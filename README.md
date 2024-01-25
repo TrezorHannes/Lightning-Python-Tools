@@ -1,6 +1,8 @@
 # Peerswap-Python-Tools
 
 Couple of scripts I'm working on to simplify and integrate peerswap into my system. Currently un-organised, but shared publicly to ensure collaboration and peer-review.
+Check out the dev-branch with things which are not fully working yet and want to get your hands on.
+
 If you're interested getting more info on peerswap, it's usecase and capabilities, here's a quick dump to digest
 
 - https://github.com/ElementsProject/elements/blob/master/contrib/README.md
