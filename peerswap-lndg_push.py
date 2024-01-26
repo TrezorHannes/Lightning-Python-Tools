@@ -16,7 +16,6 @@ pscli_command = ['pscli', 'listpeers']
 username = 'lndg-admin'
 password = '{{ LNDG-PASSWORD }}'
 get_api_url = 'http://localhost:8889/api/channels'
-update_api_url = 'http://localhost:8889/api/chanpolicy/'
 
 # File path for the log file
 log_file_path = os.path.expanduser('~/peerswap-LNDg_changes.log')
@@ -118,9 +117,10 @@ def update_notes(channel_id, notes):
         "chan_id": channel_id,
         "notes": notes
     }
+    api_url = f"{get_api_url}/{channel_id}/"
     try:
-        # Make a POST request to the LNDg API to update the notes
-        response = requests.post(update_api_url, json=payload, auth=(username, password))
+        # Make a PUT request to the LNDg API to update the notes
+        response = requests.put(update_api_url, json=payload, auth=(username, password))
 
         timestamp = get_current_timestamp()
         logging.debug(f"Channel-ID: {channel_id}")
@@ -151,7 +151,7 @@ def main():
                 print("============================================================================")
                 print(f"No existing notes stored in LNDg for {alias} Channel {channel_id}.")
                 print(f"Overwriting with new notes:\n{new_notes}.")
-                # update_notes(channel_id, new_notes)
+                update_notes(channel_id, new_notes)
             else:
                 print("============================================================================")
                 print(f"Existing notes stored in LNDg for {alias} Channel {channel_id}:\n{current_notes}")
