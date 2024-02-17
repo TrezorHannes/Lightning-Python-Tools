@@ -14,7 +14,7 @@ password = '${{ secrets.PASSWORD }}'
 file_path = os.path.expanduser('~/.config/0_fee.txt')
 
 # Remote pubkey to ignore. Add a pubkey to be ignored in any case, and uncomment
-# ignore_remote_pubkey = ''
+ignore_remote_pubkey = ''
 
 def get_chan_ids_to_write():
     chan_ids_to_write = []  # Initialize the list
