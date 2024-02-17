@@ -32,6 +32,14 @@ from prettytable import PrettyTable
 # If you have any questions or need support, feel free to reach out:
 # Contact: https://njump.me/hakuna@tunnelsats.com
 
+# Get your l-btc balance
+def get_lbtc_balance():
+    result = subprocess.run(['pscli', 'lbtc-getbalance'], stdout=subprocess.PIPE)
+    balance_data = json.loads(result.stdout)
+    sat_amount = balance_data['sat_amount']
+    formatted_balance = "{:,}".format(int(sat_amount))
+    print(f"LBTC-Balance: {formatted_balance}")
+
 # Function to execute the command and return JSON output
 def get_pscli_listpeers_output():
     result = subprocess.run(['pscli', 'listpeers'], stdout=subprocess.PIPE)
@@ -107,5 +115,6 @@ def main():
 
     print(table)
 
+get_lbtc_balance()
 if __name__ == "__main__":
     main()
