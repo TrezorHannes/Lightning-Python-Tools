@@ -31,3 +31,6 @@ Then run the script using the following command:
 To create an alias for convenient usage, add the following line to your .bash_aliases file:
 - `alias ps_list="INSTALLDIR/.venv/bin/python3 INSTALLDIR/Peerswap/ps_peers.py"`
 - `alias lndg_amboss="INSTALLDIR/.venv/bin/python3 INSTALLDIR/LNDg/amboss_pull.py"`
+
+If you have any questions or need support, feel free to reach out:
+Contact: https://njump.me/hakuna@tunnelsats.com

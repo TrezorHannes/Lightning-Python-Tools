@@ -7,9 +7,6 @@ import json
 import subprocess
 from prettytable import PrettyTable
 
-# If you have any questions or need support, feel free to reach out:
-# Contact: https://njump.me/hakuna@tunnelsats.com
-
 # Get your l-btc balance
 def get_lbtc_balance():
     result = subprocess.run(['pscli', 'lbtc-getbalance'], stdout=subprocess.PIPE)
