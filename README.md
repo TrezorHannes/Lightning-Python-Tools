@@ -22,11 +22,12 @@ To run this script, you need a Python virtual environment. Follow the steps belo
 ### === Usage ===
 To execute the script, make sure the virtual environment is activated:
    `$ source .venv/bin/activate`
+
 Then run the script using the following command:
-   `$ .venv/bin/python3 Peerswap/ps_peers.py`
-   `$ .venv/bin/python3 LNDg/amboss_pull.py`
+- `$ .venv/bin/python3 Peerswap/ps_peers.py`
+- `$ .venv/bin/python3 LNDg/amboss_pull.py`
 
 ### === Optional: Create an Alias ===
 To create an alias for convenient usage, add the following line to your .bash_aliases file:
-   `alias ps_list="INSTALLDIR/.venv/bin/python3 INSTALLDIR/Peerswap/ps_peers.py"`
-   `alias lndg_amboss="INSTALLDIR/.venv/bin/python3 INSTALLDIR/LNDg/amboss_pull.py"`
+- `alias ps_list="INSTALLDIR/.venv/bin/python3 INSTALLDIR/Peerswap/ps_peers.py"`
+- `alias lndg_amboss="INSTALLDIR/.venv/bin/python3 INSTALLDIR/LNDg/amboss_pull.py"`
