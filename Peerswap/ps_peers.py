@@ -7,28 +7,6 @@ import json
 import subprocess
 from prettytable import PrettyTable
 
-# === Installation Instructions ===
-# To run this script, you need a Python virtual environment. Follow the steps below:
-# 1. Install virtualenv (if not already installed):
-#    $ sudo apt install virtualenv
-# 2. Create a virtual environment in the current directory:
-#    $ virtualenv -p python3 .venv
-# 3. Activate the virtual environment:
-#    $ source .venv/bin/activate
-# 4. Install the required dependencies using pip:
-#    $ pip install -r requirements.txt
-
-# === Usage ===
-# To execute the script, make sure the virtual environment is activated:
-# $ source .venv/bin/activate
-# Then run the script using the following command:
-# $ .venv/bin/python3 ps_peers.py
-
-# === Optional: Create an Alias ===
-# To create an alias for convenient usage, add the following line to your .bash_aliases file:
-# alias ps_list="INSTALLDIR/.venv/bin/python3 INSTALLDIR/ps_peers.py"
-# Replace INSTALLDIR with the absolute path to your script.
-
 # If you have any questions or need support, feel free to reach out:
 # Contact: https://njump.me/hakuna@tunnelsats.com
 
