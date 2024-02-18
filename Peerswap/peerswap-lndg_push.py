@@ -1,24 +1,30 @@
-## This script is still missing a serializer for notes in LNDg being updated via API
-## Until this is implemented, it's not going to work for automated updates
-## However, you can uncomment the debug-entries in the main() function to get a quick overview for manual copy & paste
-
 import datetime
 import os
 import requests
 import json
 import subprocess
 import logging  # For more structured debugging
+import configparser
+
+# Get the path to the parent directory
+parent_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Construct the path to the config.ini file
+config_file_path = os.path.join(parent_dir, '..', 'config.ini')
+config = configparser.ConfigParser()
+config.read(config_file_path)
 
 # Define the command to get peers information
 pscli_command = ['pscli', 'listpeers']
 
 # LNDg API credentials and endpoints
-username = 'lndg-admin'
-password = '{{ LNDG-PASSWORD }}'
+username = config['credentials']['lndg_username']
+password = config['credentials']['lndg_password']
+
 get_api_url = 'http://localhost:8889/api/channels'
 
 # File path for the log file
-log_file_path = os.path.expanduser('~/peerswap-LNDg_changes.log')
+log_file_path = os.path.join(parent_dir, '..', 'logs', 'peerswap-LNDg_changes.log')
 
 # Logfile definition
 logging.basicConfig(filename=log_file_path, level=logging.DEBUG) 
@@ -120,7 +126,7 @@ def update_notes(channel_id, notes):
     api_url = f"{get_api_url}/{channel_id}/"
     try:
         # Make a PUT request to the LNDg API to update the notes
-        response = requests.put(update_api_url, json=payload, auth=(username, password))
+        response = requests.put(get_api_url, json=payload, auth=(username, password))
 
         timestamp = get_current_timestamp()
         logging.debug(f"Channel-ID: {channel_id}")

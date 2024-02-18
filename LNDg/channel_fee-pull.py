@@ -2,19 +2,28 @@ import os
 import requests
 import json
 import time
+import configparser
+
+# Get the path to the parent directory
+parent_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Construct the path to the config.ini file
+config_file_path = os.path.join(parent_dir, '..', 'config.ini')
+config = configparser.ConfigParser()
+config.read(config_file_path)
 
 # API endpoint URL
 api_url = 'http://localhost:8889/api/channels?limit=500&is_open=true'
 
 # Authentication credentials
-username = 'lndg-admin'
-password = '${{ secrets.PASSWORD }}'
+username = config['credentials']['lndg_username']
+password = config['credentials']['lndg_password']
 
 # File path for storing data. This txt is populated to have charge-lnd pick it up
-file_path = os.path.expanduser('~/.config/0_fee.txt')
+file_path = os.path.expanduser('~/.chargelnd/.config/0_fee.txt')
 
-# Remote pubkey to ignore. Add a pubkey to be ignored in any case, and uncomment
-ignore_remote_pubkey = ''
+# Remote pubkey to ignore. Add pubkey or reference in config.ini if you want to use it.
+ignore_remote_pubkey = config['pubkey']['fee_ignore_pubkey']
 
 def get_chan_ids_to_write():
     chan_ids_to_write = []  # Initialize the list

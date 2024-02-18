@@ -3,22 +3,31 @@ import requests
 import json
 import time
 import datetime  # Import datetime module
+import configparser
+
+# Get the path to the parent directory
+parent_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Construct the path to the config.ini file
+config_file_path = os.path.join(parent_dir, '..', 'config.ini')
+config = configparser.ConfigParser()
+config.read(config_file_path)
 
 # API endpoint URL for retrieving channels
 api_url = 'http://localhost:8889/api/channels?limit=500'
 
 # API endpoint URL for updating channels
-update_api_url = 'http://debian-nuc.local:8889/api/chanpolicy/'
+update_api_url = 'http://localhost:8889/api/chanpolicy/'
 
 # Authentication credentials
-username = 'lndg-admin'
-password = 'PASSWORD'
+username = config['credentials']['lndg_username']
+password = config['credentials']['lndg_password']
 
 # File path for the log file
-log_file_path = os.path.expanduser('~/channel_changes.log')
+log_file_path = os.path.join(parent_dir, '..', 'logs', 'lndg-channel_base-fee.log')
 
-# Remote pubkey to ignore. Add pubkey and uncomment if you want to use it.
-ignore_remote_pubkey = ''
+# Remote pubkey to ignore. Add pubkey or reference in config.ini if you want to use it.
+ignore_remote_pubkey = config['pubkey']['base_fee_ignore_pubkey']
 
 def get_channels_to_modify():
     channels_to_modify = []  # Initialize the list

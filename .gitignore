@@ -1,0 +1,6 @@
+config.ini
+*.log      # Ignore all files with a .log extension
+/logs/     # Ignore the entire logs directory
+/data/     # Ignore the entire data directory
+/.venv/    # Ignore the entire virtual environment directory
+

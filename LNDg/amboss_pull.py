@@ -12,18 +12,30 @@ import os
 import time
 import datetime
 import logging  # For more structured debugging
+import configparser
+
+# Get the path to the parent directory
+parent_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Construct the path to the config.ini file located in the parent directory
+config_file_path = os.path.join(parent_dir, '..', 'config.ini')
+config = configparser.ConfigParser()
+config.read(config_file_path)
 
 # Define the API endpoint
-url = 'https://api.amboss.space/graphql'
+amboss_url = 'https://api.amboss.space/graphql'
 
 # LNDg API credentials and endpoints. Retrievable from lndg/data/lndg-admin.txt
-username = 'lndg-admin'
-password = '{PASSWORD}'
-get_api_url = 'http://localhost:8889/api/channels'
-update_api_url = 'http://localhost:8889/api/channels/'
+username = config['credentials']['lndg_username']
+password = config['credentials']['lndg_password']
+lndg_api_url = 'http://localhost:8889/api/channels'
+
+# Define the file paths
+active_file_path = os.path.expanduser('~/.chargelnd/.config/magma-channels.txt') # Production
+finished_file_path = os.path.expanduser('~/.chargelnd/.config/magma_finished.txt') # Production
 
 # File path for the log file
-log_file_path = os.path.expanduser('~/logs/magma-LNDg_changes.log')
+log_file_path = os.path.join(parent_dir, '..', 'logs', 'amboss-LNDg_changes.log')
 
 # Logfile definition
 logging.basicConfig(filename=log_file_path, level=logging.DEBUG) 
@@ -34,7 +46,7 @@ def get_current_timestamp():
 
 # Define the headers, grab your API Key from Magma and enter it here
 headers = {
-    'Authorization': 'Bearer {MAGMA-API-KEY}',
+    'Authorization': f"Bearer {config['credentials']['amboss_authorization']}",
     'Content-Type': 'application/json',
 }
 
@@ -65,17 +77,10 @@ payload = {
     "query": query
 }
 
-# Define the file paths
-active_file_path = '/home/chargelnd/charge-lnd/.config/magma-channels.txt' # Production
-finished_file_path = '/home/admin/tools/python-workspace/data/magma_finished.txt'
-
-# debug to show the active pubkeys of magma channel sales before writing into production
-# active_file_path = '/home/admin/tools/python-workspace/data/magma_active.txt'
-
 # Function to move pubkeys from active file to finished file
 def move_finished_pubkeys():
     # Make the request
-    response = requests.post(url, json=payload, headers=headers)
+    response = requests.post(amboss_url, json=payload, headers=headers)
     response.raise_for_status()  # Raise an exception for 4xx and 5xx status codes
 
     data = response.json()
@@ -123,7 +128,7 @@ def matchtable_pubkey_to_chan_id(active_pubkeys, non_active_pubkeys):
     active_chan_ids = []
     non_active_chan_ids = []
 
-    response = requests.get(f"{get_api_url}?limit=500", auth=(username, password))
+    response = requests.get(f"{lndg_api_url}?limit=500", auth=(username, password))
     if response.status_code == 200:
         data = response.json()
         if 'results' in data:
@@ -145,7 +150,7 @@ def matchtable_pubkey_to_chan_id(active_pubkeys, non_active_pubkeys):
 
 # Update the fee for channels with expired magma sales lease time
 def update_autofees(non_active_chan_ids):
-    global update_api_url  # Reference the global variable within the function
+    global lndg_api_url  # Reference the global variable within the function
 
     for chan_id in non_active_chan_ids:
         
@@ -158,7 +163,7 @@ def update_autofees(non_active_chan_ids):
         }
         try:
             # Make a PUT request to the LNDg API to update the auto_fees
-            response = requests.put(f"{update_api_url}/{chan_id}/", json=payload, auth=(username, password))
+            response = requests.put(f"{lndg_api_url}/{chan_id}/", json=payload, auth=(username, password))
 
             timestamp = get_current_timestamp()
             # logging.debug(f"Channel-ID: {chan_id}")
@@ -178,7 +183,7 @@ def update_autofees(non_active_chan_ids):
             logging.error(f"Error updating auto_fees for channel {chan_id}: {e}")
 
 def update_notes_for_active_channels(active_chan_ids, query_data):
-    global update_api_url  # Reference the global variable within the function
+    global lndg_api_url  # Reference the global variable within the function
 
     for chan_id in active_chan_ids:
 
@@ -190,7 +195,7 @@ def update_notes_for_active_channels(active_chan_ids, query_data):
         }
         try:
             # Make a PUT request to the LNDg API to update the notes
-            response = requests.put(f"{update_api_url}/{chan_id}/", json=payload, auth=(username, password))
+            response = requests.put(f"{lndg_api_url}/{chan_id}/", json=payload, auth=(username, password))
 
             timestamp = get_current_timestamp()
             # logging.debug(f"Channel-ID: {chan_id}")
