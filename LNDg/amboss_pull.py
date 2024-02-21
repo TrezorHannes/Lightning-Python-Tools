@@ -32,7 +32,7 @@ lndg_api_url = 'http://localhost:8889/api/channels'
 
 # Define the file paths
 active_file_path = os.path.expanduser('~/.chargelnd/.config/magma-channels.txt') # Production
-finished_file_path = os.path.expanduser('~/.chargelnd/.config/magma_finished.txt') # Production
+finished_file_path = os.path.expanduser('~/.chargelnd/.config/magma-finished.txt') # Production
 
 # File path for the log file
 log_file_path = os.path.join(parent_dir, '..', 'logs', 'amboss-LNDg_changes.log')

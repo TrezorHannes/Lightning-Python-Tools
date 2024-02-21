@@ -23,7 +23,7 @@ password = config['credentials']['lndg_password']
 file_path = os.path.expanduser('~/.chargelnd/.config/0_fee.txt')
 
 # Remote pubkey to ignore. Add pubkey or reference in config.ini if you want to use it.
-ignore_remote_pubkey = config['pubkey']['fee_ignore_pubkey']
+ignore_remote_pubkey = config['pubkey']['base_fee_ignore']
 
 def get_chan_ids_to_write():
     chan_ids_to_write = []  # Initialize the list

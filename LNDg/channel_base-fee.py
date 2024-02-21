@@ -27,7 +27,7 @@ password = config['credentials']['lndg_password']
 log_file_path = os.path.join(parent_dir, '..', 'logs', 'lndg-channel_base-fee.log')
 
 # Remote pubkey to ignore. Add pubkey or reference in config.ini if you want to use it.
-ignore_remote_pubkey = config['pubkey']['base_fee_ignore_pubkey']
+ignore_remote_pubkey = config['pubkey']['base_fee_ignore']
 
 def get_channels_to_modify():
     channels_to_modify = []  # Initialize the list
