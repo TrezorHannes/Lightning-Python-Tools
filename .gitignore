@@ -5,3 +5,4 @@ config.ini
 /.venv/    # Ignore the entire virtual environment directory
 
 logs/amboss-LNDg_changes.log
+logs/peerswap-LNDg_changes.log
