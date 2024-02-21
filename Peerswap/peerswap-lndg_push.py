@@ -21,7 +21,7 @@ pscli_command = ['pscli', 'listpeers']
 username = config['credentials']['lndg_username']
 password = config['credentials']['lndg_password']
 
-get_api_url = 'http://localhost:8889/api/channels'
+lndg_api_url = 'http://localhost:8889/api/channels'
 
 # File path for the log file
 log_file_path = os.path.join(parent_dir, '..', 'logs', 'peerswap-LNDg_changes.log')
@@ -95,7 +95,7 @@ def get_current_timestamp():
 # Function to get current notes from LNDg API
 def get_current_notes(channel_id):
     # Use the base API URL and append the specific channel ID
-    api_url = f"{get_api_url}/{channel_id}/"
+    api_url = f"{lndg_api_url}/{channel_id}/"
 
     try:
         # Make the API request with authentication
@@ -119,14 +119,15 @@ def get_current_notes(channel_id):
 
 # Function to update notes on LNDg API
 def update_notes(channel_id, notes):
+    global lndg_api_url  # Reference the global variable within the function
     payload = {
         "chan_id": channel_id,
         "notes": notes
     }
-    api_url = f"{get_api_url}/{channel_id}/"
+    # api_url = f"{get_api_url}/{channel_id}/"
     try:
         # Make a PUT request to the LNDg API to update the notes
-        response = requests.put(get_api_url, json=payload, auth=(username, password))
+        response = requests.put(f"{lndg_api_url}/{channel_id}/", json=payload, auth=(username, password))
 
         timestamp = get_current_timestamp()
         logging.debug(f"Channel-ID: {channel_id}")
@@ -171,7 +172,7 @@ def main():
                     print(f"Appending the existing notes with new notes:\n{current_notes}\n{new_notes}.")
                     # debug_api_url = f"{update_api_url}{channel_id}/"
                     # print(f"Debug: Would PUT {channel_id} to {debug_api_url} with notes:\n{current_notes}\n{new_notes}")
-                    update_notes(channel_id, current_notes + new_notes)
+                    update_notes(channel_id, current_notes + "\n" + new_notes)
                 else:
                     print(f"Invalid action. Skipping update for this channel.")
 
