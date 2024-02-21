@@ -1,0 +1,11 @@
+#rename file to config.ini
+[credentials]
+#Amboss API Key
+amboss_authorization = 
+#LNDg username+pwd from lndg/data/lndg-admin.txt
+lndg_username = 
+lndg_password = 
+
+[pubkey]
+#Add Pubkeys you want to ignore in automated LNDg updates
+base_fee_ignore = 
