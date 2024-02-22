@@ -5,6 +5,8 @@ import json
 import subprocess
 import logging  # For more structured debugging
 import configparser
+import argparse
+import sys
 
 # Get the path to the parent directory
 parent_dir = os.path.dirname(os.path.abspath(__file__))
@@ -124,22 +126,23 @@ def update_notes(channel_id, notes):
         "chan_id": channel_id,
         "notes": notes
     }
-    # api_url = f"{get_api_url}/{channel_id}/"
     try:
         # Make a PUT request to the LNDg API to update the notes
         response = requests.put(f"{lndg_api_url}/{channel_id}/", json=payload, auth=(username, password))
 
         timestamp = get_current_timestamp()
+        '''
         logging.debug(f"Channel-ID: {channel_id}")
         logging.debug(f"Payload: {payload}")
         logging.debug(f"API Response: {response.text}")
         logging.debug(f"API Status Code: {response.status_code}")
         logging.debug(f"Timestamp: {timestamp}")
+        '''
         if response.status_code == 200:
             # Log the changes
             with open(log_file_path, 'a') as log_file:
                 log_file.write(f"{timestamp}: Updated notes for channel {channel_id}\n")
-            print(f"{timestamp}: Updated notes for channel {channel_id}")
+            # print(f"{timestamp}: Updated notes for channel {channel_id}")
         else:
             logging.error(f"{timestamp}: Failed to update notes for channel {channel_id}: Status Code {response.status_code}")
 
@@ -153,28 +156,61 @@ def main():
     if peers_info:
         for channel_id, new_notes in peers_info:
             alias = find_alias_by_chan_id(channel_id) 
-            current_notes = get_current_notes(channel_id)
-            if not current_notes:
-                print("============================================================================")
-                print(f"No existing notes stored in LNDg for {alias} Channel {channel_id}.")
-                print(f"Overwriting with new notes:\n{new_notes}.")
-                update_notes(channel_id, new_notes)
+            parser = argparse.ArgumentParser(description='Script to update notes for LNDg channels.')
+            parser.add_argument('-o', '--overwrite', action='store_true', help='Overwrite existing notes with new notes.')
+            parser.add_argument('-a', '--append', action='store_true', help='Append new notes to existing notes.')
+            parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose mode.')
+            args = parser.parse_args()
+
+            if args.overwrite:
+                action = 'o'
+            elif args.append:
+                action = 'a'
             else:
-                print("============================================================================")
-                print(f"Existing notes stored in LNDg for {alias} Channel {channel_id}:\n{current_notes}")
-                action = input("Do you want to overwrite the existing notes (o) or append the new notes (a)? (o/a): ")
-                if action.lower() == 'o':
+                action = None
+
+            current_notes = get_current_notes(channel_id)
+
+            if args.verbose:
+                if action == 'o':
+                    print(f"{alias} with channel {channel_id}.")
                     print(f"Overwriting the existing notes with new notes:\n{new_notes}.")
-                    # debug_api_url = f"{update_api_url}{channel_id}/"
-                    # print(f"Debug: Would PUT {channel_id} to {debug_api_url} with notes:\n{new_notes}")
-                    update_notes(channel_id, new_notes)
-                elif action.lower() == 'a':
+                elif action == 'a':
+                    print(f"{alias} with channel {channel_id}.")
                     print(f"Appending the existing notes with new notes:\n{current_notes}\n{new_notes}.")
-                    # debug_api_url = f"{update_api_url}{channel_id}/"
-                    # print(f"Debug: Would PUT {channel_id} to {debug_api_url} with notes:\n{current_notes}\n{new_notes}")
+
+            if action == 'o':
+                update_notes(channel_id, new_notes)
+            elif action == 'a':
+                if current_notes is not None:
                     update_notes(channel_id, current_notes + "\n" + new_notes)
                 else:
-                    print(f"Invalid action. Skipping update for this channel.")
+                    update_notes(channel_id, new_notes)
+            else:
+                if not current_notes:
+                    print("============================================================================")
+                    print(f"No existing notes stored in LNDg for {alias} Channel {channel_id}.")
+                    print(f"Overwriting with new notes:\n{new_notes}.")
+                    update_notes(channel_id, new_notes)
+                # Add automatic overwrite if current_notes start with "Swaps Allowed"
+                elif current_notes and current_notes.startswith("Swaps Allowed"):
+                    action = 'o'
+                else:
+                    print("============================================================================")
+                    print(f"Existing notes stored in LNDg for {alias} Channel {channel_id}:\n{current_notes}")
+                    action = input("Do you want to overwrite the existing notes (o) or append the new notes (a)? (o/a): ")
+                    if action.lower() == 'o':
+                        print(f"Overwriting the existing notes with new notes:\n{new_notes}.")
+                        # debug_api_url = f"{update_api_url}{channel_id}/"
+                        # print(f"Debug: Would PUT {channel_id} to {debug_api_url} with notes:\n{new_notes}")
+                        update_notes(channel_id, new_notes)
+                    elif action.lower() == 'a':
+                        print(f"Appending the existing notes with new notes:\n{current_notes}\n{new_notes}.")
+                        # debug_api_url = f"{update_api_url}{channel_id}/"
+                        # print(f"Debug: Would PUT {channel_id} to {debug_api_url} with notes:\n{current_notes}\n{new_notes}")
+                        update_notes(channel_id, current_notes + "\n" + new_notes)
+                    else:
+                        print(f"Invalid action. Skipping update for this channel.")
 
 if __name__ == "__main__":
     main()
