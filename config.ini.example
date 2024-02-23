@@ -9,3 +9,7 @@ lndg_password =
 [pubkey]
 #Add Pubkeys you want to ignore in automated LNDg updates
 base_fee_ignore = 
+
+[no-swapout]
+#Add Pubkeys you want to filter out for swapout outputs
+swapout_blacklist = 
