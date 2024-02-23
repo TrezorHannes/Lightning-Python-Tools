@@ -5,6 +5,7 @@
 
 # This is shown in the terminal, but also written as channel-IDs into a file found 
 # in directory data. From there, it can be picked up by swap-out scripts.
+# swap_out-candidates.py -h for help on the different options
 
 import os
 import requests
@@ -12,9 +13,7 @@ import json
 import time
 import configparser
 from prettytable import PrettyTable
-
-# Define the capacity threshold
-CAPACITY_THRESHOLD = 5000000
+import argparse
 
 # Get the path to the parent directory
 parent_dir = os.path.dirname(os.path.abspath(__file__))
@@ -33,6 +32,17 @@ password = config['credentials']['lndg_password']
 
 # File path for storing data. This export can be used for swap-out
 file_path = os.path.join(parent_dir, '..', 'data', 'low-fee-high-local.log')
+# File path for storing BOS tags. Create symlink to homedir with ln -s ~/.bos bos
+file_path_to_bos = os.path.join(parent_dir, '..', 'bos', 'tags.json')
+
+parser = argparse.ArgumentParser(description='Script to manage swap-out candidates.')
+parser.add_argument('-b', '--bos', action='store_true', help='Export bos tags.json file for easy probing.')
+parser.add_argument('-f', '--file-export', action='store_true', help='Write into defined file.log for easy pickup of swap-out automations like litd.')
+parser.add_argument('-c', '--capacity', type=int, default=5000000, help='Set the capacity threshold for swap-out candidates.')
+args = parser.parse_args()
+
+# Set the CAPACITY_THRESHOLD based on the parsed argument
+CAPACITY_THRESHOLD = args.capacity
 
 # Remote pubkey to ignore. Add pubkey or reference in config.ini if you want to use it.
 ignore_remote_pubkey = config['no-swapout']['swapout_blacklist']
@@ -77,7 +87,7 @@ def terminal_output():
                 results = data['results']
 
                 table = PrettyTable()
-                table.field_names = ["Alias", "Is Active", "Capacity", "Local Balance", "AR Out Target", "Auto Rebalance", "Channel-ID"]
+                table.field_names = ["Alias", "Is Active", "Capacity", "Local Balance", "AR Out Target", "Auto Rebalance", "Channel ID"]
 
                 sorted_results = sorted(results, key=lambda x: (x.get('local_balance', 0) / x.get('capacity', 1)), reverse=True)
 
@@ -103,11 +113,52 @@ def terminal_output():
     except Exception as e:
         print(f"Error: {e}")
 
-terminal_output()
+def write_bos_tags():
+    try:
+        response = requests.get(api_url, auth=(username, password))
+        if response.status_code == 200:
+            data = response.json()
+            if 'results' in data:
+                results = data['results']
+                # Filter and sort results based on the same criteria
+                filtered_sorted_results = [
+                    result for result in sorted(results, key=lambda x: (x.get('local_balance', 0) / x.get('capacity', 1)), reverse=True)
+                    if result.get('local_fee_rate', 0) == 0 and result.get('remote_pubkey', '') != ignore_remote_pubkey and result.get('local_balance', 0) > CAPACITY_THRESHOLD
+                ]
+                # Extract remote_pubkey from filtered and sorted results
+                remote_pubkeys = [result.get('remote_pubkey', '') for result in filtered_sorted_results]
 
-chan_ids = get_chan_ids_to_write()
+                tags_data = {
+                    "tags": [
+                        {
+                            "alias": "swap-candidates",
+                            "id": "454d13aff835eeb91de6183684a208cd7e3d4cc19d025fab84f6838c4575cdae",
+                            "nodes": remote_pubkeys
+                        }
+                    ]
+                }
 
-if chan_ids:
-    with open(file_path, 'w') as file:
-        file.write(', '.join(chan_ids) + '\n')
-        print("Data written to file.")
+                with open(file_path_to_bos, 'w') as file:
+                    json.dump(tags_data, file, indent=2)
+
+                print(f"Tags data written to {file_path_to_bos}")
+        else:
+            print(f"API request failed with status code: {response.status_code}")
+    except Exception as e:
+        print(f"Error: {e}")
+
+def main():
+    terminal_output()
+
+    if args.bos:
+        write_bos_tags()
+
+    if args.file_export:
+        chan_ids = get_chan_ids_to_write()
+        if chan_ids:
+            with open(file_path, 'w') as file:
+                file.write(', '.join(chan_ids) + '\n')
+            print(f"Channel-ID data written to {file_path}")
+
+if __name__ == "__main__":
+    main()
