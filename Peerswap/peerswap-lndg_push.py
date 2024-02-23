@@ -113,7 +113,6 @@ def get_current_notes(channel_id):
         logging.error(f"Error retrieving notes for channel {channel_id}: {e}")
         return None
 
-
 # Function to update notes on LNDg API
 def update_notes(channel_id, notes):
     global lndg_api_url
@@ -164,41 +163,35 @@ def main():
 
             if args.verbose:
                 if action == 'o':
+                    print("============================================================================")
                     print(f"{alias} with channel {channel_id}.")
                     print(f"Overwriting the existing notes with new notes:\n{new_notes}.")
                 elif action == 'a':
+                    print("============================================================================")
                     print(f"{alias} with channel {channel_id}.")
                     print(f"Appending the existing notes with new notes:\n{current_notes}\n{new_notes}.")
 
             if action == 'o':
                 update_notes(channel_id, new_notes)
             elif action == 'a':
-                if current_notes is not None:
-                    update_notes(channel_id, current_notes + "\n" + new_notes)
+                if not current_notes or current_notes.startswith("Swaps Allowed"):
+                    update_notes(channel_id, new_notes)
                 else:
-                    update_notes(channel_id, new_notes)
+                    update_notes(channel_id, current_notes + "\n" + new_notes)
             else:
-                if not current_notes:
-                    print("============================================================================")
-                    print(f"No existing notes stored in LNDg for {alias} Channel {channel_id}.")
-                    print(f"Overwriting with new notes:\n{new_notes}.")
-                    update_notes(channel_id, new_notes)
                 # Add automatic overwrite if current_notes start with "Swaps Allowed"
-                elif current_notes and current_notes.startswith("Swaps Allowed"):
-                    action = 'o'
+                if not current_notes or current_notes.startswith("Swaps Allowed"):
+                    update_notes(channel_id, new_notes)
+                
                 else:
                     print("============================================================================")
                     print(f"Existing notes stored in LNDg for {alias} Channel {channel_id}:\n{current_notes}")
                     action = input("Do you want to overwrite the existing notes (o) or append the new notes (a)? (o/a): ")
                     if action.lower() == 'o':
                         print(f"Overwriting the existing notes with new notes:\n{new_notes}.")
-                        # debug_api_url = f"{update_api_url}{channel_id}/"
-                        # print(f"Debug: Would PUT {channel_id} to {debug_api_url} with notes:\n{new_notes}")
                         update_notes(channel_id, new_notes)
                     elif action.lower() == 'a':
                         print(f"Appending the existing notes with new notes:\n{current_notes}\n{new_notes}.")
-                        # debug_api_url = f"{update_api_url}{channel_id}/"
-                        # print(f"Debug: Would PUT {channel_id} to {debug_api_url} with notes:\n{current_notes}\n{new_notes}")
                         update_notes(channel_id, current_notes + "\n" + new_notes)
                     else:
                         print(f"Invalid action. Skipping update for this channel.")
