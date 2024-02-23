@@ -31,13 +31,11 @@ log_file_path = os.path.join(parent_dir, '..', 'logs', 'peerswap-LNDg_changes.lo
 # Logfile definition
 logging.basicConfig(filename=log_file_path, level=logging.DEBUG) 
 
-# Alt function to get the output of 'lncli listchannels'
 def get_lncli_listchannels_output():
     result = subprocess.run(['lncli', 'listchannels'], stdout=subprocess.PIPE)
     channels_data = json.loads(result.stdout)
     return channels_data['channels']
 
-# Alt function to match alias using channel-id
 def find_alias_by_chan_id(chan_id):
     channels_data = get_lncli_listchannels_output()
     for channel in channels_data:
@@ -56,9 +54,7 @@ def get_peerswap_info():
             print(f"Error parsing JSON: {e}")
             return None 
         if result.returncode == 0:
-            # Parse the JSON output
             peers_info = json.loads(result.stdout)
-            # Extract the required information
             formatted_info = []
             for peer in peers_info['peers']:
                 if peer.get('channels'):  # Check if the 'channels' list exists
@@ -107,7 +103,6 @@ def get_current_notes(channel_id):
         if response.status_code == 200:
             data = response.json()
             # Extract the 'notes' field from the JSON response
-            # logging.debug(f"Data type: {type(data)}, value: {data}")
             notes = data.get('notes', '')
             return notes
         else:
@@ -121,13 +116,12 @@ def get_current_notes(channel_id):
 
 # Function to update notes on LNDg API
 def update_notes(channel_id, notes):
-    global lndg_api_url  # Reference the global variable within the function
+    global lndg_api_url
     payload = {
         "chan_id": channel_id,
         "notes": notes
     }
     try:
-        # Make a PUT request to the LNDg API to update the notes
         response = requests.put(f"{lndg_api_url}/{channel_id}/", json=payload, auth=(username, password))
 
         timestamp = get_current_timestamp()
@@ -139,17 +133,14 @@ def update_notes(channel_id, notes):
         logging.debug(f"Timestamp: {timestamp}")
         '''
         if response.status_code == 200:
-            # Log the changes
             with open(log_file_path, 'a') as log_file:
                 log_file.write(f"{timestamp}: Updated notes for channel {channel_id}\n")
-            # print(f"{timestamp}: Updated notes for channel {channel_id}")
         else:
             logging.error(f"{timestamp}: Failed to update notes for channel {channel_id}: Status Code {response.status_code}")
 
     except Exception as e:
         logging.error(f"Error updating notes for channel {channel_id}: {e}")
 
-# Main function
 def main():
     channels_data = get_lncli_listchannels_output()
     peers_info = get_peerswap_info()
