@@ -91,6 +91,20 @@ def get_peerswap_info():
 
         return None
 
+# Filters channels based on pscli output and deletes notes for non-existent channels
+def filter_and_delete_notes(peers_info):
+
+    pscli_channel_ids = [peer_info[0] for peer_info in peers_info if peer_info]
+
+    for channel in get_lncli_listchannels_output():
+        channel_id = channel['chan_id']
+        if channel_id not in pscli_channel_ids:
+            current_notes = get_current_notes(channel_id)
+            if current_notes and current_notes.startswith("Swaps Allowed"):
+                update_notes(channel_id, "")  # Clear the notes
+                print(f"Deleted notes for channel {channel_id}. Is their daemon running?")
+                logging.info(f"Deleted notes channel {channel_id} Is their daemon running?")
+
 def get_current_timestamp():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -147,21 +161,28 @@ def update_notes(channel_id, notes):
 def main():
     channels_data = get_lncli_listchannels_output()
     peers_info = get_peerswap_info()
+    
+    parser = argparse.ArgumentParser(description='Script to update notes for LNDg channels.')
+    parser.add_argument('-o', '--overwrite', action='store_true', help='Overwrite existing notes with new notes.')
+    parser.add_argument('-a', '--append', action='store_true', help='Append new notes to existing notes.')
+    parser.add_argument('-d', '--delete', action='store_true', help='Delete swap notes from channels not offering PS anymore.')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose mode.')
+    args = parser.parse_args()
+    
+    if args.delete:
+        filter_and_delete_notes(peers_info)
+    
     if peers_info:
+
         for channel_id, new_notes in peers_info:
             alias = find_alias_by_chan_id(channel_id) 
-            parser = argparse.ArgumentParser(description='Script to update notes for LNDg channels.')
-            parser.add_argument('-o', '--overwrite', action='store_true', help='Overwrite existing notes with new notes.')
-            parser.add_argument('-a', '--append', action='store_true', help='Append new notes to existing notes.')
-            parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose mode.')
-            args = parser.parse_args()
+            
+            action = None
 
             if args.overwrite:
                 action = 'o'
             elif args.append:
                 action = 'a'
-            else:
-                action = None
 
             current_notes = get_current_notes(channel_id)
 
