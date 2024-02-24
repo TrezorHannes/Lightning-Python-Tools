@@ -35,22 +35,22 @@ file_path = os.path.join(parent_dir, '..', 'data', 'low-fee-high-local.log')
 # File path for storing BOS tags. Create symlink to homedir with ln -s ~/.bos bos
 file_path_to_bos = os.path.join(parent_dir, '..', 'bos', 'tags.json')
 
+# Remote pubkey to ignore. Add pubkey or reference in config.ini if you want to use it.
+ignore_remote_pubkey = config['no-swapout']['swapout_blacklist']
+
 parser = argparse.ArgumentParser(description='Script to manage swap-out candidates.')
 parser.add_argument('-b', '--bos', action='store_true', help='Export bos tags.json file for easy probing.')
 parser.add_argument('-f', '--file-export', action='store_true', help='Write into defined file.log for easy pickup of swap-out automations like litd.')
+parser.add_argument('-p', '--pubkey', action='store_true', help='Show remote pubkey instead of channel ID in the table.')
 parser.add_argument('-c', '--capacity', type=int, default=5000000, help='Set the capacity threshold for swap-out candidates.')
 args = parser.parse_args()
 
 # Set the CAPACITY_THRESHOLD based on the parsed argument
 CAPACITY_THRESHOLD = args.capacity
 
-# Remote pubkey to ignore. Add pubkey or reference in config.ini if you want to use it.
-ignore_remote_pubkey = config['no-swapout']['swapout_blacklist']
-
 def get_chan_ids_to_write():
     chan_ids_to_write = []  # Initialize the list
     try:
-        # Make the API request with authentication
         response = requests.get(api_url, auth=(username, password))
 
         # Check if the request was successful (status code 200)
@@ -87,7 +87,10 @@ def terminal_output():
                 results = data['results']
 
                 table = PrettyTable()
-                table.field_names = ["Alias", "Is Active", "Capacity", "Local Balance", "AR Out Target", "Auto Rebalance", "Channel ID"]
+                if args.pubkey:
+                    table.field_names = ["Alias", "Is Active", "Capacity", "Local Balance", "AR Out Target", "Auto Rebalance", "Pubkey"]
+                else:
+                    table.field_names = ["Alias", "Is Active", "Capacity", "Local Balance", "AR Out Target", "Auto Rebalance", "Channel ID"]
 
                 sorted_results = sorted(results, key=lambda x: (x.get('local_balance', 0) / x.get('capacity', 1)), reverse=True)
 
@@ -104,7 +107,10 @@ def terminal_output():
 
                     if local_fee_rate == 0 and remote_pubkey != ignore_remote_pubkey and local_balance > CAPACITY_THRESHOLD:
                         local_balance_ratio = (local_balance / capacity) * 100
-                        table.add_row([alias, is_active, capacity, f"{local_balance_ratio:.2f}%", ar_out_target, auto_rebalance, channel_id])
+                        if args.pubkey:
+                            table.add_row([alias, is_active, capacity, f"{local_balance_ratio:.2f}%", ar_out_target, auto_rebalance, remote_pubkey])
+                        else:
+                            table.add_row([alias, is_active, capacity, f"{local_balance_ratio:.2f}%", ar_out_target, auto_rebalance, channel_id])
 
                 print(table)
         else:
