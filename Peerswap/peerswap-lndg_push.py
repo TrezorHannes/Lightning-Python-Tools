@@ -18,7 +18,7 @@ config.read(config_file_path)
 
 # pscli path and get peers information
 pscli_path = config['paths']['pscli_path']
-pscli_command = ['pscli', 'listpeers']
+pscli_command = [pscli_path, 'listpeers']
 
 # lncli path from the config file
 lncli_path = config['paths']['lncli_path']
