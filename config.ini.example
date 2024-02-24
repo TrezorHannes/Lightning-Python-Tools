@@ -13,3 +13,8 @@ base_fee_ignore =
 [no-swapout]
 #Add Pubkeys you want to filter out for swapout outputs
 swapout_blacklist = 
+
+[paths]
+# set your paths in case you cron-job it: $ whereis lncli & whereis pscli
+lncli_path = /usr/local/bin/lncli
+pscli_path = /usr/local/bin/pscli

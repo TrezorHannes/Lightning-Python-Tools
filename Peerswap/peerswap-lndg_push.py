@@ -16,8 +16,12 @@ config_file_path = os.path.join(parent_dir, '..', 'config.ini')
 config = configparser.ConfigParser()
 config.read(config_file_path)
 
-# Define the command to get peers information
+# pscli path and get peers information
+pscli_path = config['paths']['pscli_path']
 pscli_command = ['pscli', 'listpeers']
+
+# lncli path from the config file
+lncli_path = config['paths']['lncli_path']
 
 # LNDg API credentials and endpoints
 username = config['credentials']['lndg_username']
@@ -32,7 +36,7 @@ log_file_path = os.path.join(parent_dir, '..', 'logs', 'peerswap-LNDg_changes.lo
 logging.basicConfig(filename=log_file_path, level=logging.DEBUG) 
 
 def get_lncli_listchannels_output():
-    result = subprocess.run(['lncli', 'listchannels'], stdout=subprocess.PIPE)
+    result = subprocess.run([lncli_path, 'listchannels'], stdout=subprocess.PIPE)
     channels_data = json.loads(result.stdout)
     return channels_data['channels']
 
