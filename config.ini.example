@@ -7,11 +7,11 @@ lndg_username =
 lndg_password = 
 
 [pubkey]
-#Add Pubkeys you want to ignore in automated LNDg updates
+#Add Pubkeys you want to ignore in automated LNDg updates, comma-separated for adding multiple pubkeys. 
 base_fee_ignore = 
 
 [no-swapout]
-#Add Pubkeys you want to filter out for swapout outputs
+#Add Pubkeys you want to filter out for swapout outputs, comma-separated for adding multiple pubkeys. 
 swapout_blacklist = 
 
 [paths]

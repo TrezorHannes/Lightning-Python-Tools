@@ -36,7 +36,7 @@ file_path = os.path.join(parent_dir, '..', 'data', 'low-fee-high-local.log')
 file_path_to_bos = os.path.join(parent_dir, '..', 'bos', 'tags.json')
 
 # Remote pubkey to ignore. Add pubkey or reference in config.ini if you want to use it.
-ignore_remote_pubkey = config['no-swapout']['swapout_blacklist']
+ignore_remote_pubkeys = config['no-swapout']['swapout_blacklist'].split(',')
 
 parser = argparse.ArgumentParser(description='Script to manage swap-out candidates.')
 parser.add_argument('-b', '--bos', action='store_true', help='Export bos tags.json file for easy probing.')
@@ -67,7 +67,7 @@ def get_chan_ids_to_write():
                     capacity = result.get('capacity', '')
                     local_balance = result.get('local_balance', 0)
                     chan_id = result.get('chan_id', '')
-                    if local_fee_rate == 0 and remote_pubkey != ignore_remote_pubkey and local_balance > CAPACITY_THRESHOLD:
+                    if local_fee_rate == 0 and remote_pubkey not in ignore_remote_pubkeys and local_balance > CAPACITY_THRESHOLD:
                         chan_ids_to_write.append(chan_id)
         else:
             print(f"API request failed with status code: {response.status_code}")
@@ -105,7 +105,7 @@ def terminal_output():
                     auto_rebalance = result.get('auto_rebalance', '')
                     channel_id = result.get('chan_id','')
 
-                    if local_fee_rate == 0 and remote_pubkey != ignore_remote_pubkey and local_balance > CAPACITY_THRESHOLD:
+                    if local_fee_rate == 0 and remote_pubkey not in ignore_remote_pubkeys and local_balance > CAPACITY_THRESHOLD:
                         local_balance_ratio = (local_balance / capacity) * 100
                         if args.pubkey:
                             table.add_row([alias, is_active, capacity, f"{local_balance_ratio:.2f}%", ar_out_target, auto_rebalance, remote_pubkey])
@@ -129,7 +129,7 @@ def write_bos_tags():
                 # Filter and sort results based on the same criteria
                 filtered_sorted_results = [
                     result for result in sorted(results, key=lambda x: (x.get('local_balance', 0) / x.get('capacity', 1)), reverse=True)
-                    if result.get('local_fee_rate', 0) == 0 and result.get('remote_pubkey', '') != ignore_remote_pubkey and result.get('local_balance', 0) > CAPACITY_THRESHOLD
+                    if result.get('local_fee_rate', 0) == 0 and result.get('remote_pubkey', '') not in ignore_remote_pubkeys and result.get('local_balance', 0) > CAPACITY_THRESHOLD
                 ]
                 # Extract remote_pubkey from filtered and sorted results
                 remote_pubkeys = [result.get('remote_pubkey', '') for result in filtered_sorted_results]
