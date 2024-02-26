@@ -7,6 +7,9 @@ import logging  # For more structured debugging
 import configparser
 import argparse
 import sys
+import locale
+
+locale.setlocale(locale.LC_ALL, '')
 
 # Get the path to the parent directory
 parent_dir = os.path.dirname(os.path.abspath(__file__))
@@ -70,14 +73,16 @@ def get_peerswap_info():
                 supported_assets = ', '.join(peer['supported_assets'])
                 swaps_out = sum(int(ch['swaps_out']) for ch in [peer['as_sender'], peer['as_receiver']])
                 swaps_in = sum(int(ch['swaps_in']) for ch in [peer['as_sender'], peer['as_receiver']])
+                sats_out = sum(int(ch['sats_out']) for ch in [peer['as_sender'], peer['as_receiver']])
+                sats_in = sum(int(ch['sats_in']) for ch in [peer['as_sender'], peer['as_receiver']])
+                
                 paid_fee = int(peer['paid_fee'])
 
                 new_notes = (
-                    f"Swaps Allowed: {swaps_allowed}\n"
-                    f"Assets Allowed: {supported_assets}\n"
-                    f"SUM of Swap-Outs: {swaps_out}\n"
-                    f"SUM of Swap-Ins: {swaps_in}\n"
-                    f"Paid fee: {paid_fee}"
+                f"Swaps Allowed: {swaps_allowed} with {supported_assets}\n"
+                f"⚡Swap-ins: {locale.format_string('%d', sats_in, grouping=True)}sats with {swaps_in} swaps \n"
+                f"⚡Swap-outs: {locale.format_string('%d', sats_out, grouping=True)}sats with {swaps_out} swaps \n"
+                f"Paid fee: {paid_fee}"
                 )
                 
                 formatted_info.append((channel_id, new_notes))  # Append individual peer objects
