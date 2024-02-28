@@ -1,3 +1,5 @@
+# .venv/bin/python Peerswap/peerswap-lndg_push.py -h for help
+
 import datetime
 import os
 import requests
