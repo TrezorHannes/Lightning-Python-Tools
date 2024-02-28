@@ -5,8 +5,15 @@ However, sharing some of the code repositories might help you overcome some codi
 or inspire you to build on top of it.
 
 ### Current Scripts
-- LNDg: A couple of scripts which help further automation. For instance, a script which automatically gathers your Magma Sell Orders and write those channel details into the GUI of LNDg
-- Peerswap: A few scripts which either help you navigate PS offers via CLI or also integrate PS infos into LNDg via  Django API
+LNDg: 
+- `amboss_pull`: [cronjob, one-off] automatically gather your Magma Sell Orders and write those channel details into the GUI of LNDg. Optionally populate a file configuration for charge-lnd. Also optionally, trigger other settings in LNDg eg switch on AutoFee once maturity reached
+- `channel_base-fee`: [cronjob, one-off] modify channel-settings in LNDg based on other LNDg fields. Eg change base-fee once a certain fee-condition is met.
+- `channel_fee_pull`: [cronjob, one-off] retrieve LNDg channel details such as fee, base-fee and write a file for other systems to pick it up
+- `swap_out_candidates`: [command-line output] pull current active channels with `-c CAPACITY` threshold locally and low fee on your side to provide good swap-out candidates. Export to .bos tags possible
+
+Peerswap
+- `peerswap-lndg_push`: [command-line output, cronjob] writes your existing PeerSwap peers info, the SUM of Sats and Swaps into LNDg Dashboard and Channel Card
+- `ps_peers`: [command-line output] quick overview of existing L-BTC Balance and Peerswap Peers + Liquidity in a table format
 
 ### === Installation Instructions ===
 To run this script, you need a Python virtual environment. Follow the steps below:
@@ -26,6 +33,10 @@ To execute the script, make sure the virtual environment is activated:
 Then run the script using the following command:
 - `$ .venv/bin/python3 Peerswap/ps_peers.py`
 - `$ .venv/bin/python3 LNDg/amboss_pull.py`
+
+Or schedule it as a cronjob
+- `$ crontab -e`
+- `0 * * * * INSTALLDIR/Lightning-Python-Tools/.venv/bin/python3 INSTALLDIR/Lightning-Python-Tools/LNDg/amboss_pull.py && INSTALLDIR/Lightning-Python-Tools/.venv/bin/python3 INSTALLDIR/Lightning-Python-Tools/Peerswap/peerswap-lndg_push.py -a >> /home/admin/cron.log 2>&1`
 
 ### === Optional: Create an Alias ===
 To create an alias for convenient usage, add the following line to your .bash_aliases file:

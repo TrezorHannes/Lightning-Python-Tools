@@ -227,6 +227,7 @@ def update_notes_for_active_channels(active_channels_info):
 active_channels_info, non_active_chan_ids = move_finished_channels()
 
 # Update auto fees for the channels with expired magma sales lease time
+# Comment this out if you only want to leverage note-updates in LNDg
 update_autofees(non_active_chan_ids)
 
 # Call update_notes_for_active_channels with active_chan_ids
