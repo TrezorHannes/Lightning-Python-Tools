@@ -1,3 +1,6 @@
+# This is a local fork of https://github.com/jvxis/nr-tools
+# enter the necessary settings in config.ini file in the parent dir
+
 #Import Lybraries
 import requests
 import telebot
@@ -10,8 +13,6 @@ import schedule
 from datetime import datetime
 import configparser
 
-# enter the necessary paths in the config.ini file
-
 # Get the path to the parent directory
 parent_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -20,15 +21,17 @@ config_file_path = os.path.join(parent_dir, '..', 'config.ini')
 config = configparser.ConfigParser()
 config.read(config_file_path)
 
-#Constants
-TOKEN = config['telegram']['magma_bot_token']
-AMBOSS_TOKEN = config['credentials']['amboss_authorization']
+# Variables
 EXPIRE = 180000
-CHAT_ID = config['telegram']['telegram_user_id']
-API_MEMPOOL = 'https://mempool.space/api/v1/fees/recommended'
 limit_cost = 0.90
 fee_rate_ppm = 350
-magma_channel_list = "/home/chargelnd/charge-lnd/.config/magma-channels.txt"
+API_MEMPOOL = 'https://mempool.space/api/v1/fees/recommended'
+
+TOKEN = config['telegram']['magma_bot_token']
+AMBOSS_TOKEN = config['credentials']['amboss_authorization']
+CHAT_ID = config['telegram']['telegram_user_id']
+
+magma_channel_list = config['paths']['charge_lnd_path']
 full_path_bos = config['system']['full_path_bos']
 log_file_path = os.path.join(parent_dir, '..', 'logs', 'amboss_channel_point.log')
 log_file_path2 = os.path.join(parent_dir, '..', 'logs', 'amboss_open_command.log')
