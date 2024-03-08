@@ -1,7 +1,5 @@
 import os
 import requests
-import json
-import time
 import configparser
 
 # Get the path to the parent directory

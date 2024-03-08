@@ -8,7 +8,6 @@ import subprocess
 import logging  # For more structured debugging
 import configparser
 import argparse
-import sys
 import locale
 
 locale.setlocale(locale.LC_ALL, '')

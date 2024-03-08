@@ -4,9 +4,7 @@
 # It also enters Magma Active or Expired into the LNDg API as 'note' so it'll show in LNDg Dashboard mouseover and channel card
 
 import requests
-import json
 import os
-import time
 import datetime
 import logging  # For more structured debugging
 import configparser

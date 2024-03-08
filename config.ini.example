@@ -1,4 +1,5 @@
-#rename file to config.ini
+# rename file to config.ini. No 'highcomma' or "quotation marks"
+
 [credentials]
 #Amboss API Key
 amboss_authorization = 
@@ -18,3 +19,22 @@ swapout_blacklist =
 # set your paths in case you cron-job it: $ whereis lncli & whereis pscli
 lncli_path = /usr/local/bin/lncli
 pscli_path = /usr/local/bin/pscli
+
+[telegram]
+chat_id = 
+magma_bot_token = 
+peerswap_bot_token = 
+telegram_user_id = 
+
+[info]
+node = 
+
+[system]
+full_path_bos = /usr/bin/bos
+BCK_SOURCE_PATH = /home/elements/.elements/liquidv1/wallets
+BCK_DEST_PATH = /mnt/backup/liquid
+path_command = /usr/local/bin/
+
+[urls]
+mempool_tx = https://mempool.space/tx/
+liquid_tx = https://liquid.network/tx/

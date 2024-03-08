@@ -10,7 +10,6 @@
 import os
 import requests
 import json
-import time
 import configparser
 from prettytable import PrettyTable
 import argparse

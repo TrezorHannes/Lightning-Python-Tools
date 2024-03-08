@@ -1,7 +1,5 @@
 import os
 import requests
-import json
-import time
 import datetime  # Import datetime module
 import configparser
 
