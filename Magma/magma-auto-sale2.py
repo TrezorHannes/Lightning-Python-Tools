@@ -368,6 +368,7 @@ def calculate_utxos_required_and_fees(amount_input, fee_per_vbyte):
     channel_size = float(amount_input)
     total = sum(utxo["amount_sat"] for utxo in utxos_data)
     utxos_needed = 0
+    fee_cost = 0
     amount_with_fees = channel_size
     related_outpoints = []
 
@@ -475,6 +476,7 @@ def open_channel(pubkey, size, invoice):
     # get fastest fee
     print("Getting fastest fee...")
     fee_rate = get_fast_fee()
+    formatted_outpoints = None
     if fee_rate:
         print(f"Fastest Fee:{fee_rate} sat/vB")
        # Check UTXOS and Fee Cost
@@ -625,7 +627,7 @@ def send_telegram_message(message):
         #Open Channel
         
         bot.send_message(message.chat.id, text=f"Open a {valid_channel_to_open['size']} SATS channel")    
-        funding_tx, msg_open = open_channel(valid_channel_to_open['account'], valid_channel_to_open['size'], valid_channel_to_open['seller_invoice_amount'])
+        funding_tx, msg_open = open_channel(valid_channel_to_open['account'], valid_channel_to_open['size'], valid_channel_to_open['seller_invoice_amount']) # type: ignore
         # Deal with  errors and show on Telegram
         if funding_tx == -1 or funding_tx == -2 or funding_tx == -3:
             bot.send_message(message.chat.id, text=msg_open)
