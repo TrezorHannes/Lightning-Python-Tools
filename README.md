@@ -15,6 +15,8 @@ Peerswap
 - `peerswap-lndg_push`: [command-line output, cronjob] writes your existing PeerSwap peers info, the SUM of Sats and Swaps into LNDg Dashboard and Channel Card
 - `ps_peers`: [command-line output] quick overview of existing L-BTC Balance and Peerswap Peers + Liquidity in a table format
 
+Entries with [command-line output] provide further help-text with `-h` or `--help`
+
 ### === Installation Instructions ===
 To run this script, you need a Python virtual environment. Follow the steps below:
 1. Install virtualenv (if not already installed):
@@ -28,7 +30,12 @@ To run this script, you need a Python virtual environment. Follow the steps belo
 
 ### === Usage ===
 To execute the script, make sure the virtual environment is activated:
+
    `$ source .venv/bin/activate`
+
+or use the python binary in your nested .venv directory
+
+   `$ .venv/bin/python swap_out_candidates.py -h`
 
 Then run the script using the following command:
 - `$ .venv/bin/python3 Peerswap/ps_peers.py`
@@ -39,9 +46,9 @@ Or schedule it as a cronjob
 - `0 * * * * INSTALLDIR/Lightning-Python-Tools/.venv/bin/python3 INSTALLDIR/Lightning-Python-Tools/LNDg/amboss_pull.py && INSTALLDIR/Lightning-Python-Tools/.venv/bin/python3 INSTALLDIR/Lightning-Python-Tools/Peerswap/peerswap-lndg_push.py -a >> /home/admin/cron.log 2>&1`
 
 ### === Optional: Create an Alias ===
-To create an alias for convenient usage, add the following line to your .bash_aliases file:
-- `alias ps_list="INSTALLDIR/.venv/bin/python3 INSTALLDIR/Peerswap/ps_peers.py"`
-- `alias lndg_amboss="INSTALLDIR/.venv/bin/python3 INSTALLDIR/LNDg/amboss_pull.py"`
+To create an alias for convenient usage, add the following line to your `nano ~/.bash_aliases` file:
+- `alias ps_list="INSTALLDIR/Lightning-Python-Tools/.venv/bin/python3 INSTALLDIR/Lightning-Python-Tools/Peerswap/ps_peers.py"`
+- `alias lndg_amboss="INSTALLDIR/Lightning-Python-Tools/.venv/bin/python3 INSTALLDIR/Lightning-Python-Tools/LNDg/amboss_pull.py"`
 
 If you have any questions or need support, feel free to reach out:
 Contact: https://njump.me/hakuna@tunnelsats.com
