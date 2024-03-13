@@ -203,6 +203,7 @@ def update_notes_for_active_channels(active_channels_info):
 
         payload = {
             "chan_id": chan_id,
+            "auto_fees": False,
             "notes": notes
         }
         try:
