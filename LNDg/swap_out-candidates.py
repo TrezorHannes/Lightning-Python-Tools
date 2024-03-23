@@ -163,7 +163,7 @@ def main():
         chan_ids = get_chan_ids_to_write()
         if chan_ids:
             with open(file_path, 'w') as file:
-                file.write(', '.join(chan_ids) + '\n')
+                file.write(','.join(chan_ids) + '\n')
             print(f"Channel-ID data written to {file_path}")
 
 if __name__ == "__main__":
