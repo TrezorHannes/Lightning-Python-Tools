@@ -12,6 +12,7 @@ import os
 import schedule
 from datetime import datetime
 import configparser
+import logging  # For more structured debugging
 
 # Get the path to the parent directory
 parent_dir = os.path.dirname(os.path.abspath(__file__))
@@ -33,12 +34,18 @@ CHAT_ID = config['telegram']['telegram_user_id']
 
 magma_channel_list = config['paths']['charge_lnd_path']
 full_path_bos = config['system']['full_path_bos']
+
+# Set up logging
+log_file_path = os.path.join(parent_dir, '..', 'logs', 'magma-auto-sale2.log')
+logging.basicConfig(filename=log_file_path, level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 log_file_path = os.path.join(parent_dir, '..', 'logs', 'amboss_channel_point.log')
 log_file_path2 = os.path.join(parent_dir, '..', 'logs', 'amboss_open_command.log')
 
+
+
 #Code
 bot = telebot.TeleBot(TOKEN)
-print("Amboss Channel Open Bot Started")
+logging.info("Amboss Channel Open Bot Started")
 
 def execute_lncli_addinvoice(amt, memo, expiry):
 # Command to be executed
@@ -54,9 +61,9 @@ def execute_lncli_addinvoice(amt, memo, expiry):
         output = output.decode("utf-8")
         error = error.decode("utf-8")
 
-        # Print the command output and error
-        print("Command Output:", output)
-        print("Command Error:", error)
+        # Log the command output and error
+        logging.debug(f"Command Output: {output}")
+        logging.error(f"Command Error: {error}")
 
         # Try to parse the JSON output
         try:
@@ -68,12 +75,12 @@ def execute_lncli_addinvoice(amt, memo, expiry):
 
         except json.JSONDecodeError as json_error:
             # If not a valid JSON response, handle accordingly
-            print(f"Error decoding JSON: {json_error}")
+            logging.exception(f"Error decoding JSON: {json_error}")
             return f"Error decoding JSON: {json_error}", None
 
     except subprocess.CalledProcessError as e:
         # Handle any errors that occur during command execution
-        print(f"Error executing command: {e}")
+        logging.exception(f"Error executing command: {e}")
         return f"Error executing command: {e}", None
     
 # Function to format the response content with emojis
@@ -145,7 +152,7 @@ def confirm_channel_point_to_amboss(order_id, transaction):
             return json_response
 
     except requests.exceptions.RequestException as e:
-        print(f"Error making the request: {e}")
+        logging.exception(f"Error making the request: {e}")
         return None
     
 
@@ -157,7 +164,7 @@ def get_channel_point(hash_to_find):
         ]
 
         try:
-            print(f"Command: {command}")
+            logging.info(f"Command: {command}")
             result = subprocess.run(command, capture_output=True, text=True, check=True)
             output = result.stdout
 
@@ -166,7 +173,7 @@ def get_channel_point(hash_to_find):
             return result_json
 
         except subprocess.CalledProcessError as e:
-            print(f"Error executing the command: {e}")
+            logging.exception(f"Error executing the command: {e}")
             return None
     
     result = execute_lightning_command()
@@ -197,7 +204,7 @@ def execute_lnd_command(node_pub_key, fee_per_vbyte, formatted_outpoints, input_
         f"--node_key {node_pub_key} --sat_per_vbyte={fee_per_vbyte} "
         f"{formatted_outpoints} --local_amt={input_amount} --fee_rate_ppm {fee_rate_ppm}"
     )
-    print(f"UTXOs: {formatted_outpoints}")
+    logging.info(f"UTXOs: {formatted_outpoints}")
     
     # Option to not use the UTXOs
     #command = (
@@ -208,7 +215,7 @@ def execute_lnd_command(node_pub_key, fee_per_vbyte, formatted_outpoints, input_
 
     try:
         # Run the command and capture the output
-        print(f"Command: {command}")
+        logging.info(f"Command: {command}")
         result = subprocess.run(command, shell=True, check=True, capture_output=True)
 
         # If the command is successful, update the magma_channel_list
@@ -223,7 +230,7 @@ def execute_lnd_command(node_pub_key, fee_per_vbyte, formatted_outpoints, input_
             funding_txid = output_json.get("funding_txid")
             return funding_txid
         except json.JSONDecodeError as json_error:
-            print(f"Error decoding JSON: {json_error}")
+            logging.exception(f"Error decoding JSON: {json_error}")
 
             # Save the command and JSON error to a log file
             log_content = f"Command: {command}\nJSON Decode Error: {json_error}\n"
@@ -235,7 +242,7 @@ def execute_lnd_command(node_pub_key, fee_per_vbyte, formatted_outpoints, input_
 
     except subprocess.CalledProcessError as e:
         # Handle command execution errors
-        print("Error executing command:", e)
+        logging.exception("Error executing command:", e)
 
         # Save the command and error to a log file
         log_content = f"Command: {command}\nError: {e}\n"
@@ -297,22 +304,22 @@ def get_address_by_pubkey(peer_pubkey):
         else:
             return None
     else:
-        print(f"Error: {response.status_code}")
+        logging.error(f"Error: {response.status_code}")
         return None
 
 
 def connect_to_node(node_key_address):
     command = f"lncli connect {node_key_address} --timeout 120s"
-    print(f"Command:{command}")
+    logging.info(f"Command:{command}")
     process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     output, error = process.communicate()
     output = output.decode("utf-8")
 
     if process.returncode == 0:
-        print(f"Successfully connected to node {node_key_address}")
+        logging.info(f"Successfully connected to node {node_key_address}")
         return process.returncode
     else:
-        print(f"Error connecting to node {node_key_address}: {error}")
+        logging.error(f"Error connecting to node {node_key_address}: {error}")
         return process.returncode
 
 
@@ -347,12 +354,12 @@ def get_lncli_utxos():
         data = json.loads(output)
         utxos = data.get("utxos", [])
     except json.JSONDecodeError as e:
-        print(f"Error decoding lncli output: {e}")
+        logging.exception(f"Error decoding lncli output: {e}")
     
     # Sort utxos based on amount_sat in reverse order
     utxos = sorted(utxos, key=lambda x: x.get("amount_sat", 0), reverse=True)
     
-    print(f"Utxos:{utxos}")
+    logging.info(f"Utxos:{utxos}")
     return utxos
 
 # Calcula o tamanho da transação em vBytes
@@ -373,7 +380,7 @@ def calculate_utxos_required_and_fees(amount_input, fee_per_vbyte):
     related_outpoints = []
 
     if total < channel_size:
-        print(f"Não há UTXOs suficientes para abrir um canal de {channel_size} SATS. Total UTXOS: {total} SATS")
+        logging.error(f"There are not enough UTXOs to open a channel {channel_size} SATS. Total UTXOS: {total} SATS")
         return -1, 0, None
 
     #for utxo_amount, utxo_outpoint in zip(utxos_data['amounts'], utxos_data['outpoints']):
@@ -392,7 +399,7 @@ def calculate_utxos_required_and_fees(amount_input, fee_per_vbyte):
     return utxos_needed, fee_cost, related_outpoints if related_outpoints else None
 
 def check_channel():
-    print("check_channel function called")
+    logging.info("check_channel function called")
     url = 'https://api.amboss.space/graphql'
     headers = {
         'content-type': 'application/json',
@@ -402,6 +409,7 @@ def check_channel():
         "query": "query List {\n  getUser {\n    market {\n      offer_orders {\n        list {\n          id\n          size\n          status\n        account\n        seller_invoice_amount\n        }\n      }\n    }\n  }\n}"
     }
 
+
     try:
         response = requests.post(url, json=payload, headers=headers)
         response.raise_for_status()  # Raise an exception for 4xx and 5xx status codes
@@ -410,24 +418,25 @@ def check_channel():
         market = data.get('getUser', {}).get('market', {})
         offer_orders = market.get('offer_orders', {}).get('list', [])
 
-        # Print the entire offer list for debugging
-        print("All Offers:", offer_orders)
+        # Log the entire offer list for debugging
+        logging.info(f"All Offers: {offer_orders}")
 
         # Find the first offer with status "WAITING_FOR_CHANNEL_OPEN"
         valid_channel_to_open = next((offer for offer in offer_orders if offer.get('status') == "WAITING_FOR_CHANNEL_OPEN"), None)
 
-        # Print the found offer for debugging
-        print("Found Offer:", valid_channel_to_open)
+        # Log the found offer for debugging
+        logging.info(f"Found Offer: {valid_channel_to_open}")
 
         if not valid_channel_to_open:
-            print("No orders with status 'WAITING_FOR_CHANNEL_OPEN' waiting for execution.")
+            logging.info("No orders with status 'WAITING_FOR_CHANNEL_OPEN' waiting for execution.")
             return None
 
         return valid_channel_to_open
 
     except requests.exceptions.RequestException as e:
-        print(f"An error occurred while processing the request: {str(e)}")
+        logging.exception(f"An error occurred while processing the check-channel request: {str(e)}")
         return None
+
 #Check Buy offers
 def check_offers():
     url = 'https://api.amboss.space/graphql'
@@ -446,69 +455,69 @@ def check_offers():
         data = response.json()
 
         if data is None:  # Check if data is None
-            print("No data received from the API")
+            logging.error("No data received from the API")
             return None
         
         market = data.get('getUser', {}).get('market', {})
         offer_orders = market.get('offer_orders', {}).get('list', [])
 
-        # Print the entire offer list for debugging
-        print("All Offers:", offer_orders)
+        # Log the entire offer list for debugging
+        logging.info(f"All Offers: {offer_orders}")
 
         # Find the first offer with status "VALID_CHANNEL_OPENING"
         valid_channel_opening_offer = next((offer for offer in offer_orders if offer.get('status') == "WAITING_FOR_SELLER_APPROVAL"), None)
 
-        # Print the found offer for debugging
-        print("Found Offer:", valid_channel_opening_offer)
+        # Log the found offer for debugging
+        logging.info(f"Found Offer: {valid_channel_opening_offer}")
 
         if not valid_channel_opening_offer:
-            print("No orders with status 'WAITING_FOR_SELLER_APPROVAL' waiting for approval.")
+            logging.info("No orders with status 'WAITING_FOR_SELLER_APPROVAL' waiting for approval.")
             return None
 
         return valid_channel_opening_offer
 
     except requests.exceptions.RequestException as e:
-        print(f"An error occurred while processing the request: {str(e)}")
+        logging.exception(f"An error occurred while processing the check-offers request: {str(e)}")
         return None
 
 # Function Channel Open
 def open_channel(pubkey, size, invoice):
     # get fastest fee
-    print("Getting fastest fee...")
+    logging.info("Getting fastest fee...")
     fee_rate = get_fast_fee()
     formatted_outpoints = None
     if fee_rate:
-        print(f"Fastest Fee:{fee_rate} sat/vB")
+        logging.info(f"Fastest Fee:{fee_rate} sat/vB")
        # Check UTXOS and Fee Cost
-        print("Getting UTXOs, Fee Cost and Outpoints to open the channel")
+        logging.info("Getting UTXOs, Fee Cost and Outpoints to open the channel")
         utxos_needed, fee_cost, related_outpoints = calculate_utxos_required_and_fees(size,fee_rate)
        # Check if enough UTXOS
         if utxos_needed == -1:
             msg_open = f"There isn't enough confirmed Balance to open a {size} SATS channel"
-            print(msg_open)
+            logging.info(msg_open)
             return -1, msg_open 
         # Check if Fee Cost is less than the Invoice
         if (fee_cost) >= float(invoice):
             msg_open = f"Can't open this channel now, the fee {fee_cost} is bigger or equal to {limit_cost*100}% of the Invoice paid by customer"
-            print(msg_open)
+            logging.info(msg_open)
             return -2, msg_open
         # Good to open channel
         if related_outpoints is not None:
             formatted_outpoints = ' '.join([f'--utxo {outpoint}' for outpoint in related_outpoints])
-            print(f"Opening Channel: {pubkey}")
+            logging.info(f"Opening Channel: {pubkey}")
             # Run function to open channel
         else:
         # Handle the case when related_outpoints is None
-            print("No related outpoints found.")
-        print(f"Opening Channel: {pubkey}")
+            logging.info("No related outpoints found.")
+        logging.info(f"Opening Channel: {pubkey}")
         # Run function to open channel
         funding_tx = execute_lnd_command(pubkey, fee_rate, formatted_outpoints, size, fee_rate_ppm)
         if funding_tx is None:
             msg_open = f"Problem to execute the LNCLI command to open the channel. Please check the Log Files"
-            print(msg_open)
+            logging.info(msg_open)
             return -3, msg_open
         msg_open = f"Channel opened with funding transaction: {funding_tx}"
-        print(msg_open)
+        logging.info(msg_open)
         return funding_tx, msg_open       
 
     else:
@@ -516,7 +525,7 @@ def open_channel(pubkey, size, invoice):
 
 @bot.message_handler(commands=['channelopen'])
 def send_telegram_message(message):
-    print("send_telegram_message function called")
+    logging.info("send_telegram_message function called")
     if message is None:
         # If message is not provided, create a dummy message for default behavior
         class DummyMessage:
@@ -531,9 +540,9 @@ def send_telegram_message(message):
     # Get the current date and time
     current_datetime = datetime.now()
 
-    # Format and print the current date and time
+    # Format and Log the current date and time
     formatted_datetime = current_datetime.strftime("%Y-%m-%d %H:%M:%S")
-    print("Date and Time:", formatted_datetime)
+    logging.info(f"Date and Time: {formatted_datetime}")
     bot.send_message(message.chat.id, text="Checking new Orders...")
     valid_channel_opening_offer = check_offers()
 
@@ -553,12 +562,12 @@ def send_telegram_message(message):
         bot.send_message(message.chat.id, text=f"Generating Invoice of {valid_channel_opening_offer['seller_invoice_amount']} sats...")
         invoice_hash, invoice_request = execute_lncli_addinvoice(valid_channel_opening_offer['seller_invoice_amount'],f"Magma-Channel-Sale-Order-ID:{valid_channel_opening_offer['id']}", str(EXPIRE))
         if "Error" in invoice_hash:
-            print(invoice_hash)
+            logging.info(invoice_hash)
             bot.send_message(message.chat.id, text=invoice_hash)
             return
 
-        # Print the invoice result for debugging
-        print("Invoice Result:", invoice_request)
+        # Log the invoice result for debugging
+        logging.debug("Invoice Result:", invoice_request)
         # Send the payment_request content to Telegram
         if invoice_request is not None:
             bot.send_message(message.chat.id, str(invoice_request))
@@ -567,7 +576,7 @@ def send_telegram_message(message):
         bot.send_message(message.chat.id, f"Accepting Order: {valid_channel_opening_offer['id']}")
         accept_result = accept_order(valid_channel_opening_offer['id'], invoice_request)
         accept_result = accept_order(valid_channel_opening_offer['id'], invoice_request)
-        print("Order Acceptance Result:", accept_result)
+        logging.info("Order Acceptance Result:", accept_result)
         bot.send_message(message.chat.id, text=f"Order Acceptance Result: {accept_result}")
     
         # Check if the order acceptance was successful
@@ -575,18 +584,18 @@ def send_telegram_message(message):
             if accept_result['data']['sellerAcceptOrder']:
                 success_message = "Invoice Successfully Sent to Amboss. Now you need to wait for Buyer payment to open the channel."
                 bot.send_message(message.chat.id, text=success_message)
-                print(success_message)
+                logging.info(success_message)
             else:
                 failure_message = "Failed to accept the order. Check the accept_result for details."
                 bot.send_message(message.chat.id, text=failure_message)
-                print(failure_message)
+                logging.error(failure_message)
                 return
         
         else:
             error_message = "Unexpected format in the order acceptance result. Check the accept_result for details."
             bot.send_message(message.chat.id, text=error_message)
-            print(error_message)
-            print("Unexpected Order Acceptance Result Format:", accept_result)
+            logging.error(error_message)
+            logging.error("Unexpected Order Acceptance Result Format:", accept_result)
             return
     
     # Wait five minutes to check if the buyer pre-paid the offer
@@ -617,11 +626,11 @@ def send_telegram_message(message):
         #Connect
         node_connection = connect_to_node(customer_addr)
         if node_connection == 0:
-            print(f"Successfully connected to node {customer_addr}")
+            logging.info(f"Successfully connected to node {customer_addr}")
             bot.send_message(message.chat.id, text=f"Successfully connected to node {customer_addr}")
         
         else:
-            print(f"Error connecting to node {customer_addr}:")
+            logging.error(f"Error connecting to node {customer_addr}:")
             bot.send_message(message.chat.id, text=f"Can't connect to node {customer_addr}. Maybe it is already connected trying to open channel anyway")
 
         #Open Channel
@@ -634,7 +643,7 @@ def send_telegram_message(message):
             return
         # Send funding tx to Telegram
         bot.send_message(message.chat.id, text=msg_open)
-        print("Waiting 10 seconds to get channel point...")
+        logging.info("Waiting 10 seconds to get channel point...")
         bot.send_message(message.chat.id, text="Waiting 10 seconds to get channel point...")
         # Wait 10 seconds to get channel point
         time.sleep(10)
@@ -644,21 +653,21 @@ def send_telegram_message(message):
         if channel_point is None:
             #log_file_path = "amboss_channel_point.log"
             msg_cp = f"Can't get channel point, please check the log file {log_file_path} and try to get it manually from LNDG for the funding txid: {funding_tx}"
-            print(msg_cp)
+            logging.error(msg_cp)
             bot.send_message(message.chat.id,text=msg_cp)
             # Create the log file and write the channel_point value
             with open(log_file_path, "w") as log_file:
                 log_file.write(funding_tx)
             return
-        print(f"Channel Point: {channel_point}")
+        logging.info(f"Channel Point: {channel_point}")
         bot.send_message(message.chat.id, text=f"Channel Point: {channel_point}")
 
-        print("Waiting 10 seconds to Confirm Channel Point to Magma...")
+        logging.info("Waiting 10 seconds to Confirm Channel Point to Magma...")
         bot.send_message(message.chat.id, text="Waiting 10 seconds to Confirm Channel Point to Magma...")
         # Wait 10 seconds to get channel point
         time.sleep(10)
         # Send Channel Point to Amboss
-        print("Confirming Channel to Amboss...")
+        logging.info("Confirming Channel to Amboss...")
         bot.send_message(message.chat.id, text= "Confirming Channel to Amboss...")
         channel_confirmed = confirm_channel_point_to_amboss(valid_channel_to_open['id'],channel_point)
         if channel_confirmed is None or "Error" in channel_confirmed:
@@ -667,15 +676,15 @@ def send_telegram_message(message):
                 msg_confirmed = channel_confirmed
             else:
                 msg_confirmed = f"Can't confirm channel point {channel_point} to Amboss, check the log file {log_file_path} and try to do it manually"
-            print(msg_confirmed)
+            logging.info(msg_confirmed)
             bot.send_message(message.chat.id, text=msg_confirmed)
             # Create the log file and write the channel_point value
             with open(log_file_path, "w") as log_file:
                 log_file.write(channel_point)
             return
         msg_confirmed = "Opened Channel confirmed to Amboss"
-        print(msg_confirmed)
-        print(f"Result: {channel_confirmed}")
+        logging.info(msg_confirmed)
+        logging.info(f"Result: {channel_confirmed}")
         bot.send_message(message.chat.id, text=msg_confirmed)
         bot.send_message(message.chat.id, text=f"Result: {channel_confirmed}")
     elif os.path.exists(log_file_path):
@@ -686,7 +695,7 @@ def send_telegram_message(message):
 
 def execute_bot_behavior():
     # This function contains the logic you want to execute
-    print("Executing bot behavior...")
+    logging.info("Executing bot behavior...")
     send_telegram_message(None)  # Pass None as a placeholder for the message parameter
 
 # Schedule the bot_behavior function to run every 20 minutes
@@ -703,8 +712,8 @@ if __name__ == "__main__":
     #log_file_path2 = "amboss_open_command.log"
 
     # Check if the log file exists
-    print(f"Exist File Path1: {os.path.exists(log_file_path)}\n")
-    print(f"Exist File Path2: {os.path.exists(log_file_path2)}\n")
+    logging.info(f"Exist File Path1: {os.path.exists(log_file_path)}\n")
+    logging.info(f"Exist File Path2: {os.path.exists(log_file_path2)}\n")
     if not os.path.exists(log_file_path) and not os.path.exists(log_file_path2):
         if len(sys.argv) > 1 and sys.argv[1] == '--cron':
              # Execute the scheduled bot behavior immediately
@@ -717,7 +726,6 @@ if __name__ == "__main__":
             # Otherwise, run the bot polling for new messages
             bot.polling(none_stop=True)
     elif os.path.exists(log_file_path):
-        print(f"The log file {log_file_path} already exists. This means you need to check if there is a pending channel to confirm to Amboss. Check the {log_file_path} content")
+        logging.info(f"The log file {log_file_path} already exists. This means you need to check if there is a pending channel to confirm to Amboss. Check the {log_file_path} content")
     elif os.path.exists(log_file_path2):
-        print(f"The log file {log_file_path2} already exists. This means you have a problem with the LNCLI command, check first the {log_file_path2} content and if the channel is opened")
-
+        logging.info(f"The log file {log_file_path2} already exists. This means you have a problem with the LNCLI command, check first the {log_file_path2} content and if the channel is opened")
