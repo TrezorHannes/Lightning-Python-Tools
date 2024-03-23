@@ -576,7 +576,7 @@ def send_telegram_message(message):
         bot.send_message(message.chat.id, f"Accepting Order: {valid_channel_opening_offer['id']}")
         accept_result = accept_order(valid_channel_opening_offer['id'], invoice_request)
         accept_result = accept_order(valid_channel_opening_offer['id'], invoice_request)
-        logging.info("Order Acceptance Result:", accept_result)
+        logging.info(f"Order Acceptance Result: {accept_result}")
         bot.send_message(message.chat.id, text=f"Order Acceptance Result: {accept_result}")
     
         # Check if the order acceptance was successful
@@ -595,7 +595,7 @@ def send_telegram_message(message):
             error_message = "Unexpected format in the order acceptance result. Check the accept_result for details."
             bot.send_message(message.chat.id, text=error_message)
             logging.error(error_message)
-            logging.error("Unexpected Order Acceptance Result Format:", accept_result)
+            logging.error(f"Unexpected Order Acceptance Result Format: {accept_result}")
             return
     
     # Wait five minutes to check if the buyer pre-paid the offer
