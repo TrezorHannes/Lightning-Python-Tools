@@ -50,5 +50,9 @@ To create an alias for convenient usage, add the following line to your `nano ~/
 - `alias ps_list="INSTALLDIR/Lightning-Python-Tools/.venv/bin/python3 INSTALLDIR/Lightning-Python-Tools/Peerswap/ps_peers.py"`
 - `alias lndg_amboss="INSTALLDIR/Lightning-Python-Tools/.venv/bin/python3 INSTALLDIR/Lightning-Python-Tools/LNDg/amboss_pull.py"`
 
+### === How to obtain Telegram Infos ===
+- Contact the @myidbot bot and send the /getid command to get your personal chat ID, or invite it into a group and use the /getgroupid command to get the group chat ID.
+- Or get the chat ID directly from the bot API. Send your bot a command in the chat you want to use, then check https://api.telegram.org/bot{YourBotToken}/getUpdates, eg. https://api.telegram.org/botabcdefg:kjfsjf58FJkdjf49fj922fjkF/getUpdates
+
 If you have any questions or need support, feel free to reach out:
 Contact: https://njump.me/hakuna@tunnelsats.com
