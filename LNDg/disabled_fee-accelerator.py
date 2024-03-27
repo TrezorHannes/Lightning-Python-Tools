@@ -14,7 +14,7 @@
 
 import os
 import requests
-import datetime  # Import datetime module
+from datetime import datetime, timedelta
 import configparser
 import logging  # For more structured debugging
 from prettytable import PrettyTable
@@ -26,6 +26,9 @@ parent_dir = os.path.dirname(os.path.abspath(__file__))
 config_file_path = os.path.join(parent_dir, '..', 'config.ini')
 config = configparser.ConfigParser()
 config.read(config_file_path)
+
+# eg only update if the fee update is > 24 hrs ago
+fee_updated_hours_ago = 3
 
 # API endpoint URL for retrieving channels
 api_url = 'http://localhost:8889/api/channels?limit=1500'
@@ -49,7 +52,7 @@ ignore_remote_pubkeys = config['pubkey']['base_fee_ignore'].split(',')
 def calculate_new_fee_rate(local_fee_rate):
     # Define thresholds and increments
     lower_threshold = 200
-    upper_threshold = 1600
+    upper_threshold = 1750
     max_increment_percentage = 0.03  # 3% for slower slope
     min_increment = 10  # Minimum increment for high fee rates
 
@@ -81,8 +84,6 @@ def get_channels_to_modify():
             if 'results' in data:
                 results = data['results']
                 for result in results:
-                    # Keeping fees_updated in case we want to add a timebound dependency into the if-condition
-                    # eg only update if the fee update is > 24 hrs ago
                     remote_pubkey = result.get('remote_pubkey', '')
                     local_fee_rate = result.get('local_fee_rate', 0)
                     capacity = result.get('capacity', 0)
@@ -99,15 +100,25 @@ def get_channels_to_modify():
                     chan_id = result.get('chan_id', '')
                     alias = result.get('alias', '')
 
+                    # Parse the fees_updated string into a datetime object and calc the difference
+                    fees_updated_datetime = datetime.strptime(fees_updated, "%Y-%m-%dT%H:%M:%S.%f")
+                    time_difference = datetime.now() - fees_updated_datetime
+
+                    # Check if the fees were updated more than 'x' hours ago
+                    if time_difference > timedelta(hours=fee_updated_hours_ago):
+                        fees_timing_condition = True
+                    else:
+                        fees_timing_condition = False
+
                     if remote_pubkey in ignore_remote_pubkeys and remote_disabled and ar_out_target < 50:
                         logging.info(f"Ignoring channel {chan_id} with remote_pubkey {remote_pubkey}")
                     else:
-                        # add further filters into the if condition to losen or tighten which channels you want to update periodically
+                        # add more filters into the if condition to losen or tighten which channels you want to update periodically
                         # eg if capacity >= 5000000 will only add channels with more than 5M
 
                         # furthermore, the local_disabled is a custom setup I run since charge-lnd disables local initiator channels
                         # with < 5% local liquidity available.
-                        if initiator and is_active and local_disabled and is_open and ar_in_target < 95 and auto_fees and auto_rebalance:
+                        if initiator and is_active and local_disabled and is_open and ar_in_target < 95 and auto_fees and auto_rebalance and fees_timing_condition:
                             local_new_fee_rate = calculate_new_fee_rate(local_fee_rate)
                             
                             logging.info(f"Processing channel for {alias} - current fee: {local_fee_rate}, new fee: {local_new_fee_rate}, is_open: {is_open}")
@@ -145,7 +156,7 @@ def modify_channels(channels):
             response = requests.post(update_api_url, json=payload, auth=(username, password))
 
             # Get the current timestamp
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             if response.status_code == 200:
                 # Log the changes
