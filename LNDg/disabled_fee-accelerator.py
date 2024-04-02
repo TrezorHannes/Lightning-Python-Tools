@@ -27,8 +27,10 @@ config_file_path = os.path.join(parent_dir, '..', 'config.ini')
 config = configparser.ConfigParser()
 config.read(config_file_path)
 
-# eg only update if the fee update is > 24 hrs ago
+# only update if the fee update is > 24 hrs ago
 fee_updated_hours_ago = 3
+# stop increasing fee at ppm
+capped_ceiling = 2150
 
 # API endpoint URL for retrieving channels
 api_url = 'http://localhost:8889/api/channels?limit=1500'
@@ -44,7 +46,7 @@ password = config['credentials']['lndg_password']
 log_file_path = os.path.join(parent_dir, '..', 'logs', 'lndg-fee-accelerator.log')
 
 # Logfile definition
-logging.basicConfig(filename=log_file_path, level=logging.DEBUG) 
+logging.basicConfig(filename=log_file_path, level=logging.DEBUG)
 
 # Remote pubkey to ignore. Add pubkey or reference in config.ini if you want to use it.
 ignore_remote_pubkeys = config['pubkey']['base_fee_ignore'].split(',')
@@ -52,7 +54,7 @@ ignore_remote_pubkeys = config['pubkey']['base_fee_ignore'].split(',')
 def calculate_new_fee_rate(local_fee_rate):
     # Define thresholds and increments
     lower_threshold = 200
-    upper_threshold = 1750
+    upper_threshold = capped_ceiling
     max_increment_percentage = 0.03  # 3% for slower slope
     min_increment = 10  # Minimum increment for high fee rates
 
@@ -67,7 +69,7 @@ def calculate_new_fee_rate(local_fee_rate):
 
     # Calculate the increment based on the dynamic percentage
     increment = max(min_increment, local_fee_rate * increment_percentage)
-    local_new_fee_rate = min(local_fee_rate + increment, 1750)
+    local_new_fee_rate = min(local_fee_rate + increment, upper_threshold)
     local_new_fee_rate = int(round(local_new_fee_rate))
 
     return local_new_fee_rate
@@ -104,22 +106,23 @@ def get_channels_to_modify():
                     fees_updated_datetime = datetime.strptime(fees_updated, "%Y-%m-%dT%H:%M:%S.%f")
                     time_difference = datetime.now() - fees_updated_datetime
 
-                    # Check if the fees were updated more than 'x' hours ago
+                    local_new_fee_rate = calculate_new_fee_rate(local_fee_rate)
+
+                    # Check a few conditions upfront
                     if time_difference > timedelta(hours=fee_updated_hours_ago):
                         fees_timing_condition = True
                     else:
                         fees_timing_condition = False
 
-                    if remote_pubkey in ignore_remote_pubkeys and remote_disabled and ar_out_target < 50:
-                        logging.info(f"Ignoring channel {chan_id} with remote_pubkey {remote_pubkey}")
+                    if remote_pubkey in ignore_remote_pubkeys:
+                        logging.info(f"Ignoring channel {chan_id} with {alias} and current fee-rate of {local_fee_rate}")
                     else:
                         # add more filters into the if condition to losen or tighten which channels you want to update periodically
                         # eg if capacity >= 5000000 will only add channels with more than 5M
 
                         # furthermore, the local_disabled is a custom setup I run since charge-lnd disables local initiator channels
                         # with < 5% local liquidity available.
-                        if initiator and is_active and local_disabled and is_open and ar_in_target < 95 and auto_fees and auto_rebalance and fees_timing_condition:
-                            local_new_fee_rate = calculate_new_fee_rate(local_fee_rate)
+                        if initiator and is_active and local_disabled and is_open and ar_in_target < 95 and auto_fees and auto_rebalance and fees_timing_condition and local_new_fee_rate < capped_ceiling and ar_out_target > 50 and not remote_disabled:    
                             
                             logging.info(f"Processing channel for {alias} - current fee: {local_fee_rate}, new fee: {local_new_fee_rate}, is_open: {is_open}")
                             
@@ -160,7 +163,7 @@ def modify_channels(channels):
 
             if response.status_code == 200:
                 # Log the changes
-                logging.info(f"{timestamp}: Changed Local fee to {local_new_fee_rate} for channel {chan_id}\n")
+                logging.info(f"{timestamp}: API confirmed changing local fee to {local_new_fee_rate} for channel {chan_id}\n")
             else:
                 logging.error(f"{timestamp}: Failed to update channel {chan_id}: Status Code {response.status_code}")
 
