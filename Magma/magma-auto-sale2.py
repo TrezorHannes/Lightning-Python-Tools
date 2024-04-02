@@ -190,7 +190,10 @@ def get_channel_point(hash_to_find):
 
     return None
 
-# Write the pubkey to ensure the opening-fee is within the magma promise band, populated for charge-lnd to pickup
+# This needs an update since not using the pubkey but the channel-id for charge-lnd. 
+# However, the channel-id isn't populated until the utxo is confirmed. Needs a new polling function with
+# lncli pendingchannels or 
+# lncli listchannels --peer node_pub_key --skip_peer_alias_lookup 
 def update_magma_channel_fee(node_pub_key, magma_channel_list):
     with open(magma_channel_list, "a") as file:
         file.write(node_pub_key + "\n")
@@ -458,12 +461,18 @@ def check_offers():
             logging.error("No data received from the API")
             return None
         
+        response_data = response.json()
+        # logging.info(f"Raw API Response: {response_data}")
+
         market = data.get('getUser', {}).get('market', {})
-        offer_orders = market.get('offer_orders', {}).get('list', [])
+        # offer_orders = market.get('offer_orders', {}).get('list', [])
+        offer_orders = response_data.get('data', {}).get('getUser', {}).get('market', {}).get('offer_orders', {}).get('list', [])
 
         # Log the entire offer list for debugging
         logging.info(f"All Offers: {offer_orders}")
 
+        for offer in offer_orders:
+            logging.info(f"Offer ID: {offer.get('id')}, Status: {offer.get('status')}")
         # Find the first offer with status "VALID_CHANNEL_OPENING"
         valid_channel_opening_offer = next((offer for offer in offer_orders if offer.get('status') == "WAITING_FOR_SELLER_APPROVAL"), None)
 
