@@ -47,25 +47,25 @@ headers = {
 
 # Define the query
 query = '''
-    {
-      getUser {
-        market {
-          offer_orders {
-            list {
-              endpoints {
-                destination
-              }
-              status
-              channel_id
-              blocks_until_can_be_closed
-              created_at
-              id
-            }
+query ListAllActiveOffers { 
+  getUser {
+    market {
+      offer_orders {
+        list {
+          endpoints {
+            destination
           }
+          status
+          channel_id
+          blocks_until_can_be_closed
+          created_at
+          id
         }
       }
     }
-    '''
+  }
+}
+'''
 
 # Define the payload
 payload = {
