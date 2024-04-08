@@ -13,7 +13,7 @@ def get_lbtc_balance():
     balance_data = json.loads(result.stdout)
     sat_amount = balance_data['sat_amount']
     formatted_balance = "{:,}".format(int(sat_amount))
-    print(f"LBTC-Balance: {formatted_balance}")
+    return formatted_balance
 
 # Function to execute the command and return JSON output
 def get_pscli_listpeers_output():
@@ -54,7 +54,8 @@ def find_alias_by_node_id(node_id):
 def main():
     local_pubkey = get_local_node_pubkey()  # Get the local node's public key
     peers_data = get_pscli_listpeers_output()
-    channels_data = get_lncli_listchannels_output()  # Use the new function here
+
+    lbtc_balance = get_lbtc_balance()  # Store the balance 
 
     # Creating a PrettyTable
     table = PrettyTable()
@@ -87,6 +88,8 @@ def main():
                     peer_fee_rate,
                     active_status
                 ])
+
+    table.title = f"PeerSwap List - LBTC Balance: {lbtc_balance}"
 
     print(table)
 
