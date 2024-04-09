@@ -26,8 +26,8 @@ password = config['credentials']['lndg_password']
 lndg_api_url = 'http://localhost:8889/api/channels'
 
 # Define the output paths
-active_file_path = os.path.expanduser('~/.chargelnd/.config/magma-channels_new.txt') # Production
-finished_file_path = os.path.expanduser('~/.chargelnd/.config/magma-finished_new.txt') # Production
+charge_lnd_path = config['paths']['charge_lnd_path']
+finished_file_path = os.path.join(charge_lnd_path, 'magma-finished.txt') # Production
 
 # path for the log file
 log_file_path = os.path.join(parent_dir, '..', 'logs', 'amboss-LNDg_changes.log')
@@ -60,6 +60,7 @@ query ListAllActiveOffers {
           blocks_until_can_be_closed
           created_at
           id
+          locked_fee_rate_cap 
         }
       }
     }
@@ -114,20 +115,27 @@ def convert_short_to_long_chan_id(short_chan_ids):  # Now accepts a list
         print(f"An error occurred: {e}")
         return {} 
     
+def get_fee_cap_file_path(fee_cap):
+    return os.path.join(charge_lnd_path, f'magma-channels_{fee_cap}.txt') 
 
-# Function to move channels from active file to finished file
-def move_finished_channels():
+# Function to categorize channels, write to files, and update LNDg
+def cluster_sold_channels():
     response = requests.post(amboss_url, json=payload, headers=headers)
     response.raise_for_status()  
     data = response.json()
 
     active_channels_info = []  
     non_active_chan_ids = []
+    fee_cap_groups = {}  # To track fee caps
 
     short_id_info = {
-        order['channel_id']: {'status': order['status'], 'blocks_until_close': order['blocks_until_can_be_closed']}
-        for order in data['data']['getUser']['market']['offer_orders']['list'] if order['channel_id'] is not None
+    order['channel_id']: {
+        'status': order['status'], 
+        'blocks_until_close': order['blocks_until_can_be_closed'],
+        'locked_fee_rate_cap': order.get('locked_fee_rate_cap', 0)  # Include the fee cap
     }
+    for order in data['data']['getUser']['market']['offer_orders']['list'] if order['channel_id'] is not None
+}
 
     # Filter out None values and convert short IDs to long IDs
     short_chan_ids = list(short_id_info.keys())
@@ -142,22 +150,29 @@ def move_finished_channels():
 
         status = info['status']
         blocks_until_close = info['blocks_until_close']
+        fee_cap = info['locked_fee_rate_cap']
 
         if status == "CHANNEL_MONITORING_FINISHED" or blocks_until_close == 0:
             non_active_chan_ids.append(long_chan_id)
         elif status == "VALID_CHANNEL_OPENING":
             active_channels_info.append((long_chan_id, blocks_until_close))
 
-    # Write channel IDs to the active and finished files
-    with open(active_file_path, 'w') as active_file:
-        for chan_id, _ in active_channels_info:
-            active_file.write(chan_id + '\n')
+            if fee_cap not in fee_cap_groups:
+                fee_cap_groups[fee_cap] = [] 
+            fee_cap_groups[fee_cap].append(long_chan_id)
+
+    # Write channel IDs to their respective files 
+    for fee_cap, channel_ids in fee_cap_groups.items():
+        file_path = get_fee_cap_file_path(fee_cap)  # Function to generate file path based on fee cap
+        with open(file_path, 'w') as output_file:
+            for chan_id in channel_ids:
+                output_file.write(chan_id + '\n')
 
     with open(finished_file_path, 'w') as finished_file:
         for chan_id in non_active_chan_ids:
             finished_file.write(chan_id + '\n')
 
-    return active_channels_info, non_active_chan_ids
+    return active_channels_info, non_active_chan_ids, fee_cap_groups
 
 
 # Update the fee for channels with expired magma sales lease time
@@ -222,12 +237,9 @@ def update_notes_for_active_channels(active_channels_info):
             logging.error(f"Error updating notes for channel {chan_id}: {e}")
 
 
-# Call move_finished_pubkeys to get active and non-active pubkeys
-active_channels_info, non_active_chan_ids = move_finished_channels()
+# Main execution
+if __name__ == "__main__": 
+    active_channels_info, non_active_chan_ids, fee_cap_groups = cluster_sold_channels() 
 
-# Update auto fees for the channels with expired magma sales lease time
-# Comment this out if you only want to leverage note-updates in LNDg
-update_autofees(non_active_chan_ids)
-
-# Call update_notes_for_active_channels with active_chan_ids
-update_notes_for_active_channels(active_channels_info)
+    update_autofees(non_active_chan_ids)  # If you want to update autofees
+    update_notes_for_active_channels(active_channels_info) 
