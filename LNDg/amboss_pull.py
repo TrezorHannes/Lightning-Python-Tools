@@ -6,8 +6,10 @@
 import requests
 import os
 import datetime
+import time
 import logging  # For more structured debugging
 import configparser
+import json  # Import the json module
 
 # Get the path to the parent directory
 parent_dir = os.path.dirname(os.path.abspath(__file__))
@@ -120,9 +122,21 @@ def get_fee_cap_file_path(fee_cap):
 
 # Function to categorize channels, write to files, and update LNDg
 def cluster_sold_channels():
-    response = requests.post(amboss_url, json=payload, headers=headers)
-    response.raise_for_status()  
-    data = response.json()
+    data = {'data': {'getUser': {'market': {'offer_orders': {'list': []}}}}}
+    for attempt in range(5):
+        try:
+            response = requests.post(amboss_url, json=payload, headers=headers)
+            if response.status_code != 200:
+                raise requests.exceptions.HTTPError(f"HTTP Error: {response.status_code}")
+            data = response.json()
+            break
+        except requests.exceptions.HTTPError as e:
+            print(f"HTTP Error: {e}")
+        except json.decoder.JSONDecodeError as e:
+            print(f"JSON Decode Error: {e}")
+            if attempt == 4:
+                raise e
+            time.sleep(30)
 
     active_channels_info = []  
     non_active_chan_ids = []
