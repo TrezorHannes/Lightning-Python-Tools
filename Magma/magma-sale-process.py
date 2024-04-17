@@ -31,6 +31,11 @@ MAX_FEE_PERCENTAGE = 0.90
 FEE_RATE_PPM = 350 # let's pick this up from the query
 MEMPOOL_API_URL = 'https://mempool.space/api/v1/fees/recommended'
 
+# Constants
+UTXO_INPUT_SIZE = 57.5  # vBytes (approximate)
+OUTPUT_SIZE = 43  # vBytes (approximate)
+TRANSACTION_OVERHEAD = 10.5  # vBytes (approximate)
+
 TOKEN = config['telegram']['magma_bot_token']
 AMBOSS_TOKEN = config['credentials']['amboss_authorization']
 CHAT_ID = config['telegram']['telegram_user_id']
@@ -289,10 +294,6 @@ def get_and_calculate_utxos() -> list[dict]:
         error_logger.error("Error executing lncli: %s. Output: %s", e, e.output)
         raise LNDError("Failed to execute lncli") from e
 
-UTXO_INPUT_SIZE = 57.5  # vBytes (approximate)
-OUTPUT_SIZE = 43  # vBytes (approximate)
-TRANSACTION_OVERHEAD = 10.5  # vBytes (approximate)
-
 def calculate_transaction_size(utxos_needed: int, num_outputs: int = 2) -> int:
     """Calculates the estimated size of a Bitcoin transaction in virtual bytes (vBytes).
 
@@ -310,7 +311,7 @@ def calculate_transaction_size(utxos_needed: int, num_outputs: int = 2) -> int:
     total_size = int(total_size)  # Convert to integer (rounding down)
     return total_size
 
-def calculate_utxos_required_and_fees(target_amount, fee_per_vbyte):
+def calculate_utxos_required_and_fees(target_amount: int, fee_per_vbyte: int) -> Tuple[int, int, List[dict]]:
     utxos_data = sorted(get_and_calculate_utxos(), key=lambda x: x["amount_sat"], reverse=True)  # Sort by amount descending
     total_available = sum(utxo["amount_sat"] for utxo in utxos_data)
 
@@ -321,13 +322,13 @@ def calculate_utxos_required_and_fees(target_amount, fee_per_vbyte):
 
     utxos_needed = 0
     accumulated_amount = 0
-    selected_outpoints = []
+    selected_utxos = []
     fee_cost = 0
 
     for utxo in utxos_data:
         utxos_needed += 1
         accumulated_amount += utxo["amount_sat"]
-        selected_outpoints.append(utxo["outpoint"])
+        selected_utxos.append(utxo)
 
         tx_size = calculate_transaction_size(utxos_needed)
         fee_cost = tx_size * fee_per_vbyte
@@ -335,19 +336,32 @@ def calculate_utxos_required_and_fees(target_amount, fee_per_vbyte):
         if accumulated_amount >= target_amount + fee_cost:
             break
 
-    return utxos_needed, fee_cost, selected_outpoints
+    profitability = (target_amount - fee_cost) / target_amount
+    if profitability < MAX_FEE_PERCENTAGE:
+        error_message = f"Order not profitable: Profitability {profitability:.2%}, below maximum allowed {MAX_FEE_PERCENTAGE:.2%}"
+        handle_critical_error(error_message)  # Call the error handler
+        return -1, 0, None
+
+    return utxos_needed, fee_cost, selected_utxos
 
 
-def check_mempool_fees_and_profitability(order, fee_rate)
+def check_mempool_fees_and_profitability(order, fee_rate):
     response = requests.get(MEMPOOL_API_URL)
     data = response.json()
     if data:
         fast_fee = data['fastestFee']
-        return fast_fee
+        profitability = (order['seller_invoice_amount'] - fast_fee) / order['seller_invoice_amount']
+        if profitability < MAX_FEE_PERCENTAGE:
+            error_message = f"Order not profitable: Profitability {profitability:.2%}, below maximum allowed {MAX_FEE_PERCENTAGE:.2%}"
+            handle_critical_error(error_message)  # Call the error handler
+            return False
+        else:
+            return True
     else:
         return None
-    
 
+    
+'''
 def get_buyer_details_and_connect(pubkey)
     
 
@@ -356,7 +370,7 @@ def open_channel(pubkey, amount, fee_rate, outpoints)
 
 def confirm_channel_point(order_id, channel_point)
     
-
+'''
 
 
 if __name__ == "__main__":
