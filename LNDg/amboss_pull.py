@@ -9,7 +9,10 @@ import datetime
 import time
 import logging  # For more structured debugging
 import configparser
-import json  # Import the json module
+import json
+
+# how long until charge-lnd changes from strategy=static to proportional
+fee_grace_period = 2016
 
 # Get the path to the parent directory
 parent_dir = os.path.dirname(os.path.abspath(__file__))
@@ -62,7 +65,8 @@ query ListAllActiveOffers {
           blocks_until_can_be_closed
           created_at
           id
-          locked_fee_rate_cap 
+          locked_fee_rate_cap
+          locked_min_block_length 
         }
       }
     }
@@ -126,8 +130,7 @@ def cluster_sold_channels():
     for attempt in range(5):
         try:
             response = requests.post(amboss_url, json=payload, headers=headers)
-            if response.status_code != 200:
-                raise requests.exceptions.HTTPError(f"HTTP Error: {response.status_code}")
+            response.raise_for_status()
             data = response.json()
             break
         except requests.exceptions.HTTPError as e:
@@ -146,7 +149,8 @@ def cluster_sold_channels():
     order['channel_id']: {
         'status': order['status'], 
         'blocks_until_close': order['blocks_until_can_be_closed'],
-        'locked_fee_rate_cap': order.get('locked_fee_rate_cap', 0)  # Include the fee cap
+        'locked_fee_rate_cap': order.get('locked_fee_rate_cap', 0),
+        'locked_min_block_length': order.get('locked_min_block_length', 0)
     }
     for order in data['data']['getUser']['market']['offer_orders']['list'] if order['channel_id'] is not None
 }
@@ -165,11 +169,15 @@ def cluster_sold_channels():
         status = info['status']
         blocks_until_close = info['blocks_until_close']
         fee_cap = info['locked_fee_rate_cap']
+        min_block_length = info['locked_min_block_length']
 
         if status == "CHANNEL_MONITORING_FINISHED" or blocks_until_close == 0:
             non_active_chan_ids.append(long_chan_id)
         elif status == "VALID_CHANNEL_OPENING":
-            active_channels_info.append((long_chan_id, blocks_until_close))
+            
+            # Calculate how long until charge-lnd activates proportional fee strategy (setting: chan.min_age = 2016)
+            fee_grace_calculation = sum([-1 * (min_block_length - blocks_until_close - fee_grace_period)])
+            active_channels_info.append((long_chan_id, blocks_until_close, fee_cap, fee_grace_calculation))
 
             if fee_cap not in fee_cap_groups:
                 fee_cap_groups[fee_cap] = [] 
@@ -223,12 +231,16 @@ def update_notes_for_active_channels(active_channels_info):
 
     for item in active_channels_info:
         try:
-            chan_id, blocks_until_close = item
+            chan_id, blocks_until_close, fee_cap, min_block_length = item
         except ValueError:
-            print(f"Error unpacking item: {item}. Expected a tuple with 2 elements.")
+            print(f"Error unpacking item: {item}. Expected a tuple with 4 elements.")
             continue
 
-        notes = f"Status: 🌋 Magma Channel Buy Order Active (Lease Expiration: {blocks_until_close} blocks)"
+        notes = ""
+        if min_block_length < 0:
+            notes = f"Status: 🌋 Magma Channel Buy Order Active \n(Lease Expiration: {blocks_until_close} blocks). \nFee Cap: {fee_cap}. Proportional Fee Rate activated ✅"
+        elif min_block_length > 0:
+            notes = f"Status: 🌋 Magma Channel Buy Order Active \n(Lease Expiration: {blocks_until_close} blocks). \nFee Cap: {fee_cap}. Proportional Fee Rate in: {min_block_length}."
 
         payload = {
             "chan_id": chan_id,
