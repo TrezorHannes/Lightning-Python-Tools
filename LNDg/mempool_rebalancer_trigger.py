@@ -131,17 +131,9 @@ if __name__ == "__main__":
             if mempool_fees_ok is not None:
                 if mempool_fees_ok:
                     ar_enabled = True
-                    print("Mempool fees OK")
                 else:
                     ar_enabled = False
-                    print("Mempool fees Not OK")
                 adjust_ar_enabled(ar_enabled)
-
-                # Log the change
-                timestamp = get_current_timestamp()
-                log_message = f"{timestamp}: AR-Enabled setting adjusted to {ar_enabled}"
-                
-                logging.info(log_message)
 
             # Wait before the next check
             time.sleep(1800)  # Wait 1/2 hour
