@@ -167,9 +167,9 @@ def cluster_sold_channels():
             continue
 
         status = info['status']
-        blocks_until_close = info['blocks_until_close']
-        fee_cap = info['locked_fee_rate_cap']
-        min_block_length = info['locked_min_block_length']
+        blocks_until_close = info.get('blocks_until_close', 0) or 0
+        min_block_length = info.get('locked_min_block_length', 0) or 0
+        fee_cap = info.get('locked_fee_rate_cap', 0)
 
         if status == "CHANNEL_MONITORING_FINISHED" or blocks_until_close == 0:
             non_active_chan_ids.append(long_chan_id)
@@ -200,9 +200,36 @@ def cluster_sold_channels():
 # Update the fee for channels with expired magma sales lease time
 def update_autofees(non_active_chan_ids):
     global lndg_api_url
+    timestamp = get_current_timestamp()
 
-    for chan_id in non_active_chan_ids:
-        
+    def fetch_current_channel_states():
+        current_states = {}
+        try:
+            response = requests.get(f"{lndg_api_url}/", auth=(username, password))
+            if response.status_code == 200:
+                data = response.json()
+                for channel in data.get('results', []):
+                    chan_id = channel.get('chan_id', '')
+                    auto_fees = channel.get('auto_fees', False)
+                    is_active = channel.get('is_active', True)
+                    is_open = channel.get('is_open', True)
+
+                    # Only consider channels that are active, open, and have auto_fees set to False
+                    if is_active and is_open and not auto_fees:
+                        current_states[chan_id] = False
+            else:
+                logging.error(f"{timestamp} Failed to fetch current channel states, status code: {response.status_code}")
+        except Exception as e:
+            logging.error(f"{timestamp} Error fetching current channel states: {e}")
+        return current_states
+
+    current_channel_states = fetch_current_channel_states()
+    print(current_channel_states)
+
+    # Filter out channels that are not eligible for update (already have auto_fees set to True or are not active/open)
+    channels_to_update = [chan_id for chan_id in non_active_chan_ids if chan_id in current_channel_states]
+    print(f" Channels to Update: {channels_to_update}")
+    for chan_id in channels_to_update:
         notes = f"Status: ⛰️ Magma Channel Buy Order Expired"
         
         payload = {
@@ -213,12 +240,10 @@ def update_autofees(non_active_chan_ids):
         try:
             response = requests.put(f"{lndg_api_url}/{chan_id}/", json=payload, auth=(username, password))
 
-            timestamp = get_current_timestamp()
-
             if response.status_code == 200:
                 with open(log_file_path, 'a') as log_file:
                     log_file.write(f"{timestamp}: Updated auto_fees for channel {chan_id}\n")
-                logging.debug(f"Updated auto_fees for channel {chan_id}")
+                logging.info(f"Updated auto_fees for channel {chan_id}")
             else:
                 logging.error(f"{timestamp}: Failed to update auto_fees for channel {chan_id}: Status Code {response.status_code}")
 
