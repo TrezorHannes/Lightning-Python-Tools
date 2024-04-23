@@ -8,7 +8,7 @@ import re
 import io
 import argparse
 
-parser = argparse.ArgumentParser(description='Lightning Swap Wallet - Swap your wallet lightning fast.')
+parser = argparse.ArgumentParser(description='Lightning Swap Wallet')
 args = parser.parse_args()
 
 # Get the path to the parent directory
@@ -200,6 +200,9 @@ while True:
         print("Getting peers with local balance >= 30%...")
         try:
             # Execute the lncli command
+            command = f"{full_path_lncli}"
+            print("Executing command: ", command)
+            # Execute the command and capture the output
             command_output = execute_command(full_path_lncli)
             # Parse the JSON output
             data = json.load(io.StringIO(command_output))
