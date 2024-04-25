@@ -40,6 +40,15 @@ log_file_path = os.path.join(parent_dir, '..', 'logs', 'amboss-LNDg_changes.log'
 # Logfile definition
 logging.basicConfig(filename=log_file_path, level=logging.DEBUG) 
 
+# Error classes
+class AmbossAPIError(Exception):
+    """Represents an error when interacting with the Amboss API."""
+
+    def __init__(self, message, status_code=None, response_data=None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_data = response_data
+
 # Get the current timestamp
 def get_current_timestamp():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -134,11 +143,11 @@ def cluster_sold_channels():
             data = response.json()
             break
         except requests.exceptions.HTTPError as e:
-            print(f"HTTP Error: {e}")
+            logging.error(f"HTTP Error: {e}")
         except json.decoder.JSONDecodeError as e:
-            print(f"JSON Decode Error: {e}")
+            logging.error(f"Error fetching data from Amboss (attempt {attempt+1}/5): {e}")
             if attempt == 4:
-                raise e
+                raise AmbossAPIError("Could not fetch data from Amboss after 5 attempts") from e
             time.sleep(30)
 
     active_channels_info = []  
@@ -156,14 +165,16 @@ def cluster_sold_channels():
 }
 
     # Filter out None values and convert short IDs to long IDs
-    short_chan_ids = list(short_id_info.keys())
+    valid_orders = [order for order in data['data']['getUser']['market']['offer_orders']['list'] if order['channel_id'] is not None]
+
+    short_chan_ids = [order['channel_id'] for order in valid_orders]
     long_chan_id_map = convert_short_to_long_chan_id(short_chan_ids)
 
     # Process orders using long channel IDs
     for short_chan_id, info in short_id_info.items():
         long_chan_id = long_chan_id_map.get(short_chan_id)
         if not long_chan_id:
-            print(f"Warning: No long channel ID found for short channel ID {short_chan_id}")
+            logging.error(f"Warning: No long channel ID found for short channel ID {short_chan_id}")
             continue
 
         status = info['status']
