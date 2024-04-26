@@ -92,50 +92,59 @@ def filter_channels(channels):
 channel = 0
 
 def send_payments(ln_address, amount, total_amount, interval_seconds, fee_rate, message, peer):
-    global channel
-    global success_counter
-    remain_capacity_tx = 0
+    channel_index = 0
+    success_counter = 0
+
     while total_amount > 0:
-
-        # Build the command with user input
-        if peer is not None:
-            command_to_execute = f"{full_path_bos} send {ln_address} --amount {amount} --message \"{message}\" --max-fee-rate {fee_rate} --out {peer}"
+        if peer:
+            command_to_execute = build_command(ln_address, amount, message, fee_rate, peer)
         else:
-            print(f"Total peers: {len(filtered_channels)}")
-            if channel < len(filtered_channels):
-                peer_alias = filtered_channels[channel]['peer_alias']
-                print(f"Peer:{channel} - {peer_alias}")
-                command_to_execute = f"{full_path_bos} send {ln_address} --amount {amount} --message \"{message}\" --max-fee-rate {fee_rate} --out {filtered_channels[channel]['remote_pubkey']}"
+            if channel_index < len(filtered_channels):
+                peer_alias = filtered_channels[channel_index]['peer_alias']
+                remote_pubkey = filtered_channels[channel_index]['remote_pubkey']
+                print(f"Total peers: {len(filtered_channels)}")
+                print(f"Peer:{channel_index} - {peer_alias}")
+                command_to_execute = build_command(ln_address, amount, message, fee_rate, remote_pubkey)
             else:
-                print("Starting random peers...")
-                command_to_execute = f"{full_path_bos} send {ln_address} --amount {amount} --message \"{message}\" --max-fee-rate {fee_rate}"
-        print(f"Executing command: {command_to_execute}\n")
-        output = subprocess.run(command_to_execute, shell=True, capture_output=True, text=True)
+                print("All peers attempted, starting over with random peers...")
+                channel_index = 0  # Reset channel index to start over
+                continue  # Skip the rest of the loop and try again
 
-        # Check if the output contains a success message
+        output = execute_payment_command(command_to_execute)
         if "success" in output.stdout:
             total_amount -= amount
-            print(f"✅ Transaction successful.{output.stdout} \nRemaining amount: {total_amount}\n")
-            if peer is None:
-                
-                if channel < len(filtered_channels):
-                    success_counter += amount
-                    remain_capacity_tx = (int(filtered_channels[channel]['local_balance']) - success_counter) / int(filtered_channels[channel]['capacity'])
-                
-                if channel < len(filtered_channels) and remain_capacity_tx >= (args.local_balance / 100):
-                    peer_alias = filtered_channels[channel]['peer_alias']
-                    print(f"Trying again as remain local balance is higher than {args.local_balance}%: {peer_alias}")
+            print(f"✅ Transaction successful. Remaining amount: {total_amount}\n")
+            if total_amount > 0:
+                success_counter += amount
+                if should_retry_transaction(channel_index, success_counter):
+                    peer_alias = filtered_channels[channel_index]['peer_alias']
+                    print(f"Trying again as remaining local balance is higher than {args.local_balance}%: {peer_alias}")
                 else:
-                    channel += 1
-            
-            print(f"Waiting {interval_seconds} seconds to execute next transaction\n")
-            time.sleep(interval_seconds)
+                    channel_index += 1
+                    success_counter = 0  # Reset success counter for the next peer
+            else:
+                print("Execution finished 🎉")
         else:
-            print(f"❌ Transaction failed {output.stderr}. Retrying...\n")
-            channel += 1
-            success_counter = 0
-            print(f"⌛ Waiting in 5 seconds to try again\n")
-            time.sleep(5)
+            print(f"❌ Transaction failed {output.stderr}. Moving to next peer...\n")
+            channel_index += 1
+            success_counter = 0  # Reset success counter on failure
+
+        time.sleep(interval_seconds if "success" in output.stdout else 5)
+
+
+def build_command(ln_address, amount, message, fee_rate, peer):
+    return f"{full_path_bos} send {ln_address} --amount {amount} --message \"{message}\" --max-fee-rate {fee_rate} --out {peer}"
+
+
+def execute_payment_command(command):
+    print(f"Executing command: {command}\n")
+    return subprocess.run(command, shell=True, capture_output=True, text=True)
+
+
+def should_retry_transaction(channel_index, success_counter):
+    remain_capacity_tx = (int(filtered_channels[channel_index]['local_balance']) - success_counter) / int(filtered_channels[channel_index]['capacity'])
+    return remain_capacity_tx >= (args.local_balance / 100)
+
 
 print("-" * 80)
 print(" " * 30 + f"Lightning Swap Wallet")
@@ -197,7 +206,7 @@ try:
         if not peer:
             peer = None
             print("\n📢 No peer specified, trying first with heavy outbound peers...")
-            print("\n📋Getting peers with local balance >= {args.local_balance}%...")
+            print(f"\n📋Getting peers with local balance >= {args.local_balance}%...")
             channels = get_channels()
             filtered_channels = filter_channels(channels)
             break
