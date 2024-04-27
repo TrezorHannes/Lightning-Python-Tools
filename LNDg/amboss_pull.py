@@ -133,6 +133,14 @@ def convert_short_to_long_chan_id(short_chan_ids):  # Now accepts a list
 def get_fee_cap_file_path(fee_cap):
     return os.path.join(charge_lnd_path, f'magma-channels_{fee_cap}.txt') 
 
+
+def handle_api_error(e, attempt):
+    logging.error(f"Error fetching data from Amboss (attempt {attempt+1}/5): {e}")
+    if attempt == 4:
+        raise AmbossAPIError("Could not fetch data from Amboss after 5 attempts") from e
+    time.sleep(30)
+
+
 # Function to categorize channels, write to files, and update LNDg
 def cluster_sold_channels():
     data = {'data': {'getUser': {'market': {'offer_orders': {'list': []}}}}}
@@ -145,10 +153,7 @@ def cluster_sold_channels():
         except requests.exceptions.HTTPError as e:
             logging.error(f"HTTP Error: {e}")
         except json.decoder.JSONDecodeError as e:
-            logging.error(f"Error fetching data from Amboss (attempt {attempt+1}/5): {e}")
-            if attempt == 4:
-                raise AmbossAPIError("Could not fetch data from Amboss after 5 attempts") from e
-            time.sleep(30)
+            handle_api_error(e, attempt)
 
     active_channels_info = []  
     non_active_chan_ids = []
@@ -182,10 +187,8 @@ def cluster_sold_channels():
         min_block_length = info.get('locked_min_block_length', 0) or 0
         fee_cap = info.get('locked_fee_rate_cap', 0)
 
-        if status == "CHANNEL_MONITORING_FINISHED" or blocks_until_close == 0:
-            non_active_chan_ids.append(long_chan_id)
-        elif status == "VALID_CHANNEL_OPENING":
-            
+        if status == "VALID_CHANNEL_OPENING":
+
             # Calculate how long until charge-lnd activates proportional fee strategy (setting: chan.min_age = 2016)
             fee_grace_calculation = sum([-1 * (min_block_length - blocks_until_close - fee_grace_period)])
             active_channels_info.append((long_chan_id, blocks_until_close, fee_cap, fee_grace_calculation))
@@ -193,6 +196,13 @@ def cluster_sold_channels():
             if fee_cap not in fee_cap_groups:
                 fee_cap_groups[fee_cap] = [] 
             fee_cap_groups[fee_cap].append(long_chan_id)
+        
+        elif status == "CHANNEL_MONITORING_FINISHED" or blocks_until_close == 0:
+            non_active_chan_ids.append(long_chan_id)
+
+        else:
+            # Handle other statuses or unexpected cases
+            logging.info(f"Channel {long_chan_id} with status {status} and blocks until close {blocks_until_close} is not processed.")
 
     # Write channel IDs to their respective files 
     for fee_cap, channel_ids in fee_cap_groups.items():
