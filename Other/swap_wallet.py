@@ -18,8 +18,14 @@ import sys
 
 # Parse the command line arguments
 parser = argparse.ArgumentParser(description='Lightning Swap Wallet')
-parser.add_argument('-lb', '--local-balance', type=float, default=60,
-                    help='Minimum local balance percentage to consider for transactions (default: 60)')
+parser.add_argument('-lb', '--local-balance', type=float, default=60, help='Minimum local balance percentage to consider for transactions (default: 60)')
+parser.add_argument('-a', '--ln-address', type=str, help='Lightning address to send funds to')
+parser.add_argument('-ta', '--total-amount', type=int, help='Total amount to transfer (in satoshis)')
+parser.add_argument('-amt', '--amount', type=int, help='Amount per transaction (in satoshis)')
+parser.add_argument('-i', '--interval', type=int, default=3, help='Interval in seconds between transactions (default: 3)')
+parser.add_argument('-fr', '--fee-rate', type=int, help='Maximum fee rate in ppm (parts per million)')
+parser.add_argument('-m', '--message', type=str, help='Message to include with payments')
+parser.add_argument('-p', '--peer', type=str, help='Peer pubkey to send payments through (optional)')
 args = parser.parse_args()
 
 # Get the path to the parent directory
@@ -153,7 +159,6 @@ def send_payments_auto_select_peer(ln_address, amount, total_amount, interval_se
         time.sleep(interval_seconds if "success" in output.stdout else 5)
 
 
-
 def build_command(ln_address, amount, message, fee_rate, peer):
     return f"{full_path_bos} send {ln_address} --amount {amount} --message \"{message}\" --max-fee-rate {fee_rate} --out {peer}"
 
@@ -171,82 +176,75 @@ def should_retry_transaction(channel_index, success_counter, peer):
         return remain_capacity_tx >= (args.local_balance / 100)
 
 
-print("-" * 80)
-print(" " * 30 + f"Lightning Swap Wallet")
-print("-" * 80)
-        
-try:
-    # Get user input for LN address, amount, and total amount
-    while True:
-        ln_address = input("📧 Enter LN address: ")
-        if not ln_address:
-            print("🛑 Invalid LN address. Please enter a valid LN address.")
-            continue
-        elif not re.match(r'^[a-zA-Z0-9_.-]+@[a-zA-Z0-9_.-]+\.[a-zA-Z0-9_.-]+$', ln_address):
-            print("🛑 Invalid LN address. Please enter a valid LN address.")
-            continue
-        break
+def get_user_input_if_needed(arg_value, prompt_message):
+    """Gets user input if the command line argument is not provided."""
+    if arg_value is None:
+        while True:
+            user_input = input(prompt_message)
+            if not user_input:
+                print("Invalid input. Please try again.")
+            else:
+                return user_input
+    else:
+        return arg_value
 
 
-    while True:
-        total_amount_to_transfer = input("💰 Enter total amount to transfer: ")
-        try:
-            total_amount = int(total_amount_to_transfer)
-        except ValueError:
-            print("🛑 Invalid amount. Please enter a valid number.")
-            continue
-        break
+if __name__ == "__main__":
+    print("-" * 80)
+    print(" " * 30 + f"Lightning Swap Wallet")
+    print("-" * 80)
 
-    while True:
-        amount = input("💸 Enter amount per transaction: ")
-        try:
-            amount = int(amount)
-        except ValueError:
-            print("🛑 Invalid amount. Please enter a valid number.")
-            continue
-        break
+    try:
+        ln_address = get_user_input_if_needed(args.ln_address, "Enter LN address: ")
+        while not re.match(r'^[a-zA-Z0-9_.-]+@[a-zA-Z0-9_.-]+\.[a-zA-Z0-9_.-]+$', ln_address):
+            print("Invalid LN address. Please enter a valid LN address.")
+            ln_address = get_user_input_if_needed(args.ln_address, "Enter LN address: ")
+            
 
-    while True:
-        interval = input("⌛ Enter the interval in seconds between transactions: ")
-        try:
-            interval_seconds = int(interval)
-        except ValueError:
-            print("🛑 Invalid interval. Please enter a valid number.")
-            continue
-        break
+        total_amount = get_user_input_if_needed(args.total_amount, "Enter total amount to transfer: ")
+        while True:
+            try:
+                total_amount = int(total_amount)
+                break
+            except ValueError:
+                print("Invalid amount. Please enter a valid number.")
 
-    while True:
-        fee_rate = input("🫰 Enter the max fee rate in ppm: ")
-        try:
-            fee_rate = int(fee_rate)
-        except ValueError:
-            print("🛑 Invalid fee rate. Please enter a valid number.")
-            continue
-        break
+        amount = get_user_input_if_needed(args.amount, "Enter amount per transaction: ")
+        while True:
+            try:
+                amount = int(amount)
+                break
+            except ValueError:
+                print("Invalid amount. Please enter a valid number.")
 
-    message = input("🗯️ Payment Message: ")
+        interval_seconds = get_user_input_if_needed(args.interval, "Enter the interval in seconds between transactions: ")
+        while True:
+            try:
+                interval_seconds = int(interval_seconds)
+                break
+            except ValueError:
+                print("Invalid interval. Please enter a valid number.")
 
-    while True:
-        peer = input("🫗 Out Peer Alias or Pubkey: ")
-        if not peer:
-            peer = None
-            print("\n📢 No peer specified, trying first with heavy outbound peers...")
-            print(f"\n📋Getting peers with local balance >= {args.local_balance}%...")
-            channels = get_channels()
-            filtered_channels = filter_channels(channels)
-            break
-        else:
-            break
+        fee_rate = get_user_input_if_needed(args.fee_rate, "Enter the max fee rate in ppm: ")
+        while True:
+            try:
+                fee_rate = int(fee_rate)
+                break
+            except ValueError:
+                print("Invalid fee rate. Please enter a valid number.")
 
-except KeyboardInterrupt:
-    print("\nExiting...")
-    sys.exit(0)
+        message = get_user_input_if_needed(args.message, "Payment Message: ")
+        peer = args.peer  # Peer is optional, so it can be None
 
-# Send payments
-channels = get_channels()
-filtered_channels = filter_channels(channels)
+    except KeyboardInterrupt:
+        print("\nExiting...")
+        sys.exit(0)
 
-if peer:
-    send_payments_with_specified_peer(ln_address, amount, total_amount, interval_seconds, fee_rate, message, peer)
-else:
-    send_payments_auto_select_peer(ln_address, amount, total_amount, interval_seconds, fee_rate, message, filtered_channels)
+    # Send payments
+    channels = get_channels()
+    filtered_channels = filter_channels(channels)
+
+    if peer:
+        send_payments_with_specified_peer(ln_address, amount, total_amount, interval_seconds, fee_rate, message, peer)
+    else:
+        send_payments_auto_select_peer(ln_address, amount, total_amount, interval_seconds, fee_rate, message, filtered_channels)
