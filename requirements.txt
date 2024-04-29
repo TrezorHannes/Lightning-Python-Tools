@@ -1,6 +1,6 @@
 prettytable
-requests
-configparser
+requests==2.25.1
+configparser==3.8.1
 pyTelegramBotAPI>=4.14.1
 requests>=2.25.1
 schedule>=1.2.1
