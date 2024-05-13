@@ -83,7 +83,7 @@ def execute_lncli_addinvoice(amt, memo, expiry):
         logging.exception(f"Error executing command: {e}")
         return f"Error executing command: {e}", None
     
-# Function to format the response content with emojis
+# Function to format the response content
 def format_response(response_content):
     if isinstance(response_content, str):
         # Convert the JSON response to a dictionary
@@ -422,7 +422,7 @@ def check_channel():
         offer_orders = market.get('offer_orders', {}).get('list', [])
 
         # Log the entire offer list for debugging
-        logging.info(f"All Offers: {offer_orders}")
+        # logging.info(f"All Offers: {offer_orders}")
 
         # Find the first offer with status "WAITING_FOR_CHANNEL_OPEN"
         valid_channel_to_open = next((offer for offer in offer_orders if offer.get('status') == "WAITING_FOR_CHANNEL_OPEN"), None)
@@ -552,11 +552,13 @@ def send_telegram_message(message):
     # Format and Log the current date and time
     formatted_datetime = current_datetime.strftime("%Y-%m-%d %H:%M:%S")
     logging.info(f"Date and Time: {formatted_datetime}")
-    bot.send_message(message.chat.id, text="Checking new Orders...")
+    # bot.send_message(message.chat.id, text="Checking new Orders...")
+    logging.info("Checking new Orders...")
     valid_channel_opening_offer = check_offers()
 
     if not valid_channel_opening_offer:
-        bot.send_message(message.chat.id, text="No Magma orders waiting for your approval.")
+        # bot.send_message(message.chat.id, text="No Magma orders waiting for your approval.")
+        logging.info("No Magma orders waiting for your approval.")
     else:
 
         # Display the details of the valid channel opening offer
@@ -612,11 +614,13 @@ def send_telegram_message(message):
     # Check if there is no error on a previous attempt to open a channel or confirm channel point to amboss
     
     if not os.path.exists(log_file_path) and not os.path.exists(log_file_path2):
-        bot.send_message(message.chat.id, text="Checking Channels to Open...")
+        # bot.send_message(message.chat.id, text="Checking Channels to Open...")
+        logging.info("Checking Channels to Open...")
         valid_channel_to_open = check_channel()
 
         if not valid_channel_to_open:
-            bot.send_message(message.chat.id, text="No Channels pending to open.")
+            # bot.send_message(message.chat.id, text="No Channels pending to open.")
+            logging.info("No Channels pending to open.")
             return
 
         # Display the details of the valid channel opening offer
