@@ -136,10 +136,12 @@ def monitor_sell_requests(target_statuses: list[str]) -> tuple[dict | None, dict
     try:
         response = requests.post(AMBOSS_API_URL, json={"query": query}, headers=AMBOSS_API_HEADERS)
         response.raise_for_status()  # Raise exception for HTTP errors
+        print("API response received successfully") # Debugging print
 
         data = response.json()
-        # print(data)  # Print the entire response
+        # print(f"Received data: {data}")  # Debugging print
         offer_orders = data.get('data', {}).get('getUser', {}).get('market', {}).get('offer_orders', {}).get('list', [])
+        print(f"Found {len(offer_orders)} offer orders") # Debugging print
 
         matching_order = next(
             (offer for offer in offer_orders if offer.get('status') in target_statuses), None
@@ -147,6 +149,7 @@ def monitor_sell_requests(target_statuses: list[str]) -> tuple[dict | None, dict
         if matching_order:
             # uncomment for detailed debugging
             # main_logger.info("Found order with status '%s': %s", target_status, matching_order)
+            print(f"Found matching order with status '{matching_order.get('status')}': {matching_order}")
             return matching_order, data.get('extensions')  # Return both order and extensions
 
         return matching_order, data.get('extensions')  # Return None for order, but still include extensions
@@ -204,13 +207,14 @@ def create_lightning_invoice(amount: int, memo: str, expiry: int) -> tuple[str |
     """
 
     command = f"lncli addinvoice --memo '{memo}' --amt {amount} --expiry {expiry}"
+    result = None
 
     try:
         result = subprocess.run(command, shell=True, capture_output=True, text=True, check=True)
         output_json = json.loads(result.stdout)
 
-        payment_hash = output_json.get("r_hash")
-        payment_request = output_json.get("payment_request")
+        payment_hash: Optional[str] = output_json.get("r_hash")
+        payment_request: Optional[str] = output_json.get("payment_request")
 
         if payment_request:
             main_logger.info("Created Lightning invoice: %s (hash: %s)", payment_request, payment_hash)
@@ -220,7 +224,11 @@ def create_lightning_invoice(amount: int, memo: str, expiry: int) -> tuple[str |
         return payment_hash, payment_request
 
     except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
-        error_logger.error("Error creating Lightning invoice: %s. Command: %s", e, command)
+        if isinstance(e, subprocess.CalledProcessError):
+            error_logger.error("lncli command failed: %s (return code: %s)", e.stderr, e.returncode)
+        elif isinstance(e, json.JSONDecodeError):
+            error_logger.error("Error decoding lncli output: %s. Output: %s", e, result.stdout if result else "N/A") 
+
         raise LNDError("Failed to create Lightning invoice") from e
 
 
@@ -653,25 +661,31 @@ if __name__ == "__main__":
         sys.exit(1) 
 
     # Use polling2 library's poll function for better control and error handling
-    poll_fn = lambda: monitor_sell_requests(target_statuses) 
+    # poll_fn = lambda: monitor_sell_requests(target_statuses) 
     while True:
         try:
-            order, extensions = polling2.poll(
-                poll_fn,
-                check_success=lambda x: x[0] is not None,
-                step=poll_interval,
-                poll_forever=True
-            )
-            main_logger.info(f"Order found: {order}")
-            main_logger.info(f"Fee rate cap: {order.get('locked_fee_rate_cap')}")
+            time.sleep(poll_interval)
+            order: Optional[dict] = None
+            extensions: Optional[dict] = None
 
-            if extensions is not None:
-                main_logger.info(f"Extensions: {extensions}")
-                main_logger.info(f"Currently available credits: {extensions.get('cost', {}).get('throttleStatus', {}).get('currentlyAvailable')}")
+            order, extensions = monitor_sell_requests(target_statuses)
 
             if order is not None:
+                main_logger.info(f"Order found: {order}")
+                if fee_rate_cap := order.get("locked_fee_rate_cap"):  
+                        main_logger.info(f"Fee rate cap: {fee_rate_cap}")
+                else:
+                    main_logger.warning("Fee rate cap not found in order data.")
+
+                if extensions is not None:
+                    main_logger.info(f"Extensions: {extensions}")
+                    main_logger.info(f"Currently available credits: {extensions.get('cost', {}).get('throttleStatus', {}).get('currentlyAvailable')}")
+                    poll_interval = adjust_poll_interval(extensions, poll_interval)
+
                 try:
                     match order['status']:
+                        case "SELLER_REJECTED":
+                            order, extensions = monitor_sell_requests(target_statuses)
                         case "WAITING_FOR_SELLER_APPROVAL":
                             main_logger.info("Found an order waiting for seller approval.")
                             # Add logic to decide whether to approve or reject the order
