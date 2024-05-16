@@ -35,7 +35,7 @@ CHAT_ID = config['telegram']['telegram_user_id']
 magma_channel_list = config['paths']['charge_lnd_path']
 full_path_bos = config['system']['full_path_bos']
 
-# Set up logging
+# Set up logging // Needs fixing @TrezorHannes
 log_file_path = os.path.join(parent_dir, '..', 'logs', 'magma-auto-sale2.log')
 logging.basicConfig(filename=log_file_path, level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 log_file_path = os.path.join(parent_dir, '..', 'logs', 'amboss_channel_point.log')
