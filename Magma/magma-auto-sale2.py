@@ -427,9 +427,6 @@ def check_offers():
         # offer_orders = market.get('offer_orders', {}).get('list', [])
         offer_orders = response_data.get('data', {}).get('getUser', {}).get('market', {}).get('offer_orders', {}).get('list', [])
 
-        # Log the entire offer list for debugging
-        logging.info(f"All Offers: {offer_orders}")
-
         for offer in offer_orders:
             logging.info(f"Offer ID: {offer.get('id')}, Status: {offer.get('status')}")
         # Find the first offer with status "VALID_CHANNEL_OPENING"
