@@ -674,9 +674,6 @@ def execute_bot_behavior():
     logging.info("Executing bot behavior...")
     send_telegram_message(None)  # Pass None as a placeholder for the message parameter
 
-# Schedule the bot_behavior function to run every 20 minutes
-schedule.every(20).minutes.do(execute_bot_behavior)
-
 
 if __name__ == "__main__":
     # Check if the error log file exists
