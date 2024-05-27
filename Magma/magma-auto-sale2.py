@@ -130,9 +130,7 @@ def confirm_channel_point_to_amboss(order_id, transaction):
             # Handle error in the JSON response and log it
             error_message = json_response['errors'][0]['message']
             log_content = f"Error in confirm_channel_point_to_amboss:\nOrder ID: {order_id}\nTransaction: {transaction}\nError Message: {error_message}\n"
-
-            with open(error_file_path, "w") as log_file:
-                log_file.write(log_content)
+            logging.error(log_content)
 
             return log_content
         else:
@@ -626,8 +624,7 @@ def send_telegram_message(message):
             logging.error(msg_cp)
             bot.send_message(message.chat.id,text=msg_cp)
             # Create the log file and write the channel_point value
-            with open(log_file_path, "w") as log_file:
-                log_file.write(funding_tx)
+            logging.info(funding_tx)
             return
         logging.info(f"Channel Point: {channel_point}")
         bot.send_message(message.chat.id, text=f"Channel Point: {channel_point}")
