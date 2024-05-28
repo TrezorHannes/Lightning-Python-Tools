@@ -473,7 +473,6 @@ def open_channel(pubkey, size, invoice):
         else:
         # Handle the case when related_outpoints is None
             logging.info("No related outpoints found.")
-        logging.info(f"Opening Channel: {pubkey}")
         # Run function to open channel
         funding_tx = execute_lnd_command(pubkey, fee_rate, formatted_outpoints, size, fee_rate_ppm)
         if funding_tx is None:
