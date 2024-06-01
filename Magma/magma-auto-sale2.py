@@ -659,7 +659,7 @@ def send_telegram_message(message):
 @bot.message_handler(commands=['runnow'])
 def handle_command(message):
     logging.info("Executing bot behavior triggered by Telegram command.")
-    execute_bot_behavior()
+    threading.Thread(target=execute_bot_behavior).start()
 
 
 def execute_bot_behavior():
@@ -674,12 +674,13 @@ if __name__ == "__main__":
         # Schedule the bot behavior to run every 20 minutes
         schedule.every(20).minutes.do(execute_bot_behavior)
 
-        # Start the bot in non-blocking mode
-        threading.Thread(target=lambda: bot.polling(none_stop=True)).start()
-
-        # Run scheduled tasks in the main thread
-        while True:
-            schedule.run_pending()
-            time.sleep(1)  # Ensure there's a small delay to prevent high CPU usage
     else:
         logging.info(f"The log file {error_file_path} already exists. This means you need to check if there is a pending channel to confirm to Amboss. Check the {log_file_path} content")
+    
+    # Start the bot in non-blocking mode
+    threading.Thread(target=lambda: bot.polling(none_stop=True)).start()
+
+    # Run scheduled tasks in the main thread
+    while True:
+        schedule.run_pending()
+        time.sleep(1)  # Ensure there's a small delay to prevent high CPU usage
