@@ -85,6 +85,62 @@ def execute_lncli_addinvoice(amt, memo, expiry):
         logging.exception(f"Error executing command: {e}")
         return f"Error executing command: {e}", None
 
+def get_buyer_summary(pubkey):
+    url = 'https://api.amboss.space/graphql'
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {AMBOSS_TOKEN}'
+    }
+
+    query = '''
+    query GetBuyerSummary($pubkey: String!) {
+      getNode(pubkey: $pubkey) {
+        graph_info {
+          node {
+            addresses {
+              addr
+            }
+            alias
+          }
+          channels {
+            num_channels
+            total_capacity
+          }
+        }
+        socials {
+          info {
+            email
+            nostr
+            nostr_username
+            telegram
+            twitter
+            website
+            custom_url
+            message
+          }
+          lightning_labs {
+            terminal_web {
+              position
+              score
+              stable_inbound_peers
+              stable_outbound_peers
+            }
+          }
+          ln_plus {
+            rankings {
+              negative_ratings_received
+              positive_ratings_received
+            }
+          }
+        }
+      }
+    }
+    '''
+
+    variables = {"pubkey": pubkey}
+
+    response = requests.post(url, json={"query": query, "variables": variables}, headers=headers)
+    return response.json()
 
 def accept_order(order_id, payment_request):
     url = 'https://api.amboss.space/graphql'
@@ -102,6 +158,21 @@ def accept_order(order_id, payment_request):
     response = requests.post(url, json={"query": query, "variables": variables}, headers=headers)
     return response.json()
 
+def reject_order(order_id):
+    url = 'https://api.amboss.space/graphql'
+    headers = {
+        'content-type': 'application/json',
+        'Authorization': f'Bearer {AMBOSS_TOKEN}',
+    }
+    query = '''
+        mutation Mutation($sellerRejectOrderId: String!) {
+          sellerRejectOrder(id: $sellerRejectOrderId)
+        }
+    '''
+    variables = {"sellerRejectOrderId": order_id}
+
+    response = requests.post(url, json={"query": query, "variables": variables}, headers=headers)
+    return response.json()
 
 def confirm_channel_point_to_amboss(order_id, transaction):
     url = 'https://api.amboss.space/graphql'
@@ -140,7 +211,6 @@ def confirm_channel_point_to_amboss(order_id, transaction):
         logging.exception(f"Error making the request: {e}")
         return None
     
-
 def get_channel_point(hash_to_find):
     def execute_lightning_command():
         command = [
@@ -174,7 +244,6 @@ def get_channel_point(hash_to_find):
                 return channel_point
 
     return None
-
 
 def execute_lnd_command(node_pub_key, fee_per_vbyte, formatted_outpoints, input_amount, fee_rate_ppm):
     # Format the command
@@ -215,7 +284,6 @@ def execute_lnd_command(node_pub_key, fee_per_vbyte, formatted_outpoints, input_
         logging.exception(f"Error executing command: {e}")
         return None
 
-
 def get_fast_fee():
     response = requests.get(API_MEMPOOL)
     data = response.json()
@@ -224,7 +292,6 @@ def get_fast_fee():
         return fast_fee
     else:
         return None
-
 
 def get_address_by_pubkey(peer_pubkey):
     url = 'https://api.amboss.space/graphql'
@@ -271,7 +338,6 @@ def get_address_by_pubkey(peer_pubkey):
         logging.error(f"Error: {response.status_code}")
         return None
 
-
 def connect_to_node(node_key_address, max_retries=MAX_CONNECTION_RETRIES):
     retries = 0
     while retries < max_retries:
@@ -298,7 +364,6 @@ def connect_to_node(node_key_address, max_retries=MAX_CONNECTION_RETRIES):
     logging.error(f"Failed to connect to node {node_key_address} after {max_retries} retries.")
     return 1  # Return 1 or another non-zero value to indicate failure
 
-
 def get_lncli_utxos():
     command = f"lncli listunspent --min_confs=3"
     process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -319,14 +384,12 @@ def get_lncli_utxos():
     logging.info(f"Utxos:{utxos}")
     return utxos
 
-
 def calculate_transaction_size(utxos_needed):
     inputs_size = utxos_needed * 57.5  # Cada UTXO é de 57.5 vBytes
     outputs_size = 2 * 43  # Dois outputs de 43 vBytes cada
     overhead_size = 10.5  # Overhead de 10.5 vBytes
     total_size = inputs_size + outputs_size + overhead_size
     return total_size
-
 
 def calculate_utxos_required_and_fees(amount_input, fee_per_vbyte):
     utxos_data = get_lncli_utxos()
@@ -355,7 +418,6 @@ def calculate_utxos_required_and_fees(amount_input, fee_per_vbyte):
         channel_size -= utxo['amount_sat']
 
     return utxos_needed, fee_cost, related_outpoints if related_outpoints else None
-
 
 def check_channel():
     logging.info("check_channel function called")
@@ -396,8 +458,6 @@ def check_channel():
         logging.exception(f"An error occurred while processing the check-channel request: {str(e)}")
         return None
 
-
-#Check Buy offers
 def check_offers():
     url = 'https://api.amboss.space/graphql'
     headers = {
@@ -443,230 +503,248 @@ def check_offers():
         logging.exception(f"An error occurred while processing the check-offers request: {str(e)}")
         return None
 
-
-# Function Channel Open
 def open_channel(pubkey, size, invoice):
-    # get fastest fee
     logging.info("Getting fastest fee...")
     fee_rate = get_fast_fee()
     formatted_outpoints = None
     if fee_rate:
-        logging.info(f"Fastest Fee:{fee_rate} sat/vB")
-       # Check UTXOS and Fee Cost
+        logging.info(f"Fastest Fee: {fee_rate} sat/vB")
         logging.info("Getting UTXOs, Fee Cost and Outpoints to open the channel")
-        utxos_needed, fee_cost, related_outpoints = calculate_utxos_required_and_fees(size,fee_rate)
-       # Check if enough UTXOS
+        utxos_needed, fee_cost, related_outpoints = calculate_utxos_required_and_fees(size, fee_rate)
+        
         if utxos_needed == -1:
             msg_open = f"There isn't enough confirmed Balance to open a {size} SATS channel"
-            logging.info(msg_open)
-            return -1, msg_open 
-        # Check if Fee Cost is less than the Invoice
-        if (fee_cost) >= float(invoice):
+            return -1, msg_open
+        
+        if fee_cost >= float(invoice):
             msg_open = f"Can't open this channel now, the fee {fee_cost} is bigger or equal to {limit_cost*100}% of the Invoice paid by customer"
-            logging.info(msg_open)
             return -2, msg_open
-        # Good to open channel
+        
         if related_outpoints is not None:
             formatted_outpoints = ' '.join([f'--utxo {outpoint}' for outpoint in related_outpoints])
             logging.info(f"Opening Channel: {pubkey}")
-            # Run function to open channel
         else:
-        # Handle the case when related_outpoints is None
             logging.info("No related outpoints found.")
-        # Run function to open channel
+        
         funding_tx = execute_lnd_command(pubkey, fee_rate, formatted_outpoints, size, fee_rate_ppm)
         if funding_tx is None:
-            msg_open = f"Problem to execute the LNCLI command to open the channel. Please check the Log Files"
-            logging.info(msg_open)
+            msg_open = "Problem to execute the LNCLI command to open the channel. Please check the Log Files"
             return -3, msg_open
+        
         msg_open = f"Channel opened with funding transaction: {funding_tx}"
-        logging.info(msg_open)
-        return funding_tx, msg_open       
-
+        return funding_tx, msg_open
     else:
-        return None
+        msg_open = "Failed to get the fastest fee rate."
+        return None, msg_open
+
+def send_message(chat_id, text):
+    bot.send_message(chat_id, text)
+    logging.info(text)
+
+def generate_invoice(amount, order_id):
+    invoice_hash, invoice_request = execute_lncli_addinvoice(amount, f"Magma-Channel-Sale-Order-ID:{order_id}", str(EXPIRE))
+    if "Error" in invoice_hash:
+        logging.error(invoice_hash)
+        return None, invoice_hash
+    return invoice_hash, invoice_request
+
+def accept_order_and_notify(chat_id, order_id, invoice_request):
+    accept_result = accept_order(order_id, invoice_request)
+    send_message(chat_id, f"Order Acceptance Result: {accept_result}")
+    if 'data' in accept_result and 'sellerAcceptOrder' in accept_result['data']:
+        if accept_result['data']['sellerAcceptOrder']:
+            success_message = "Invoice Successfully Sent to Amboss. Now you need to wait for Buyer payment to open the channel."
+            send_message(chat_id, success_message)
+            return True
+        else:
+            failure_message = "Failed to accept the order. Check the accept_result for details."
+            send_message(chat_id, failure_message)
+            return False
+    else:
+        error_message = "Unexpected format in the order acceptance result. Check the accept_result for details."
+        send_message(chat_id, error_message)
+        return False
+
+def handle_user_response(user_message, valid_channel_opening_offer):
+    if user_message.text.lower() == 'yes':
+        send_message(user_message.chat.id, "You accepted the offer. Proceeding with the order...")
+        invoice_hash, invoice_request = generate_invoice(valid_channel_opening_offer['seller_invoice_amount'], valid_channel_opening_offer['id'])
+        if invoice_request is None:
+            send_message(user_message.chat.id, invoice_hash)
+            return
+        if accept_order_and_notify(user_message.chat.id, valid_channel_opening_offer['id'], invoice_request):
+            time.sleep(420)  # Wait seven minutes to check if the buyer pre-paid the offer
+    elif user_message.text.lower() == 'no':
+        send_message(user_message.chat.id, "You rejected the offer. Cancelling the order...")
+        reject_order(valid_channel_opening_offer['id'])
+    else:
+        send_message(user_message.chat.id, "Invalid response. Please type 'Yes' or 'No'.")
+        bot.register_next_step_handler(user_message, lambda msg: handle_user_response(msg, valid_channel_opening_offer))
+
 
 
 @bot.message_handler(commands=['channelopen'])
 def send_telegram_message(message):
     logging.info("send_telegram_message function called")
     if message is None:
-        # If message is not provided, create a dummy message for default behavior
         class DummyMessage:
             def __init__(self):
                 self.chat = DummyChat()
-
         class DummyChat:
             def __init__(self):
-                self.id = CHAT_ID  # Provide a default chat ID
-
+                self.id = CHAT_ID
         message = DummyMessage()
-    # Get the current date and time
-    current_datetime = datetime.now()
 
-    # Format and Log the current date and time
+    current_datetime = datetime.now()
     formatted_datetime = current_datetime.strftime("%Y-%m-%d %H:%M:%S")
     logging.info(f"Date and Time: {formatted_datetime}")
-    # bot.send_message(message.chat.id, text="Checking new Orders...")
     logging.info("Checking new Orders...")
     valid_channel_opening_offer = check_offers()
 
     if not valid_channel_opening_offer:
-        # bot.send_message(message.chat.id, text="No Magma orders waiting for your approval.")
         logging.info("No Magma orders waiting for your approval.")
+        return
+
+    send_message(message.chat.id, "Found Order:")
+    display_channel_offer_details(message.chat.id, valid_channel_opening_offer)
+
+    buyer_summary = get_buyer_summary(valid_channel_opening_offer['account'])
+    buyer_info = buyer_summary.get('data', {}).get('getNode', {})
+    summary = f"Buyer Alias: {buyer_info.get('graph_info', {}).get('node', {}).get('alias', 'N/A')}\n"
+    summary += f"Number of Channels: {buyer_info.get('graph_info', {}).get('channels', {}).get('num_channels', 'N/A')}\n"
+    summary += f"Total Capacity: {buyer_info.get('graph_info', {}).get('channels', {}).get('total_capacity', 'N/A')}\n"
+    summary += f"Email: {buyer_info.get('socials', {}).get('info', {}).get('email', 'N/A')}\n"
+    summary += f"Telegram: {buyer_info.get('socials', {}).get('info', {}).get('telegram', 'N/A')}\n"
+    summary += f"Twitter: {buyer_info.get('socials', {}).get('info', {}).get('twitter', 'N/A')}\n"
+    summary += f"Website: {buyer_info.get('socials', {}).get('info', {}).get('website', 'N/A')}\n"
+    summary += f"Positive Ratings: {buyer_info.get('socials', {}).get('ln_plus', {}).get('rankings', {}).get('positive_ratings_received', 'N/A')}\n"
+    summary += f"Negative Ratings: {buyer_info.get('socials', {}).get('ln_plus', {}).get('rankings', {}).get('negative_ratings_received', 'N/A')}\n"
+    send_message(message.chat.id, f"Buyer Summary:\n{summary}")
+
+    markup = types.ReplyKeyboardMarkup(one_time_keyboard=True)
+    markup.add('Yes', 'No')
+    send_message(message.chat.id, "Do you want to accept this channel buy offer?")
+    bot.send_message(message.chat.id, "Do you want to accept this channel buy offer?", reply_markup=markup)
+
+    if isinstance(message, types.Message):
+        bot.register_next_step_handler(message, lambda msg: handle_user_response(msg, valid_channel_opening_offer))
     else:
+        logging.error("Invalid message type received for next step handler")
 
-        # Display the details of the valid channel opening offer
-        bot.send_message(message.chat.id, text="Found Order:")
-        formatted_offer = f"ID: {valid_channel_opening_offer['id']}\n"
-        formatted_offer += f"Amount: {valid_channel_opening_offer['seller_invoice_amount']}\n"
-        formatted_offer += f"Status: {valid_channel_opening_offer['status']}\n"
+    time.sleep(300)  # Wait for 5 minutes for user response
 
-        bot.send_message(message.chat.id, text=formatted_offer)
+    send_message(message.chat.id, "No response received. Proceeding with the order...")
+    invoice_hash, invoice_request = generate_invoice(valid_channel_opening_offer['seller_invoice_amount'], valid_channel_opening_offer['id'])
+    if invoice_request is None:
+        send_message(message.chat.id, invoice_hash)
+        return
+    if accept_order_and_notify(message.chat.id, valid_channel_opening_offer['id'], invoice_request):
+        time.sleep(420)  # Wait seven minutes to check if the buyer pre-paid the offer
 
-        # Call the invoice function
-        bot.send_message(message.chat.id, text=f"Generating Invoice of {valid_channel_opening_offer['seller_invoice_amount']} sats...")
-        invoice_hash, invoice_request = execute_lncli_addinvoice(valid_channel_opening_offer['seller_invoice_amount'],f"Magma-Channel-Sale-Order-ID:{valid_channel_opening_offer['id']}", str(EXPIRE))
-        if "Error" in invoice_hash:
-            logging.info(invoice_hash)
-            bot.send_message(message.chat.id, text=invoice_hash)
-            return
-
-        # Log the invoice result for debugging
-        logging.debug("Invoice Result:", invoice_request)
-        # Send the payment_request content to Telegram
-        if invoice_request is not None:
-            bot.send_message(message.chat.id, str(invoice_request))
-        
-        # Accept the order
-        bot.send_message(message.chat.id, f"Accepting Order: {valid_channel_opening_offer['id']}")
-        accept_result = accept_order(valid_channel_opening_offer['id'], invoice_request)
-        logging.info(f"Order Acceptance Result: {accept_result}")
-        bot.send_message(message.chat.id, text=f"Order Acceptance Result: {accept_result}")
-    
-        # Check if the order acceptance was successful
-        if 'data' in accept_result and 'sellerAcceptOrder' in accept_result['data']:
-            if accept_result['data']['sellerAcceptOrder']:
-                success_message = "Invoice Successfully Sent to Amboss. Now you need to wait for Buyer payment to open the channel."
-                bot.send_message(message.chat.id, text=success_message)
-                logging.info(success_message)
-            else:
-                failure_message = "Failed to accept the order. Check the accept_result for details."
-                bot.send_message(message.chat.id, text=failure_message)
-                logging.error(failure_message)
-                return
-        
-        else:
-            error_message = "Unexpected format in the order acceptance result. Check the accept_result for details."
-            bot.send_message(message.chat.id, text=error_message)
-            logging.error(error_message)
-            logging.error(f"Unexpected Order Acceptance Result Format: {accept_result}")
-            return
-    
-    # Wait seven minutes to check if the buyer pre-paid the offer
-    time.sleep(420)
-    # Check if there is no error on a previous attempt to open a channel or confirm channel point to amboss
-    
     if not os.path.exists(error_file_path):
-        # bot.send_message(message.chat.id, text="Checking Channels to Open...")
         logging.info("Checking Channels to Open...")
         valid_channel_to_open = check_channel()
 
         if not valid_channel_to_open:
-            # bot.send_message(message.chat.id, text="No Channels pending to open.")
             logging.info("No Channels pending to open.")
             return
 
-        # Display the details of the valid channel opening offer
-        bot.send_message(message.chat.id, text="Order:")
-        formatted_offer = f"ID: {valid_channel_to_open['id']}\n"
-        formatted_offer += f"Customer: {valid_channel_to_open['account']}\n"
-        formatted_offer += f"Size: {valid_channel_to_open['size']} SATS\n"
-        formatted_offer += f"Invoice: {valid_channel_to_open['seller_invoice_amount']} SATS\n"
-        formatted_offer += f"Status: {valid_channel_to_open['status']}\n"
+        send_message(message.chat.id, "Order:")
+        display_channel_offer_details(message.chat.id, valid_channel_to_open)
 
-        bot.send_message(message.chat.id, text=formatted_offer)
-
-        #Connecting to Peer
-        bot.send_message(message.chat.id, text=f"Connecting to peer: {valid_channel_to_open['account']}")
-        customer_addr = get_address_by_pubkey(valid_channel_to_open['account'])
-        #Connect
-        node_connection = connect_to_node(customer_addr)
-        if node_connection == 0:
-            logging.info(f"Successfully connected to node {customer_addr}")
-            bot.send_message(message.chat.id, text=f"Successfully connected to node {customer_addr}")
-        
-        else:
-            logging.error(f"Error connecting to node {customer_addr}:")
-            bot.send_message(message.chat.id, text=f"Can't connect to node {customer_addr}. Maybe it is already connected trying to open channel anyway")
-
-        #Open Channel
-        
-        bot.send_message(message.chat.id, text=f"Open a {valid_channel_to_open['size']} SATS channel")    
-        funding_tx, msg_open = open_channel(valid_channel_to_open['account'], valid_channel_to_open['size'], valid_channel_to_open['seller_invoice_amount']) # type: ignore
-        # Deal with  errors and show on Telegram
-        if funding_tx == -1 or funding_tx == -2 or funding_tx == -3:
-            bot.send_message(message.chat.id, text=msg_open)
+        if connect_to_peer(message.chat.id, valid_channel_to_open['account']) != 0:
             return
-        # Send funding tx to Telegram
-        bot.send_message(message.chat.id, text=msg_open)
-        logging.info("Waiting 10 seconds to get channel point...")
-        bot.send_message(message.chat.id, text="Waiting 10 seconds to get channel point...")
-        # Wait 10 seconds to get channel point
-        time.sleep(10)
 
-        # Get Channel Point
-        channel_point = get_channel_point(funding_tx)
+        funding_tx, msg_open = open_channel_and_notify(message.chat.id, valid_channel_to_open['account'], valid_channel_to_open['size'], valid_channel_to_open['seller_invoice_amount'])
+        if funding_tx is None:
+            return
+
+        channel_point, msg_confirmed = get_and_confirm_channel_point(message.chat.id, funding_tx, valid_channel_to_open['id'])
         if channel_point is None:
-            #log_file_path = "amboss_channel_point.log"
-            msg_cp = f"Can't get channel point, please check the log file {log_file_path} and try to get it manually from LNDG for the funding txid: {funding_tx}"
-            logging.error(msg_cp)
-            bot.send_message(message.chat.id,text=msg_cp)
-            # Create the log file and write the channel_point value
-            logging.info(funding_tx)
             return
-        logging.info(f"Channel Point: {channel_point}")
-        bot.send_message(message.chat.id, text=f"Channel Point: {channel_point}")
+    else:
+        send_message(message.chat.id, f"The log file {error_file_path} already exists. This means you need to check if there is a pending channel to confirm to Amboss. Check the {log_file_path} content")
+    
+def display_channel_offer_details(chat_id, offer):
+    formatted_offer = f"ID: {offer['id']}\n"
+    formatted_offer += f"Customer: {offer['account']}\n"
+    formatted_offer += f"Size: {offer['size']} SATS\n"
+    formatted_offer += f"Invoice: {offer['seller_invoice_amount']} SATS\n"
+    formatted_offer += f"Status: {offer['status']}\n"
+    send_message(chat_id, formatted_offer)
 
-        logging.info("Waiting 10 seconds to Confirm Channel Point to Magma...")
-        bot.send_message(message.chat.id, text="Waiting 10 seconds to Confirm Channel Point to Magma...")
-        # Wait 10 seconds to get channel point
-        time.sleep(10)
-        # Send Channel Point to Amboss
-        logging.info("Confirming Channel to Amboss...")
-        bot.send_message(message.chat.id, text= "Confirming Channel to Amboss...")
-        channel_confirmed = confirm_channel_point_to_amboss(valid_channel_to_open['id'],channel_point)
-        if channel_confirmed is None or "Error" in channel_confirmed:
-            #log_file_path = "amboss_channel_point.log"
-            if isinstance(channel_confirmed, str) and "Error" in channel_confirmed:
-                msg_confirmed = channel_confirmed
-            else:
-                msg_confirmed = f"Can't confirm channel point {channel_point} to Amboss, check the log file {log_file_path} and try to do it manually"
-            logging.info(msg_confirmed)
-            bot.send_message(message.chat.id, text=msg_confirmed)
-            # Create the log file and write the channel_point value
-            logging.error(channel_point)
-            return
-        msg_confirmed = "Opened Channel confirmed to Amboss"
+def connect_to_peer(chat_id, account):
+    send_message(chat_id, f"Connecting to peer: {account}")
+    customer_addr = get_address_by_pubkey(account)
+    node_connection = connect_to_node(customer_addr)
+    if node_connection == 0:
+        logging.info(f"Successfully connected to node {customer_addr}")
+        send_message(chat_id, f"Successfully connected to node {customer_addr}")
+    else:
+        logging.error(f"Error connecting to node {customer_addr}:")
+        send_message(chat_id, f"Can't connect to node {customer_addr}. Maybe it is already connected trying to open channel anyway")
+    return node_connection
+
+def open_channel_and_notify(chat_id, account, size, invoice_amount):
+    send_message(chat_id, f"Open a {size} SATS channel")
+    funding_tx, msg_open = open_channel(account, size, invoice_amount)
+    
+    if funding_tx is None or funding_tx in [-1, -2, -3]:
+        send_message(chat_id, msg_open)
+        return None, msg_open
+    
+    send_message(chat_id, msg_open)
+    return funding_tx, msg_open
+
+def get_and_confirm_channel_point(chat_id, funding_tx, order_id):
+    logging.info("Waiting 10 seconds to get channel point...")
+    send_message(chat_id, "Waiting 10 seconds to get channel point...")
+    time.sleep(10)
+    channel_point = get_channel_point(funding_tx)
+    if channel_point is None:
+        msg_cp = f"Can't get channel point, please check the log file {log_file_path} and try to get it manually from LNDG for the funding txid: {funding_tx}"
+        logging.error(msg_cp)
+        send_message(chat_id, msg_cp)
+        logging.info(funding_tx)
+        return None, msg_cp
+    logging.info(f"Channel Point: {channel_point}")
+    send_message(chat_id, f"Channel Point: {channel_point}")
+
+    logging.info("Waiting 10 seconds to Confirm Channel Point to Magma...")
+    send_message(chat_id, "Waiting 10 seconds to Confirm Channel Point to Magma...")
+    time.sleep(10)
+    logging.info("Confirming Channel to Amboss...")
+    send_message(chat_id, "Confirming Channel to Amboss...")
+    channel_confirmed = confirm_channel_point_to_amboss(order_id, channel_point)
+    if channel_confirmed is None or "Error" in channel_confirmed:
+        if isinstance(channel_confirmed, str) and "Error" in channel_confirmed:
+            msg_confirmed = channel_confirmed
+        else:
+            msg_confirmed = f"Can't confirm channel point {channel_point} to Amboss, check the log file {log_file_path} and try to do it manually"
         logging.info(msg_confirmed)
-        logging.info(f"Result: {channel_confirmed}")
-        bot.send_message(message.chat.id, text=msg_confirmed)
-        bot.send_message(message.chat.id, text=f"Result: {channel_confirmed}")
-    elif os.path.exists(error_file_path):
-        bot.send_message(message.chat.id, text=f"The log file {error_file_path} already exists. This means you need to check if there is a pending channel to confirm to Amboss. Check the {log_file_path} content")
-
+        send_message(chat_id, msg_confirmed)
+        logging.error(channel_point)
+        return None, msg_confirmed
+    msg_confirmed = "Opened Channel confirmed to Amboss"
+    logging.info(msg_confirmed)
+    logging.info(f"Result: {channel_confirmed}")
+    send_message(chat_id, msg_confirmed)
+    send_message(chat_id, f"Result: {channel_confirmed}")
+    return channel_point, msg_confirmed
 
 @bot.message_handler(commands=['runnow'])
 def handle_command(message):
     logging.info("Executing bot behavior triggered by Telegram command.")
-    threading.Thread(target=execute_bot_behavior).start()
+    
+    # Send a confirmation message back to the user
+    bot.reply_to(message, "Got it! Running the bot behavior now...")
 
+    threading.Thread(target=execute_bot_behavior).start()
 
 def execute_bot_behavior():
     # This function contains the logic you want to execute
     logging.info("Executing bot behavior...")
     send_telegram_message(None)  # Pass None as a placeholder for the message parameter
-
 
 if __name__ == "__main__":
     # Check if the error log file exists
