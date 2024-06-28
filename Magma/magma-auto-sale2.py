@@ -490,6 +490,24 @@ def open_channel(pubkey, size, invoice):
         return None
 
 
+def bos_confirm_income(amount):
+    command = (
+        f"{config['system']['full_path_bos']} send {config['info']['NODE']} "
+        f"--amount {amount} --avoid-high-fee-routes"
+    )
+    logging.info(f"Executing BOS command: {command}")
+
+    try:
+        result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
+        logging.info(f"BOS Command Output: {result.stdout}")
+        bot.send_message(CHAT_ID, text=f"BOS Command Output: {result.stdout}")
+        return result.stdout
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error executing BOS command: {e}")
+        bot.send_message(CHAT_ID, text=f"Error executing BOS command: {e}")
+        return None
+    
+
 @bot.message_handler(commands=['channelopen'])
 def send_telegram_message(message):
     logging.info("send_telegram_message function called")
@@ -656,6 +674,14 @@ def send_telegram_message(message):
         logging.info(f"Result: {channel_confirmed}")
         bot.send_message(message.chat.id, text=msg_confirmed)
         bot.send_message(message.chat.id, text=f"Result: {channel_confirmed}")
+
+        # We'll send the same invoice amount to ourselves to allow for LNDg to pick this up as a net-positive income for accounting.
+        # Check your keysends table to a manual mark to add it to your PNL
+        bos_result = bos_confirm_income(valid_channel_to_open['seller_invoice_amount'])
+        if bos_result:
+            logging.info("BOS command executed successfully.")
+        else:
+            logging.error("BOS command execution failed.")
     elif os.path.exists(error_file_path):
         bot.send_message(message.chat.id, text=f"The log file {error_file_path} already exists. This means you need to check if there is a pending channel to confirm to Amboss. Check the {log_file_path} content")
 
