@@ -490,10 +490,10 @@ def open_channel(pubkey, size, invoice):
         return None
 
 
-def bos_confirm_income(amount):
+def bos_confirm_income(amount, peer_pubkey):
     command = (
         f"{config['system']['full_path_bos']} send {config['info']['NODE']} "
-        f"--amount {amount} --avoid-high-fee-routes"
+        f"--amount {amount} --avoid-high-fee-routes --message 'HODLmeTight Amboss Channel Sale with {peer_pubkey}'"
     )
     logging.info(f"Executing BOS command: {command}")
 
@@ -677,7 +677,7 @@ def send_telegram_message(message):
 
         # We'll send the same invoice amount to ourselves to allow for LNDg to pick this up as a net-positive income for accounting.
         # Check your keysends table to a manual mark to add it to your PNL
-        bos_result = bos_confirm_income(valid_channel_to_open['seller_invoice_amount'])
+        bos_result = bos_confirm_income(valid_channel_to_open['seller_invoice_amount'], peer_pubkey=valid_channel_to_open['peer_pubkey'])
         if bos_result:
             logging.info("BOS command executed successfully.")
         else:

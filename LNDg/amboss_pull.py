@@ -39,6 +39,7 @@ log_file_path = os.path.join(parent_dir, '..', 'logs', 'amboss-LNDg_changes.log'
 
 # Logfile definition
 logging.basicConfig(filename=log_file_path, level=logging.DEBUG) 
+specific_long_chan_id = "920617787503214592"
 
 # Error classes
 class AmbossAPIError(Exception):
@@ -199,6 +200,7 @@ def cluster_sold_channels():
         
         elif status == "CHANNEL_MONITORING_FINISHED" or blocks_until_close == 0:
             non_active_chan_ids.append(long_chan_id)
+            logging.debug(f"Added to non_active_chan_ids: {long_chan_id}")
 
         else:
             # Handle other statuses or unexpected cases
@@ -215,6 +217,8 @@ def cluster_sold_channels():
         for chan_id in non_active_chan_ids:
             finished_file.write(chan_id + '\n')
 
+    logging.debug(f"Specific channel {specific_long_chan_id} in non_active_chan_ids: {specific_long_chan_id in non_active_chan_ids}")
+    logging.debug(f"Final non_active_chan_ids: {non_active_chan_ids}")
     return active_channels_info, non_active_chan_ids, fee_cap_groups
 
 
@@ -245,10 +249,12 @@ def update_autofees(non_active_chan_ids):
         return current_states
 
     current_channel_states = fetch_current_channel_states()
+    logging.debug(f"Current channel states: {current_channel_states}")
     print(current_channel_states)
 
     # Filter out channels that are not eligible for update (already have auto_fees set to True or are not active/open)
     channels_to_update = [chan_id for chan_id in non_active_chan_ids if chan_id in current_channel_states]
+    logging.debug(f"Channels to update: {channels_to_update}")
     print(f" Channels to Update: {channels_to_update}")
     for chan_id in channels_to_update:
         notes = f"Status: ⛰️ Magma Channel Buy Order Expired"
@@ -270,6 +276,9 @@ def update_autofees(non_active_chan_ids):
 
         except Exception as e:
             logging.error(f"Error updating auto_fees for channel {chan_id}: {e}")
+    
+    logging.debug(f"Specific channel {specific_long_chan_id} in current_channel_states: {specific_long_chan_id in current_channel_states}")
+    logging.debug(f"Specific channel {specific_long_chan_id} in channels_to_update: {specific_long_chan_id in channels_to_update}")
 
 
 def update_notes_for_active_channels(active_channels_info):
