@@ -28,7 +28,7 @@ amboss_url = 'https://api.amboss.space/graphql'
 # LNDg API credentials and endpoints. Retrievable from lndg/data/lndg-admin.txt
 username = config['credentials']['lndg_username']
 password = config['credentials']['lndg_password']
-lndg_api_url = 'http://localhost:8889/api/channels'
+lndg_api_url = 'http://localhost:8889/api/channels/?limit=1000&offset=0'
 
 # Define the output paths
 charge_lnd_path = config['paths']['charge_lnd_path']
@@ -239,6 +239,9 @@ def update_autofees(non_active_chan_ids):
                     is_active = channel.get('is_active', True)
                     is_open = channel.get('is_open', True)
 
+                    # Log each channel's details
+                    logging.debug(f"Channel ID: {chan_id}, is_active: {is_active}, is_open: {is_open}, auto_fees: {auto_fees}")
+
                     # Only consider channels that are active, open, and have auto_fees set to False
                     if is_active and is_open and not auto_fees:
                         current_states[chan_id] = False
@@ -265,7 +268,8 @@ def update_autofees(non_active_chan_ids):
             "notes": notes
         }
         try:
-            response = requests.put(f"{lndg_api_url}/{chan_id}/", json=payload, auth=(username, password))
+            put_url = f"http://localhost:8889/api/channels/{chan_id}/"
+            response = requests.put(put_url, json=payload, auth=(username, password))
 
             if response.status_code == 200:
                 with open(log_file_path, 'a') as log_file:
@@ -282,7 +286,7 @@ def update_autofees(non_active_chan_ids):
 
 
 def update_notes_for_active_channels(active_channels_info):
-    global lndg_api_url
+    # global lndg_api_url
 
     for item in active_channels_info:
         try:
@@ -303,7 +307,8 @@ def update_notes_for_active_channels(active_channels_info):
             "notes": notes
         }
         try:
-            response = requests.put(f"{lndg_api_url}/{chan_id}/", json=payload, auth=(username, password))
+            put_url = f"http://localhost:8889/api/channels/{chan_id}/"
+            response = requests.put(put_url, json=payload, auth=(username, password))
 
             timestamp = get_current_timestamp()
 
