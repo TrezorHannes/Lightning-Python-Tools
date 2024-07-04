@@ -28,7 +28,7 @@ amboss_url = 'https://api.amboss.space/graphql'
 # LNDg API credentials and endpoints. Retrievable from lndg/data/lndg-admin.txt
 username = config['credentials']['lndg_username']
 password = config['credentials']['lndg_password']
-lndg_api_url = 'http://localhost:8889/api/channels/?limit=1000&offset=0'
+lndg_api_url = 'http://localhost:8889/api/channels/?is_active=true&is_open=true&limit=300&offset=0'
 
 # Define the output paths
 charge_lnd_path = config['paths']['charge_lnd_path']
@@ -38,8 +38,7 @@ finished_file_path = os.path.join(charge_lnd_path, 'magma-finished.txt') # Produ
 log_file_path = os.path.join(parent_dir, '..', 'logs', 'amboss-LNDg_changes.log')
 
 # Logfile definition
-logging.basicConfig(filename=log_file_path, level=logging.DEBUG) 
-specific_long_chan_id = "920617787503214592"
+logging.basicConfig(filename=log_file_path, level=logging.DEBUG)
 
 # Error classes
 class AmbossAPIError(Exception):
@@ -217,8 +216,8 @@ def cluster_sold_channels():
         for chan_id in non_active_chan_ids:
             finished_file.write(chan_id + '\n')
 
-    logging.debug(f"Specific channel {specific_long_chan_id} in non_active_chan_ids: {specific_long_chan_id in non_active_chan_ids}")
-    logging.debug(f"Final non_active_chan_ids: {non_active_chan_ids}")
+    # logging.debug(f"Specific channel {specific_long_chan_id} in non_active_chan_ids: {specific_long_chan_id in non_active_chan_ids}")
+    # logging.debug(f"Final non_active_chan_ids: {non_active_chan_ids}")
     return active_channels_info, non_active_chan_ids, fee_cap_groups
 
 
@@ -240,10 +239,10 @@ def update_autofees(non_active_chan_ids):
                     is_open = channel.get('is_open', True)
 
                     # Log each channel's details
-                    logging.debug(f"Channel ID: {chan_id}, is_active: {is_active}, is_open: {is_open}, auto_fees: {auto_fees}")
+                    # logging.debug(f"Channel ID: {chan_id}, is_active: {is_active}, is_open: {is_open}, auto_fees: {auto_fees}")
 
-                    # Only consider channels that are active, open, and have auto_fees set to False
-                    if is_active and is_open and not auto_fees:
+                    # Only consider channels that have auto_fees set to False
+                    if not auto_fees:
                         current_states[chan_id] = False
             else:
                 logging.error(f"{timestamp} Failed to fetch current channel states, status code: {response.status_code}")
@@ -252,12 +251,12 @@ def update_autofees(non_active_chan_ids):
         return current_states
 
     current_channel_states = fetch_current_channel_states()
-    logging.debug(f"Current channel states: {current_channel_states}")
+    # logging.debug(f"Current channel states: {current_channel_states}")
     print(current_channel_states)
 
     # Filter out channels that are not eligible for update (already have auto_fees set to True or are not active/open)
     channels_to_update = [chan_id for chan_id in non_active_chan_ids if chan_id in current_channel_states]
-    logging.debug(f"Channels to update: {channels_to_update}")
+    # logging.debug(f"Channels to update: {channels_to_update}")
     print(f" Channels to Update: {channels_to_update}")
     for chan_id in channels_to_update:
         notes = f"Status: ⛰️ Magma Channel Buy Order Expired"
@@ -281,12 +280,11 @@ def update_autofees(non_active_chan_ids):
         except Exception as e:
             logging.error(f"Error updating auto_fees for channel {chan_id}: {e}")
     
-    logging.debug(f"Specific channel {specific_long_chan_id} in current_channel_states: {specific_long_chan_id in current_channel_states}")
-    logging.debug(f"Specific channel {specific_long_chan_id} in channels_to_update: {specific_long_chan_id in channels_to_update}")
+    # logging.debug(f"Specific channel {specific_long_chan_id} in current_channel_states: {specific_long_chan_id in current_channel_states}")
+    # logging.debug(f"Specific channel {specific_long_chan_id} in channels_to_update: {specific_long_chan_id in channels_to_update}")
 
 
 def update_notes_for_active_channels(active_channels_info):
-    # global lndg_api_url
 
     for item in active_channels_info:
         try:
@@ -328,4 +326,4 @@ if __name__ == "__main__":
     active_channels_info, non_active_chan_ids, fee_cap_groups = cluster_sold_channels() 
 
     update_autofees(non_active_chan_ids)  # If you want to update autofees
-    update_notes_for_active_channels(active_channels_info) 
+    update_notes_for_active_channels(active_channels_info)
