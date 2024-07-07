@@ -13,6 +13,7 @@
 #start - Get started with PeerSwapBot
 #help - Display this help message
 
+import logging
 import telebot
 import subprocess
 import json
@@ -20,6 +21,7 @@ import time
 import requests
 import os
 import configparser
+import traceback
 
 # enter the necessary paths in the config.ini file
 # Get the path to the parent directory
@@ -36,8 +38,12 @@ MEMPOOL_TX = config['urls']['mempool_tx']
 LIQUID_TX = config['urls']['liquid_tx']
 PATH_COMMAND = config['system']['path_command']
 
+# Logging
+log_file_path = os.path.join(parent_dir, '..', 'logs', 'peerswap-bot.log')
+logging.basicConfig(filename=log_file_path, level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
 bot = telebot.TeleBot(BOT_TOKEN)
-print("PeerSwapBot Started...")
+logging.info("Peerswap bot started")
 
 # Function to check if the user is authorized
 def is_authorized_user(user_id):
@@ -440,5 +446,13 @@ def lbtc_send_to_address(message):
         send_formatted_output(message.chat.id, formatted_output)
 
 # Polling to keep the bot running
-bot.polling()
+while True:
+    try:
+        bot.polling()
+        logging.info("Polling cycle completed")
+        time.sleep(15)  # Adjust sleep duration as needed
+    except Exception as e:
+        # Log the exception with traceback for detailed information
+        logging.error(f"Exception occurred: {e}\nTraceback: {traceback.format_exc()}")
+        time.sleep(60)  # Wait before retrying
 
