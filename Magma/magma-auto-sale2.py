@@ -677,11 +677,19 @@ def send_telegram_message(message):
 
         # We'll send the same invoice amount to ourselves to allow for LNDg to pick this up as a net-positive income for accounting.
         # Check your keysends table to a manual mark to add it to your PNL
-        bos_result = bos_confirm_income(valid_channel_to_open['seller_invoice_amount'], peer_pubkey=valid_channel_to_open['peer_pubkey'])
-        if bos_result:
-            logging.info("BOS command executed successfully.")
+        # Log the entire valid_channel_to_open dictionary for debugging
+        logging.info(f"valid_channel_to_open contents: {valid_channel_to_open}")
+
+        customer_addr = get_address_by_pubkey(valid_channel_to_open['account'])
+        if customer_addr:
+            logging.info(f"Customer Address: {customer_addr}")
+            bos_result = bos_confirm_income(valid_channel_to_open['seller_invoice_amount'], peer_pubkey=customer_addr)
+            if bos_result:
+                logging.info("BOS command executed successfully.")
+            else:
+                logging.error("BOS command execution failed.")
         else:
-            logging.error("BOS command execution failed.")
+            logging.error("Peer Pubkey not found in valid_channel_to_open.")
     elif os.path.exists(error_file_path):
         bot.send_message(message.chat.id, text=f"The log file {error_file_path} already exists. This means you need to check if there is a pending channel to confirm to Amboss. Check the {log_file_path} content")
 
