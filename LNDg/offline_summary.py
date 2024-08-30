@@ -1,9 +1,10 @@
-import os
 import psycopg2
 import pandas as pd
 from datetime import datetime
 from prettytable import PrettyTable
+import argparse
 import configparser
+import os
 
 # Get the path to the parent directory
 parent_dir = os.path.dirname(os.path.abspath(__file__))
@@ -16,96 +17,74 @@ config.read(config_file_path)
 # Database connection parameters (replace with your actual credentials)
 db_params = {
     'database': config['database']['name'],
-    'user': config['database']['user'],
-    'password': config['database']['password'],
+    'user': 'admin',  # Using 'admin' user for peer authentication
     'host': config['database']['host'],
     'port': config['database']['port']
 }
 
-# Initialize connection and cursor outside of the try block
-connection = None
-cursor = None
 
-# Execute the query
-def calculate_offline_durations_postgresql(db_params):
-    cursor = None
+def calculate_offline_durations(start_date, sort_by='total_offline_duration', sort_order='DESC'):
     try:
-        # Connect to the database (assign to the global connection variable)
-        global connection
+        # Connect to the database (with peer auth set in .postgres/pg_hba.conf)
         connection = psycopg2.connect(**db_params)
         cursor = connection.cursor()
 
         # Define and execute the SQL query
-        query = """
+        query = f"""
         WITH offline_events AS (
-            SELECT
+            SELECT 
                 *,
                 LEAD(timestamp) OVER (PARTITION BY peer_alias ORDER BY timestamp) AS online_timestamp,
-                LEAD(new_value) OVER (PARTITION BY peer_alias ORDER BY timestamp) AS next_new_value,
                 SUM(CASE WHEN new_value = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY peer_alias ORDER BY timestamp) AS offline_session_id
             FROM gui_peerevents
             WHERE event = 'Connection' 
-                AND (
-                    timestamp >= '2024-07-01' AND timestamp < '2024-08-01'
-                )
         ),
         offline_durations AS (
             SELECT
                 peer_alias,
                 offline_session_id,
-                SUM(
-                    CASE
-                        WHEN next_new_value != 0 THEN COALESCE(online_timestamp, 'infinity'::timestamp) - timestamp
-                        ELSE interval '0 seconds'
-                    END
-                ) AS total_offline_duration
+                MAX(COALESCE(online_timestamp, timestamp + interval '1 hour')) AS offline_end,
+                MIN(timestamp) AS offline_start
             FROM offline_events
-            WHERE new_value = 0 -- Only keep end of offline events (now 0)
+            WHERE new_value = 0 AND DATE_TRUNC('month', timestamp) = '{start_date}'
             GROUP BY 1, 2
-        ), 
-        aggregated_durations AS (
-            SELECT
-                AVG(total_offline_duration) AS avg_offline_duration,
-                SUM(total_offline_duration) AS total_offline_duration
-            FROM offline_durations
         )
-        SELECT * FROM aggregated_durations;
+        SELECT
+            peer_alias,
+            ROUND(EXTRACT(epoch FROM AVG(offline_end - offline_start)) / 3600, 2) AS avg_offline_hours,
+            ROUND(EXTRACT(epoch FROM SUM(offline_end - offline_start)) / 3600, 2) AS total_offline_hours
+        FROM offline_durations
+        GROUP BY 1
+        ORDER BY {sort_by} {sort_order}
         """
         cursor.execute(query)
-
-        # Fetch all rows
         results = cursor.fetchall()
 
-        # Create a DataFrame and convert durations to hours
-        df = pd.DataFrame(results, columns=["avg_offline_duration", "total_offline_duration"])
-        df['avg_offline_duration'] = df['avg_offline_duration'].apply(lambda x: x.total_seconds() / 3600)
-        df['total_offline_duration'] = df['total_offline_duration'].apply(lambda x: x.total_seconds() / 3600)
-
+        # Create a DataFrame
+        df = pd.DataFrame(results, columns=["peer_alias", "avg_offline_hours", "total_offline_hours"])
         return df
-
     except (Exception, psycopg2.Error) as error:
         print("Error while connecting to PostgreSQL:", error)
     finally:
         # Closing database connection
-        if cursor:
+        if 'cursor' in locals() and cursor:
             cursor.close()
-        if connection:
+        if 'connection' in locals() and connection:
             connection.close()
-
-
-# Create a PrettyTable
 def print_results(offline_durations):
     table = PrettyTable()
-    table.field_names = ["Avg Offline (hours)", "Total Offline (hours)"]
-
-    # Add rows to the table
-    for index, row in offline_durations.iterrows():
-        table.add_row([f'{row["avg_offline_duration"]:.2f}', f'{row["total_offline_duration"]:.2f}'])
-
+    table.field_names = ["Peer Alias", "Avg Offline (hours)", "Total Offline (hours)"]
+    for _, row in offline_durations.iterrows():
+        table.add_row(row)
     print(table)
-
+    
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Calculate offline durations for LND peers.")
+    parser.add_argument("--month", type=str, required=True, help="Month to analyze (YYYY-MM format)")
+    parser.add_argument("--sort_by", type=str, choices=["peer_alias", "avg_offline_hours", "total_offline_hours"], default="total_offline_hours", help="Column to sort by")
+    parser.add_argument("--sort_order", type=str, choices=["ASC", "DESC"], default="DESC", help="Sorting order (ASC or DESC)")
 
-    offline_durations = calculate_offline_durations_postgresql(db_params)
+    args = parser.parse_args()
+    offline_durations = calculate_offline_durations(args.month, args.sort_by, args.sort_order)
     print_results(offline_durations)
