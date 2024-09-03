@@ -13,6 +13,7 @@ import schedule
 from datetime import datetime
 import configparser
 import logging
+from logging.handlers import RotatingFileHandler
 import threading
 
 # Get the path to the parent directory
@@ -39,9 +40,28 @@ CHAT_ID = config['telegram']['telegram_user_id']
 magma_channel_list = config['paths']['charge_lnd_path']
 full_path_bos = config['system']['full_path_bos']
 
-# Set up logging // Needs fixing @TrezorHannes
+# Define log file path
 log_file_path = os.path.join(parent_dir, '..', 'logs', 'magma-auto-sale2.log')
-logging.basicConfig(filename=log_file_path, level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Set up a rotating file handler
+handler = RotatingFileHandler(
+    log_file_path, 
+    maxBytes=10*1024*1024,  # 10 MB
+    backupCount=5
+)
+
+# Set up logging configuration
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[handler]
+)
+
+# Adjust logging levels for third-party libraries
+logging.getLogger('requests').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('telebot').setLevel(logging.WARNING)
+
 error_file_path = os.path.join(parent_dir, '..', 'logs', 'magma_channel_sale-error.log')
 
 
