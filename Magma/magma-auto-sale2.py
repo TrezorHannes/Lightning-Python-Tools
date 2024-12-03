@@ -32,6 +32,7 @@ API_MEMPOOL = 'https://mempool.space/api/v1/fees/recommended'
 RETRY_DELAY_SECONDS = 60  # Retry every minute if we can't connect to the buyer
 MAX_CONNECTION_RETRIES = 30 # Retry to connect for half an hour, than abort the script
 
+banned_pubkeys = config['pubkey']['banned_magma_pubkeys'].split(',')
 
 TOKEN = config['telegram']['magma_bot_token']
 AMBOSS_TOKEN = config['credentials']['amboss_authorization']
@@ -68,6 +69,7 @@ error_file_path = os.path.join(parent_dir, '..', 'logs', 'magma_channel_sale-err
 #Code
 bot = telebot.TeleBot(TOKEN)
 logging.info("Amboss Channel Open Bot Started")
+
 
 def execute_lncli_addinvoice(amt, memo, expiry):
 # Command to be executed
@@ -120,6 +122,24 @@ def accept_order(order_id, payment_request):
     variables = {"sellerAcceptOrderId": order_id, "request": payment_request}
 
     response = requests.post(url, json={"query": query, "variables": variables}, headers=headers)
+    return response.json()
+
+
+def reject_order(order_id):
+    url = 'https://api.amboss.space/graphql'
+    headers = {
+        'content-type': 'application/json',
+        'Authorization': f'Bearer {AMBOSS_TOKEN}',
+    }
+    query = '''
+        mutation SellerRejectOrder($sellerRejectOrderId: String!) {
+          sellerRejectOrder(id: $sellerRejectOrderId)
+        }
+    '''
+    variables = {"sellerRejectOrderId": order_id}
+
+    response = requests.post(url, json={"query": query, "variables": variables}, headers=headers)
+    logging.info(f"Order {order_id} rejected. Response: {response.json()}")
     return response.json()
 
 
@@ -419,15 +439,34 @@ def check_channel():
         return None
 
 
-#Check Buy offers
 def check_offers():
     url = 'https://api.amboss.space/graphql'
     headers = {
         'content-type': 'application/json',
         'Authorization': f'Bearer {AMBOSS_TOKEN}',
     }
+    # Updated GraphQL query to include 'endpoints' and 'destination' to retrieve pubkey from channel-buyer
+    query = """
+    query ListChannelOffers {
+      getUser {
+        market {
+          offer_orders {
+            list {
+              id
+              seller_invoice_amount
+              status
+              endpoints {
+                destination
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    
     payload = {
-        "query": "query List {\n  getUser {\n    market {\n      offer_orders {\n        list {\n          id\n          seller_invoice_amount\n          status\n        }\n      }\n    }\n  }\n}"
+        "query": query
     }
 
     try:
@@ -439,21 +478,29 @@ def check_offers():
         if data is None:  # Check if data is None
             logging.error("No data received from the API")
             return None
-        
-        response_data = response.json()
-        # logging.info(f"Raw API Response: {response_data}")
 
-        market = data.get('getUser', {}).get('market', {})
-        # offer_orders = market.get('offer_orders', {}).get('list', [])
-        offer_orders = response_data.get('data', {}).get('getUser', {}).get('market', {}).get('offer_orders', {}).get('list', [])
+        offer_orders = data.get('data', {}).get('getUser', {}).get('market', {}).get('offer_orders', {}).get('list', [])
+
+        # Initialize valid_channel_opening_offer to None
+        valid_channel_opening_offer = None
 
         for offer in offer_orders:
             logging.info(f"Offer ID: {offer.get('id')}, Status: {offer.get('status')}")
-        # Find the first offer with status "VALID_CHANNEL_OPENING"
-        valid_channel_opening_offer = next((offer for offer in offer_orders if offer.get('status') == "WAITING_FOR_SELLER_APPROVAL"), None)
 
-        # Log the found offer for debugging
-        logging.info(f"Found Offer: {valid_channel_opening_offer}")
+            # Retrieve the pubkey for the offer
+            destination = offer.get('endpoints', {}).get('destination')
+
+            # Check whether the channel-buyer pubkey is in banned config file
+            if destination in banned_pubkeys:
+                logging.info(f"Pubkey {destination} is banned. Rejecting order {offer.get('id')}.")
+                reject_order(offer.get('id'))
+                continue
+
+            # Find the first offer with status "WAITING_FOR_SELLER_APPROVAL"
+            if offer.get('status') == "WAITING_FOR_SELLER_APPROVAL":
+                logging.info(f"Found valid offer to process: {offer}")
+                valid_channel_opening_offer = offer
+                break
 
         if not valid_channel_opening_offer:
             logging.info("No orders with status 'WAITING_FOR_SELLER_APPROVAL' waiting for approval.")
@@ -466,7 +513,6 @@ def check_offers():
         return None
 
 
-# Function Channel Open
 def open_channel(pubkey, size, invoice):
     # get fastest fee
     logging.info("Getting fastest fee...")

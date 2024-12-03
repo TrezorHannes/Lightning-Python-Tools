@@ -9,7 +9,9 @@ lndg_password =
 
 [pubkey]
 #Add Pubkeys you want to ignore in automated LNDg updates, comma-separated for adding multiple pubkeys. 
-base_fee_ignore = 
+base_fee_ignore = pubkey1,pubkey2,pubkey3
+#Add Pubkeys you want to auto-reject when Magma channel-buy orders are coming in
+banned_magma_pubkeys = pubkey1,pubkey2,pubkey3
 
 [no-swapout]
 #Add Pubkeys you want to filter out for swapout outputs, comma-separated for adding multiple pubkeys. 
