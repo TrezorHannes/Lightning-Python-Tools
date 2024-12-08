@@ -40,3 +40,7 @@ path_command = /usr/local/bin/
 [urls]
 mempool_tx = https://mempool.space/tx/
 liquid_tx = https://liquid.network/tx/
+
+[parameters]
+fee_updated_hours_ago = 3
+capped_ceiling = 3100
