@@ -52,11 +52,13 @@ logging.basicConfig(filename=log_file_path, level=logging.DEBUG)
 ignore_remote_pubkeys = config['pubkey']['base_fee_ignore'].split(',')
 
 def calculate_new_fee_rate(local_fee_rate):
+    # Convert local_fee_rate to an integer
+    local_fee_rate = int(local_fee_rate)
     # Define thresholds and increments
     lower_threshold = 200
-    upper_threshold = capped_ceiling
-    max_increment_percentage = 0.03  # 3% for slower slope
-    min_increment = 10  # Minimum increment for high fee rates
+    upper_threshold = int(capped_ceiling)
+    max_increment_percentage = 0.03
+    min_increment = 10
 
     if local_fee_rate <= lower_threshold:
         increment_percentage = max_increment_percentage
@@ -64,15 +66,14 @@ def calculate_new_fee_rate(local_fee_rate):
         increment_percentage = min_increment / local_fee_rate
     else:
         # decrease the increment percentage between lower and upper thresholds
-        slope = (float(min_increment) / float(upper_threshold) - max_increment_percentage) / (float(upper_threshold) - float(lower_threshold))
-        increment_percentage = max_increment_percentage + slope * (float(local_fee_rate) - float(lower_threshold))
+        slope = (min_increment / upper_threshold - max_increment_percentage) / (upper_threshold - lower_threshold)
+        increment_percentage = max_increment_percentage + slope * (local_fee_rate - lower_threshold)
 
     # Calculate the increment based on the dynamic percentage
-    increment = max(min_increment, float(local_fee_rate) * increment_percentage)
-    local_new_fee_rate = min(float(local_fee_rate) + increment, float(upper_threshold))
-    local_new_fee_rate = int(round(local_new_fee_rate))
+    increment = max(min_increment, local_fee_rate * increment_percentage)
+    local_new_fee_rate = min(local_fee_rate + increment, upper_threshold)
 
-    return local_new_fee_rate
+    return round(local_new_fee_rate)
 
 def get_channels_to_modify():
     channels_to_modify = []  # Initialize the list
