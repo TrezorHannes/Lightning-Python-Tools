@@ -498,7 +498,7 @@ def check_offers():
 
             # Find the first offer with status "WAITING_FOR_SELLER_APPROVAL"
             if offer.get('status') == "WAITING_FOR_SELLER_APPROVAL":
-                logging.info(f"Found valid offer to process: {offer}")
+                logging.info(f"Found valid & unbanned offer to process: {offer}")
                 valid_channel_opening_offer = offer
                 break
 
