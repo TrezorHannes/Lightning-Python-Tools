@@ -44,3 +44,21 @@ liquid_tx = https://liquid.network/tx/
 [parameters]
 fee_updated_hours_ago = 3
 capped_ceiling = 3100
+
+## LNBits Pocket Money Settings
+[LNBits]
+# wallet_id and invoice_key for each child
+wallets = {
+    "child1": {"wallet_id": "wallet_id_1", "invoice_key": "invoice_key_1"},
+    "child2": {"wallet_id": "wallet_id_2", "invoice_key": "invoice_key_2"},
+    "child3": {"wallet_id": "wallet_id_3", "invoice_key": "invoice_key_3"}
+}
+
+# admin key for the main LNBits wallet (parent wallet)
+admin_key = "admin_key_1"
+
+[Schedule]
+recurrence = weekly  # Options: daily, weekly, monthly
+time = 09:00  # Time of day to run the transfer
+day_of_week = friday  # Only used if recurrence is weekly
+day_of_month = 1  # Only used if recurrence is monthly
