@@ -1,0 +1,11 @@
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/" # Root directory of your repository
+    schedule:
+      interval: "weekly" # Check for updates once a week
+
+  - package-ecosystem: "github-actions"
+    directory: "/" # Monitors actions used in workflows
+    schedule:
+      interval: "weekly"
