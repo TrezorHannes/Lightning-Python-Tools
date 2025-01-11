@@ -20,7 +20,6 @@ config.read(config_file_path)
 
 # Print raw recurrence value for debugging
 recurrence_raw = config['Schedule']['recurrence']
-print(f"Raw recurrence value: {recurrence_raw!r}")
 RECURRENCE = recurrence_raw.split('#')[0].strip().lower()
 
 # Check if RECURRENCE is valid
