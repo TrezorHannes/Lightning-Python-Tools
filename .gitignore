@@ -1,5 +1,6 @@
 # Configuration Files
 config.ini
+wallets.json
 
 # Log Files and Directories
 logs/*  

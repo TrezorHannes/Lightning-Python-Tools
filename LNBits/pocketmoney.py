@@ -24,17 +24,17 @@ DAY_OF_WEEK = config['Schedule'].get('day_of_week', 'friday')
 DAY_OF_MONTH = config['Schedule'].get('day_of_month', '1')
 
 FIAT_CURRENCY = 'EUR'
-FIAT_AMOUNT = 10
 THRESHOLD_BALANCE = 1000000
 
 ADMIN_KEY = config['LNBits']['admin_key']
-INVOICE_KEY = config['LNBits']['invoice_key']
-BASE_URL = 'http://localhost:5000/api/v1'
-TOKEN = config['telegram']['magma_bot_token']
+LNBITS_URL = config['LNBits']['base_url']
+TOKEN = config['telegram']['lnbits_bot_token']
 CHAT_ID = config['telegram']['telegram_user_id']
 
-# Parse the children wallets from the config file
-CHILDREN_WALLETS = json.loads(config['LNBits']['wallets'])
+# Parse the children wallets from the jason file
+wallets_file_path = os.path.join(parent_dir, '..', 'wallets.json')
+with open(wallets_file_path, 'r') as f:
+    CHILDREN_WALLETS = json.load(f)
 
 # Initialize Telegram bot
 bot = TeleBot(TOKEN)
@@ -63,47 +63,57 @@ logger = logging.getLogger(__name__)
 # Function to get the current exchange rate
 def get_exchange_rate():
     try:
-        response = requests.get(f"{BASE_URL}/rate/EUR")
+        url = f"{LNBITS_URL}/rate/{FIAT_CURRENCY}"
+        logger.debug(f"Requesting exchange rate from: {url}")
+        response = requests.get(url, headers={'accept': 'application/json'})
+        logger.debug(f"Response status code: {response.status_code}")
         response.raise_for_status()
-        return response.json().get('rate')
+        rate = response.json().get('rate')
+        logger.debug(f"Exchange rate received: {rate}")
+        return rate
     except requests.exceptions.RequestException as e:
         logger.error(f"Error fetching exchange rate: {e}")
         bot.send_message(CHAT_ID, f"Error fetching exchange rate: {e}")
         return None
     
+# Comment out the scheduling logic for testing
 def schedule_transfers():
-    if RECURRENCE == 'daily':
-        schedule.every().day.at(TIME).do(scheduled_transfer)
-    elif RECURRENCE == 'weekly':
-        schedule.every().week.at(TIME).do(scheduled_transfer).tag(DAY_OF_WEEK)
-    elif RECURRENCE == 'monthly':
-        # schedule.every() doesn't have a month attribute, so we need to use a different approach
-        schedule.every(30).days.at(TIME).do(scheduled_transfer).tag(DAY_OF_MONTH)
-    else:
-        raise ValueError("Invalid recurrence setting. Choose from 'daily', 'weekly', or 'monthly'.")
+     if RECURRENCE == 'daily':
+         schedule.every().day.at(TIME).do(scheduled_transfer)
+     elif RECURRENCE == 'weekly':
+         schedule.every().week.at(TIME).do(scheduled_transfer).tag(DAY_OF_WEEK)
+     else:
+         raise ValueError("Invalid recurrence setting. Choose from 'daily', 'weekly', or 'monthly'.")
+
 
 # Function to create an invoice
 def create_invoice(wallet_id, invoice_key, amount_eur):
-    amount_sats = int(amount_eur * get_exchange_rate())
+    exchange_rate = get_exchange_rate()
+    if exchange_rate is None:
+        logger.error("Failed to retrieve exchange rate.")
+        bot.send_message(CHAT_ID, "Failed to retrieve exchange rate.")
+        return None, None
+
+    amount_sats = int(amount_eur * exchange_rate)
     try:
         response = requests.post(
-            f"{BASE_URL}/payments",
+            f"{LNBITS_URL}/payments",
             headers={"X-Api-Key": invoice_key},
             json={"out": False, "amount": amount_sats, "memo": "Pocket Money"}
         )
         response.raise_for_status()
         invoice_data = response.json()
-        return invoice_data.get('payment_request')
+        return invoice_data.get('payment_request'), amount_sats
     except requests.exceptions.RequestException as e:
         logger.error(f"Error creating invoice for wallet {wallet_id}: {e}")
         bot.send_message(CHAT_ID, f"Error creating invoice for wallet {wallet_id}: {e}")
-        return None
+        return None, None
 
 # Function to pay an invoice
 def pay_invoice(payment_request):
     try:
         response = requests.post(
-            f"{BASE_URL}/payments",
+            f"{LNBITS_URL}/payments",
             headers={"X-Api-Key": ADMIN_KEY},
             json={"out": True, "bolt11": payment_request}
         )
@@ -117,7 +127,7 @@ def pay_invoice(payment_request):
 # Function to check wallet balance
 def check_balance():
     try:
-        response = requests.get(f"{BASE_URL}/wallet", headers={"X-Api-Key": ADMIN_KEY})
+        response = requests.get(f"{LNBITS_URL}/wallet", headers={"X-Api-Key": ADMIN_KEY})
         response.raise_for_status()
         balance = response.json().get('balance')
         if balance < THRESHOLD_BALANCE:  # Example threshold for low balance warning
@@ -138,15 +148,24 @@ def scheduled_transfer():
     for child, wallet_info in CHILDREN_WALLETS.items():
         wallet_id = wallet_info['wallet_id']
         invoice_key = wallet_info['invoice_key']
-        payment_request = create_invoice(wallet_id, invoice_key, 10)  # Example amount in EUR
+        fiat_amount = wallet_info['fiat_amount']
+        
+        payment_request, amount_sats = create_invoice(wallet_id, invoice_key, fiat_amount)
         if payment_request:
             pay_invoice(payment_request)
-            bot.send_message(CHAT_ID, f"Transferred pocket money to {child}")
+            bot.send_message(
+                CHAT_ID, 
+                f"💶 🤑 Transferred {fiat_amount} {FIAT_CURRENCY} ({amount_sats} satoshis) worth of pocket money to {child}"
+            )
 
 # Call the function to set up the schedule
 schedule_transfers()
 
-# Run the scheduler
+# Run the scheduler (commented out for testing)
 while True:
     schedule.run_pending()
     time.sleep(60)
+
+# Call the function directly for testing
+# if __name__ == "__main__":
+#     scheduled_transfer()
