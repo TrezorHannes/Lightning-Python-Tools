@@ -1,0 +1,25 @@
+name: Formatting Check
+
+on:
+  pull_request:
+    branches:
+      - main
+      - dev
+
+jobs:
+  format:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.10
+
+      - name: Install black
+        run: pip install black
+
+      - name: Check formatting
+        run: black --check .
