@@ -13,9 +13,19 @@ LNDg:
 - `mempool_rebalancer_trigger`: [systemd] check current mempool fee-rate for half-hour estimate, and if above your defined threshold (eg > 150sats/vByte), disable Auto-Fee setting in LNDg. Automatically activates again once threshold is below your limit.
 - `disabled_fee-accelerator`: [cronjob] AutoFees in LNDg increase fees by incoming HTLCs. Dip below fee risk in LND encourage you to disable channels with you as opener and less than 5% liquidity on your side. Run this cronjob to automatically increase fee for disabled channels
 
+Magma
+- `magma-auto-sale2.py`: [systemd] Run automated monitoring of channel sales on amboss Magma, handle clearance and channel opening, as well as fees and writing into LNDg notes
+
 Peerswap
 - `peerswap-lndg_push`: [command-line output, cronjob] writes your existing PeerSwap peers info, the SUM of Sats and Swaps into LNDg Dashboard and Channel Card
 - `ps_peers`: [command-line output] quick overview of existing L-BTC Balance and Peerswap Peers + Liquidity in a table format
+
+LNBits
+- `pocketmoney.py`: [one-off, cron, systemd] allows recurring payments to child-wallets in the same LNBits instance. Define fiat-currency, recurrence and amount for each child, then add as cron or use systemd-installer.
+
+Other
+- `swap_wallet.py`: [one-off] send a specified amount of Lightning funds to a specified LN address. 
+The user can specify the total amount to transfer, the amount per transaction, the interval between transactions, the maximum fee rate, and a message to include with the payments.
 
 Entries with [command-line output] provide further help-text with `-h` or `--help`
 
