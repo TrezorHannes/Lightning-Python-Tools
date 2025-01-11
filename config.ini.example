@@ -9,7 +9,9 @@ lndg_password =
 
 [pubkey]
 #Add Pubkeys you want to ignore in automated LNDg updates, comma-separated for adding multiple pubkeys. 
-base_fee_ignore = 
+base_fee_ignore = pubkey1,pubkey2,pubkey3
+#Add Pubkeys you want to auto-reject when Magma channel-buy orders are coming in
+banned_magma_pubkeys = pubkey1,pubkey2,pubkey3
 
 [no-swapout]
 #Add Pubkeys you want to filter out for swapout outputs, comma-separated for adding multiple pubkeys. 
@@ -25,6 +27,7 @@ chat_id =
 magma_bot_token = 
 peerswap_bot_token = 
 telegram_user_id = 
+lnbits_bot_token = 
 
 [info]
 node = 
@@ -38,3 +41,22 @@ path_command = /usr/local/bin/
 [urls]
 mempool_tx = https://mempool.space/tx/
 liquid_tx = https://liquid.network/tx/
+
+[parameters]
+fee_updated_hours_ago = 3
+capped_ceiling = 3100
+
+## LNBits Pocket Money Settings
+[LNBits]
+# wallet_id and invoice_key for each child to be stored in ../wallets.json
+
+# admin key for the main LNBits wallet (parent wallet)
+admin_key = "admin_key_1"
+
+[Schedule]
+# Options: daily, weekly
+recurrence = weekly
+# Time of day to run the transfer
+time = 09:00
+# Only used if recurrence is weekly
+day_of_week = friday

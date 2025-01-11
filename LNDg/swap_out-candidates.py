@@ -64,10 +64,10 @@ def get_chan_ids_to_write():
                 for result in sorted_results:
                     remote_pubkey = result.get('remote_pubkey', '')
                     local_fee_rate = result.get('local_fee_rate', 0)
-                    capacity = result.get('capacity', '')
+                    is_active = result.get('is_active', '')
                     local_balance = result.get('local_balance', 0)
                     chan_id = result.get('chan_id', '')
-                    if local_fee_rate <= args.fee_limit and remote_pubkey not in ignore_remote_pubkeys and local_balance > CAPACITY_THRESHOLD:
+                    if local_fee_rate <= args.fee_limit and remote_pubkey not in ignore_remote_pubkeys and local_balance > CAPACITY_THRESHOLD and is_active:
                         chan_ids_to_write.append(chan_id)
         else:
             print(f"API request failed with status code: {response.status_code}")

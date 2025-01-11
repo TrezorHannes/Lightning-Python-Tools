@@ -49,9 +49,14 @@ def get_chan_ids_to_write():
     return chan_ids_to_write
 
 chan_ids = get_chan_ids_to_write()
+print(f"Channel-IDs: {chan_ids}")
 
 if chan_ids:
     with open(file_path, 'w') as file:
         for chan_id in chan_ids:
             file.write(f"{chan_id}\n")
         print("Data written to file.")
+else:
+    with open(file_path, 'w') as file:
+        file.truncate(0)
+    print("No channel IDs to write. File has been emptied.")

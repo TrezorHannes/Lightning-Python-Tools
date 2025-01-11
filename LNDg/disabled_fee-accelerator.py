@@ -28,9 +28,9 @@ config = configparser.ConfigParser()
 config.read(config_file_path)
 
 # only update if the fee update is > 24 hrs ago
-fee_updated_hours_ago = 3
+fee_updated_hours_ago = config['parameters']['fee_updated_hours_ago']
 # stop increasing fee at ppm
-capped_ceiling = 2150
+capped_ceiling = config['parameters']['capped_ceiling']
 
 # API endpoint URL for retrieving channels
 api_url = 'http://localhost:8889/api/channels?limit=1500'
@@ -52,11 +52,13 @@ logging.basicConfig(filename=log_file_path, level=logging.DEBUG)
 ignore_remote_pubkeys = config['pubkey']['base_fee_ignore'].split(',')
 
 def calculate_new_fee_rate(local_fee_rate):
+    # Convert local_fee_rate to an integer
+    local_fee_rate = int(local_fee_rate)
     # Define thresholds and increments
     lower_threshold = 200
-    upper_threshold = capped_ceiling
-    max_increment_percentage = 0.03  # 3% for slower slope
-    min_increment = 10  # Minimum increment for high fee rates
+    upper_threshold = int(capped_ceiling)
+    max_increment_percentage = 0.03
+    min_increment = 10
 
     if local_fee_rate <= lower_threshold:
         increment_percentage = max_increment_percentage
@@ -70,9 +72,8 @@ def calculate_new_fee_rate(local_fee_rate):
     # Calculate the increment based on the dynamic percentage
     increment = max(min_increment, local_fee_rate * increment_percentage)
     local_new_fee_rate = min(local_fee_rate + increment, upper_threshold)
-    local_new_fee_rate = int(round(local_new_fee_rate))
 
-    return local_new_fee_rate
+    return round(local_new_fee_rate)
 
 def get_channels_to_modify():
     channels_to_modify = []  # Initialize the list
@@ -107,9 +108,8 @@ def get_channels_to_modify():
                     time_difference = datetime.now() - fees_updated_datetime
 
                     local_new_fee_rate = calculate_new_fee_rate(local_fee_rate)
-
                     # Check a few conditions upfront
-                    if time_difference > timedelta(hours=fee_updated_hours_ago):
+                    if time_difference > timedelta(hours=float(fee_updated_hours_ago)):
                         fees_timing_condition = True
                     else:
                         fees_timing_condition = False
@@ -122,7 +122,7 @@ def get_channels_to_modify():
 
                         # furthermore, the local_disabled is a custom setup I run since charge-lnd disables local initiator channels
                         # with < 5% local liquidity available.
-                        if initiator and is_active and local_disabled and is_open and ar_in_target < 95 and auto_fees and auto_rebalance and fees_timing_condition and local_new_fee_rate < capped_ceiling and ar_out_target > 50 and not remote_disabled:    
+                        if initiator and is_active and local_disabled and is_open and ar_in_target < int(95) and auto_fees and auto_rebalance and fees_timing_condition and local_new_fee_rate < int(capped_ceiling) and ar_out_target > int(50) and not remote_disabled:    
                             
                             logging.info(f"Processing channel for {alias} - current fee: {local_fee_rate}, new fee: {local_new_fee_rate}, is_open: {is_open}")
                             
