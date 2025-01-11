@@ -54,6 +54,9 @@ capped_ceiling = 3100
 admin_key = "admin_key_1"
 
 [Schedule]
-recurrence = weekly  # Options: daily, weekly
-time = 09:00  # Time of day to run the transfer
-day_of_week = friday  # Only used if recurrence is weekly
+# Options: daily, weekly
+recurrence = weekly
+# Time of day to run the transfer
+time = 09:00
+# Only used if recurrence is weekly
+day_of_week = friday
