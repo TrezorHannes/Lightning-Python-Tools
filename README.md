@@ -21,7 +21,8 @@ Peerswap
 - `ps_peers`: [command-line output] quick overview of existing L-BTC Balance and Peerswap Peers + Liquidity in a table format
 
 LNBits
-- `pocketmoney.py`: [one-off, cron, systemd] allows recurring payments to child-wallets in the same LNBits instance. Define fiat-currency, recurrence and amount for each child, then add as cron or use systemd-installer.
+- `pocketmoney.py`: [one-off, cron, systemd] allows recurring payments to child-wallets in the same LNBits instance. Define fiat-currency, recurrence and amount for each child, then add as cron or use systemd-installer. To configure: 
+`cp config.ini.example config.ini && cp wallets.json.example wallets.json` and edit both new files accordingly.
 
 Other
 - `swap_wallet.py`: [one-off] send a specified amount of Lightning funds to a specified LN address. 
@@ -30,7 +31,7 @@ The user can specify the total amount to transfer, the amount per transaction, t
 Entries with [command-line output] provide further help-text with `-h` or `--help`
 
 ### === Installation Instructions ===
-To run this script, you need a Python virtual environment. Follow the steps below:
+To run these scripts, you need a Python virtual environment. Follow the steps below:
 1. Clone the repo with `git clone https://github.com/TrezorHannes/Lightning-Python-Tools.git`
 2. `cd Lightning-Python-Tools/`
 3. Install virtualenv (if not already installed):
