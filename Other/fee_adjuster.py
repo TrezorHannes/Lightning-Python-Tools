@@ -153,12 +153,16 @@ def analyze_fee_trends(all_fee_data, fee_base):
         return 0  # Fees are stable or mixed trends
 
 
-def calculate_new_fee_rate(amboss_data, fee_conditions, trend_factor):
+def calculate_new_fee_rate(
+    amboss_data,
+    fee_conditions,
+    trend_factor,
+    base_adjustment_percentage,
+    group_adjustment_percentage,
+):
     fee_base = fee_conditions.get("fee_base", "median")
     # Ensure the selected fee base is converted to a float
     base_fee = float(amboss_data.get("TODAY", {}).get(fee_base, 0))
-    base_adjustment_percentage = fee_conditions.get("base_adjustment_percentage", 0)
-    group_adjustment_percentage = fee_conditions.get("group_adjustment_percentage", 0)
     max_cap = fee_conditions.get("max_cap", 1000)
     trend_sensitivity = fee_conditions.get("trend_sensitivity", 1)
 
@@ -254,6 +258,7 @@ def print_fee_adjustment(
     old_fee_rate,
     new_fee_rate,
     group_name,
+    fee_base,
     fee_conditions,
     trend_factor,
     amboss_data,
@@ -273,6 +278,7 @@ def print_fee_adjustment(
         print(f"Group: {group_name}")
     else:
         print(f"Group: No Group")
+    print(f"Chosen Fee Base: {fee_base}")
     print(f"Fee Conditions: {json.dumps(fee_conditions)}")
     print(f"Trend Factor: {trend_factor}")
     for time_range, fee_info in amboss_data.items():
@@ -300,13 +306,22 @@ def main():
         pubkey = node["pubkey"]
         group_name = node.get("group")
         fee_conditions = None  # Initialize fee_conditions to None
+        base_adjustment_percentage = 0  # Initialize base_adjustment_percentage
 
         if "fee_conditions" in node:
             fee_conditions = node["fee_conditions"]
+            base_adjustment_percentage = fee_conditions.get(
+                "base_adjustment_percentage", 0
+            )
 
+        group_adjustment_percentage = 0  # Initialize group_adjustment_percentage
         if group_name and group_name in groups:
+            group_fee_conditions = groups[group_name]
+            group_adjustment_percentage = group_fee_conditions.get(
+                "group_adjustment_percentage", 0
+            )
             if not fee_conditions:
-                fee_conditions = groups[group_name]
+                fee_conditions = group_fee_conditions
         elif not fee_conditions:
             logging.warning(
                 f"No fee conditions found for pubkey {pubkey}. Skipping fee adjustment."
@@ -324,7 +339,11 @@ def main():
                 continue  # Skip to the next node
             trend_factor = analyze_fee_trends(all_amboss_data, fee_base)
             new_fee_rate = calculate_new_fee_rate(
-                all_amboss_data, fee_conditions, trend_factor
+                all_amboss_data,
+                fee_conditions,
+                trend_factor,
+                base_adjustment_percentage,
+                group_adjustment_percentage,
             )
             channels_to_modify = get_channels_to_modify(pubkey, config)
             for chan_id, channel_data in channels_to_modify.items():
@@ -337,7 +356,8 @@ def main():
                     channel_data["local_balance"],
                     channel_data["local_fee_rate"],
                     new_fee_rate,
-                    groups,
+                    group_name,
+                    fee_base,
                     fee_conditions,
                     trend_factor,
                     all_amboss_data,
