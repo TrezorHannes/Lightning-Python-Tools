@@ -24,7 +24,7 @@ Installation:
 Or run a python scheduler via systemd
 """
 
-from ast import alias
+# from ast import alias
 import os
 import requests
 from datetime import datetime, timedelta
@@ -34,6 +34,7 @@ import json
 import argparse
 import time
 import schedule
+from prettytable import PrettyTable
 
 
 # Error classes
@@ -281,14 +282,41 @@ def print_fee_adjustment(
     print(f"Chosen Fee Base: {fee_base}")
     print(f"Fee Conditions: {json.dumps(fee_conditions)}")
     print(f"Trend Factor: {trend_factor}")
+
+    table = PrettyTable()
+    table.field_names = [
+        "Time Range",
+        "Max",
+        "Mean",
+        "Median",
+        "Weighted",
+        "Weighted Corrected",
+    ]
+
     for time_range, fee_info in amboss_data.items():
-        print(f"Time Range: {time_range}")
-        print(f"  Max: {fee_info.get('max', 'N/A')}")
-        print(f"  Mean: {fee_info.get('mean', 'N/A')}")
-        print(f"  Median: {fee_info.get('median', 'N/A')}")
-        print(f"  Weighted: {fee_info.get('weighted', 'N/A')}")
-        print(f"  Weighted Corrected: {fee_info.get('weighted_corrected', 'N/A')}")
-    print("-" * 80)
+        table.add_row(
+            [
+                time_range,
+                fee_info.get("max", "N/A"),
+                (
+                    round(float(fee_info.get("mean", 0)), 1)
+                    if fee_info.get("mean")
+                    else "N/A"
+                ),
+                fee_info.get("median", "N/A"),
+                (
+                    round(float(fee_info.get("weighted", 0)), 1)
+                    if fee_info.get("weighted")
+                    else "N/A"
+                ),
+                (
+                    round(float(fee_info.get("weighted_corrected", 0)), 1)
+                    if fee_info.get("weighted_corrected")
+                    else "N/A"
+                ),
+            ]
+        )
+    print(table)
 
 
 def main():
