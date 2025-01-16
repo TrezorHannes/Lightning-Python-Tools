@@ -1,0 +1,30 @@
+{
+    "nodes": [
+        {
+            "pubkey": "021c97a90a411ff2b10dc2a8e32de2f29d2fa49d41bfbb52bd416e460db0747d0d",
+            "groups": [
+                "sink",
+                "Top Tier"
+            ],
+            "fee_conditions": {
+                "base_adjustment_percentage": 0.02,
+                "group_adjustment_percentage": 0.10,
+                "max_cap": 3500,
+                "trend_sensitivity": 0.5
+            }
+        },
+        {
+            "pubkey": "021c97a90a411ff2b10dc2a8e32de2f29d2fa49d41bfbb52bd416e460db0747d0d",
+            "groups": [
+                "sink",
+                "High Tier"
+            ],
+            "fee_conditions": {
+                "base_adjustment_percentage": 0.03,
+                "group_adjustment_percentage": 0.10,
+                "max_cap": 2500,
+                "trend_sensitivity": 0.5
+            }
+        }
+    ]
+}

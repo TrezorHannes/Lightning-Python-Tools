@@ -17,6 +17,7 @@
 # 2 * * * * /path/Lightning-Python-Tools/.venv/bin/python3 /path/Lightning-Python-Tools/LNDg/disabled_fee-accelerator.py >/dev/null 2>&1
 # Or run a python scheduler via systemd
 
+from ast import alias
 import os
 import requests
 from datetime import datetime, timedelta
@@ -73,7 +74,9 @@ def load_node_definitions():
     return node_definitions
 
 
-def fetch_amboss_data(pubkey, config, time_ranges=["TODAY"]):
+def fetch_amboss_data(
+    pubkey, config, time_ranges=["TODAY", "ONE_DAY", "ONE_WEEK", "ONE_MONTH"]
+):
     amboss_url = "https://api.amboss.space/graphql"
     headers = {
         "Authorization": f"Bearer {config['credentials']['amboss_authorization']}",
@@ -108,13 +111,12 @@ def fetch_amboss_data(pubkey, config, time_ranges=["TODAY"]):
             data = response.json()
             logging.debug(
                 f"Raw Amboss API response for {time_range}: {json.dumps(data)}"
-            )  # Print the raw response
+            )
             if data.get("errors"):
                 logging.error(f"Amboss API error for {time_range}: {data['errors']}")
                 raise AmbossAPIError(
                     f"Amboss API error for {time_range}: {data['errors']}"
                 )
-            # Adjusted parsing logic
             channels = data["data"]["getNode"]["graph_info"]["channels"]
             if channels:
                 fee_info = channels["fee_info"]["remote"]
@@ -236,16 +238,38 @@ def write_charge_lnd_file(node_data, file_path):
 
 
 def print_fee_adjustment(
-    pubkey, chan_id, old_fee_rate, new_fee_rate, groups, fee_conditions, trend_factor
+    alias,
+    pubkey,
+    chan_id,
+    capacity,
+    local_balance,
+    old_fee_rate,
+    new_fee_rate,
+    groups,
+    fee_conditions,
+    trend_factor,
+    amboss_data,
 ):
+    print(f"Alias: {alias}")
     print(f"Pubkey: {pubkey}")
     print(f"Channel ID: {chan_id}")
+    print(f"Local Capacity: {capacity}")
+    print(
+        f"Local Capacity: {local_balance} | (Outbound: {round(local_balance/capacity*100)}%)"
+    )
     print(f"Old Fee Rate: {old_fee_rate}")
     print(f"New Fee Rate: {new_fee_rate}")
     print(f"Delta: {new_fee_rate - old_fee_rate}")
     print(f"Groups: {', '.join(groups)}")
     print(f"Fee Conditions: {json.dumps(fee_conditions)}")
     print(f"Trend Factor: {trend_factor}")
+    for time_range, fee_info in amboss_data.items():
+        print(f"Time Range: {time_range}")
+        print(f"  Max: {fee_info.get('max', 'N/A')}")
+        print(f"  Mean: {fee_info.get('mean', 'N/A')}")
+        print(f"  Median: {fee_info.get('median', 'N/A')}")
+        print(f"  Weighted: {fee_info.get('weighted', 'N/A')}")
+        print(f"  Weighted Corrected: {fee_info.get('weighted_corrected', 'N/A')}")
     print("-" * 30)
 
 
@@ -265,7 +289,7 @@ def main():
         fee_conditions = node["fee_conditions"]
         try:
             all_amboss_data = fetch_amboss_data(pubkey, config)
-            print(f"Amboss Data: {all_amboss_data}")  # Add this line
+            # print(f"Amboss Data: {all_amboss_data}")  # Debug Amboss Fetcher
             if not all_amboss_data:  # Check if all_amboss_data is empty
                 logging.warning(
                     f"No Amboss data found for pubkey {pubkey}. Skipping fee adjustment."
@@ -279,13 +303,17 @@ def main():
             for chan_id, channel_data in channels_to_modify.items():
                 # update_lndg_fee(chan_id, new_fee_rate, config)
                 print_fee_adjustment(
+                    channel_data["alias"],
                     pubkey,
                     chan_id,
+                    channel_data["capacity"],
+                    channel_data["local_balance"],
                     channel_data["local_fee_rate"],
                     new_fee_rate,
                     groups,
                     fee_conditions,
                     trend_factor,
+                    all_amboss_data,
                 )
             # Example of writing to charge-lnd file
             # charge_lnd_file_path = os.path.join(config['paths']['charge_lnd_path'], f'fee_adjuster_{pubkey}.txt')

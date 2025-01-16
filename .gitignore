@@ -1,6 +1,7 @@
 # Configuration Files
 config.ini
 wallets.json
+fee_adjuster.json
 
 # Log Files and Directories
 logs/*  
