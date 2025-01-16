@@ -1,21 +1,28 @@
-# What it's solving for: For certain channels, an automated fee-algo needs external data-sources.
-# These might be internal datasources like your own database / calculation outputs, or mempool onchain fees,
-# but for now we'll focus on the Amboss API.
-# We'll then populate, per definition, either
-# - a txt file for charge-lnd to pull into your existing fee algo, or
-# - write a specific fee to LNDg, if you use that for your fee algo setting
-# try to avoid using both, because it'll end up in converging updates
+"""
+Guidelines for the Fee Adjuster Script
 
-# How?
-# 1) Specify a set of pubkeys as groups or define specific node in a jason-file
-# 2) Identify incoming fee-metric sources (for now, amboss API)
-# 3) Adjust weighting conditions groups for those metrics (eg you want to put more influence on median, or always 10% above minimum, etc)
-# 4) Apply fee groups to pubkey groups
+This script automates the adjustment of channel fees based on various conditions and trends.
+It uses data from the Amboss API to determine appropriate fee rates for each node.
 
-# Activate
-# Options to either set a cronjob
-# 2 * * * * /path/Lightning-Python-Tools/.venv/bin/python3 /path/Lightning-Python-Tools/LNDg/disabled_fee-accelerator.py >/dev/null 2>&1
-# Or run a python scheduler via systemd
+Configuration Settings (see fee_adjuster_config_docs.txt for details):
+- base_adjustment_percentage: Adjusts your local fee by this percentage. Applied to the selected fee base (e.g., median, mean).
+- group_adjustment_percentage: Additional adjustment based on node groups. Allows for differentiated strategies.
+- max_cap: Maximum fee rate allowed. Prevents fees from exceeding this value.
+- trend_sensitivity: Determines how much trends influence fee adjustments. Higher values mean greater influence.
+- fee_base: The statistical measure used as the base for fee calculations. Options include "median", "mean", "min", "max", "weighted" and "weighted_corrected".
+- groups: Categories or tags for nodes. Used to apply specific strategies or adjustments.
+
+Groups and group_adjustment_percentage:
+Nodes can belong to multiple groups, such as "sink" or "expensive". The group_adjustment_percentage is applied to nodes based on their group membership, allowing for tailored fee strategies. For example, nodes in the "expensive" group might have higher fees to reflect their role in the network.
+
+Usage:
+- Configure nodes and their settings in the fee_adjuster.json file.
+- Run the script to automatically adjust fees based on the configured settings and current trends.
+
+Installation:
+2 * * * * /path/Lightning-Python-Tools/.venv/bin/python3 /path/Lightning-Python-Tools/LNDg/disabled_fee-accelerator.py >/dev/null &1
+Or run a python scheduler via systemd
+"""
 
 from ast import alias
 import os
@@ -132,25 +139,24 @@ def fetch_amboss_data(
     return all_fee_data
 
 
-def analyze_fee_trends(all_fee_data):
-    # Implement your logic to analyze fee trends here
-    # This is a placeholder, you'll need to implement your own logic
-    # Example:
-    today_median = all_fee_data.get("TODAY", {}).get("median", 0)
-    one_week_median = all_fee_data.get("ONE_WEEK", {}).get("median", 0)
-    one_month_median = all_fee_data.get("ONE_MONTH", {}).get("median", 0)
+def analyze_fee_trends(all_fee_data, fee_base):
+    one_day_value = float(all_fee_data.get("ONE_DAY", {}).get(fee_base, 0))
+    one_week_value = float(all_fee_data.get("ONE_WEEK", {}).get(fee_base, 0))
+    one_month_value = float(all_fee_data.get("ONE_MONTH", {}).get(fee_base, 0))
 
-    # if today_median > one_week_median and one_week_median > one_month_median:
-    #    return 0.05  # Fees are increasing, add 5%
-    # elif today_median < one_week_median and one_week_median < one_month_median:
-    #    return -0.05  # Fees are decreasing, subtract 5%
-    # else:
-    return 0  # Fees are stable
+    # Simple trend analysis, go bonkers if you like
+    if one_day_value > one_week_value > one_month_value:
+        return 0.05  # Fees are consistently increasing, add 5%
+    elif one_day_value < one_week_value < one_month_value:
+        return -0.05  # Fees are consistently decreasing, subtract 5%
+    else:
+        return 0  # Fees are stable or mixed trends
 
 
 def calculate_new_fee_rate(amboss_data, fee_conditions, trend_factor):
-    # Ensure median_fee is converted to a float
-    median_fee = float(amboss_data.get("TODAY", {}).get("median", 0))
+    fee_base = fee_conditions.get("fee_base", "median")
+    # Ensure the selected fee base is converted to a float
+    base_fee = float(amboss_data.get("TODAY", {}).get(fee_base, 0))
     base_adjustment_percentage = fee_conditions.get("base_adjustment_percentage", 0)
     group_adjustment_percentage = fee_conditions.get("group_adjustment_percentage", 0)
     max_cap = fee_conditions.get("max_cap", 1000)
@@ -161,7 +167,7 @@ def calculate_new_fee_rate(amboss_data, fee_conditions, trend_factor):
     )
 
     new_fee_rate = (
-        median_fee * (1 + adjusted_base_percentage) * (1 + group_adjustment_percentage)
+        base_fee * (1 + adjusted_base_percentage) * (1 + group_adjustment_percentage)
     )
     new_fee_rate = min(new_fee_rate, max_cap)
     return round(new_fee_rate)
@@ -212,23 +218,25 @@ def get_channels_to_modify(pubkey, config):
         raise LNDGAPIError(f"Error fetching LNDg channels: {e}")
 
 
-# def update_lndg_fee(chan_id, new_fee_rate, config):
-#     update_api_url = "http://localhost:8889/api/chanpolicy/"
-#     username = config["credentials"]["lndg_username"]
-#     password = config["credentials"]["lndg_password"]
-#     payload = {"chan_id": chan_id, "fee_rate": new_fee_rate}
-#     try:
-#         response = requests.post(
-#             update_api_url, json=payload, auth=(username, password)
-#         )
-#         response.raise_for_status()
-#         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-#         logging.info(
-#             f"{timestamp}: API confirmed changing local fee to {new_fee_rate} for channel {chan_id}"
-#         )
-#     except requests.exceptions.RequestException as e:
-#         logging.error(f"Error updating LNDg fee for channel {chan_id}: {e}")
-#         raise LNDGAPIError(f"Error updating LNDg fee for channel {chan_id}: {e}")
+""" # Write to LNDg
+def update_lndg_fee(chan_id, new_fee_rate, config):
+    update_api_url = "http://localhost:8889/api/chanpolicy/"
+    username = config["credentials"]["lndg_username"]
+    password = config["credentials"]["lndg_password"]
+    payload = {"chan_id": chan_id, "fee_rate": new_fee_rate}
+    try:
+        response = requests.post(
+            update_api_url, json=payload, auth=(username, password)
+        )
+        response.raise_for_status()
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logging.info(
+            f"{timestamp}: API confirmed changing local fee to {new_fee_rate} for channel {chan_id}"
+        )
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error updating LNDg fee for channel {chan_id}: {e}")
+        raise LNDGAPIError(f"Error updating LNDg fee for channel {chan_id}: {e}")
+"""
 
 
 def write_charge_lnd_file(node_data, file_path):
@@ -245,11 +253,12 @@ def print_fee_adjustment(
     local_balance,
     old_fee_rate,
     new_fee_rate,
-    groups,
+    group_name,
     fee_conditions,
     trend_factor,
     amboss_data,
 ):
+    print("-" * 80)
     print(f"Alias: {alias}")
     print(f"Pubkey: {pubkey}")
     print(f"Channel ID: {chan_id}")
@@ -260,7 +269,10 @@ def print_fee_adjustment(
     print(f"Old Fee Rate: {old_fee_rate}")
     print(f"New Fee Rate: {new_fee_rate}")
     print(f"Delta: {new_fee_rate - old_fee_rate}")
-    print(f"Groups: {', '.join(groups)}")
+    if group_name:
+        print(f"Group: {group_name}")
+    else:
+        print(f"Group: No Group")
     print(f"Fee Conditions: {json.dumps(fee_conditions)}")
     print(f"Trend Factor: {trend_factor}")
     for time_range, fee_info in amboss_data.items():
@@ -270,7 +282,7 @@ def print_fee_adjustment(
         print(f"  Median: {fee_info.get('median', 'N/A')}")
         print(f"  Weighted: {fee_info.get('weighted', 'N/A')}")
         print(f"  Weighted Corrected: {fee_info.get('weighted_corrected', 'N/A')}")
-    print("-" * 30)
+    print("-" * 80)
 
 
 def main():
@@ -282,11 +294,26 @@ def main():
 
     config = load_config()
     node_definitions = load_node_definitions()
+    groups = node_definitions.get("groups", {})
 
     for node in node_definitions["nodes"]:
         pubkey = node["pubkey"]
-        groups = node["groups"]
-        fee_conditions = node["fee_conditions"]
+        group_name = node.get("group")
+        fee_conditions = None  # Initialize fee_conditions to None
+
+        if "fee_conditions" in node:
+            fee_conditions = node["fee_conditions"]
+
+        if group_name and group_name in groups:
+            if not fee_conditions:
+                fee_conditions = groups[group_name]
+        elif not fee_conditions:
+            logging.warning(
+                f"No fee conditions found for pubkey {pubkey}. Skipping fee adjustment."
+            )
+            continue
+
+        fee_base = fee_conditions.get("fee_base", "median")
         try:
             all_amboss_data = fetch_amboss_data(pubkey, config)
             # print(f"Amboss Data: {all_amboss_data}")  # Debug Amboss Fetcher
@@ -295,7 +322,7 @@ def main():
                     f"No Amboss data found for pubkey {pubkey}. Skipping fee adjustment."
                 )
                 continue  # Skip to the next node
-            trend_factor = analyze_fee_trends(all_amboss_data)
+            trend_factor = analyze_fee_trends(all_amboss_data, fee_base)
             new_fee_rate = calculate_new_fee_rate(
                 all_amboss_data, fee_conditions, trend_factor
             )
