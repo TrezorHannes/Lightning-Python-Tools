@@ -16,7 +16,7 @@ Groups and group_adjustment_percentage:
 Nodes can belong to multiple groups, such as "sink" or "expensive". The group_adjustment_percentage is applied to nodes based on their group membership, allowing for tailored fee strategies. For example, nodes in the "expensive" group might have higher fees to reflect their role in the network.
 
 Usage:
-- Configure nodes and their settings in the fee_adjuster.json file.
+- Configure nodes and their settings in the feeConfig.json file.
 - Run the script to automatically adjust fees based on the configured settings and current trends.
 
 Installation:
@@ -76,7 +76,7 @@ def load_config():
 
 
 def load_node_definitions():
-    nodes_file_path = os.path.join(parent_dir, "..", "fee_adjuster.json")
+    nodes_file_path = os.path.join(parent_dir, "..", "feeConfig.json")
     with open(nodes_file_path, "r") as f:
         node_definitions = json.load(f)
     return node_definitions
