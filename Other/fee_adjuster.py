@@ -244,10 +244,15 @@ def update_lndg_fee(chan_id, new_fee_rate, config):
 """
 
 
-def write_charge_lnd_file(node_data, file_path):
-    with open(file_path, "w") as f:
-        for chan_id, new_fee_rate in node_data:
-            f.write(f"{chan_id}={new_fee_rate}\n")
+def write_charge_lnd_file(file_path, pubkey, alias, new_fee_rate):
+    with open(file_path, "a") as f:
+        f.write(f"[🤖 {alias}]\n")
+        f.write(f"node.id = {pubkey}\n")
+        f.write("strategy = static\n")
+        f.write(f"fee_ppm = {new_fee_rate}\n")
+        f.write("min_htlc_msat = 1_000\n")
+        f.write("max_htlc_msat_ratio = 0.9\n")
+        f.write("\n")
 
 
 def print_fee_adjustment(
@@ -329,6 +334,15 @@ def main():
     config = load_config()
     node_definitions = load_node_definitions()
     groups = node_definitions.get("groups", {})
+    write_charge_lnd_file_enabled = node_definitions.get("write_charge_lnd_file", False)
+
+    if write_charge_lnd_file_enabled:
+        charge_lnd_file_path = os.path.join(
+            config["paths"]["charge_lnd_path"], "fee_adjuster.txt"
+        )
+        # Open the file in write mode to clear any existing content
+        with open(charge_lnd_file_path, "w") as f:
+            pass
 
     for node in node_definitions["nodes"]:
         pubkey = node["pubkey"]
@@ -360,7 +374,7 @@ def main():
         try:
             all_amboss_data = fetch_amboss_data(pubkey, config)
             # print(f"Amboss Data: {all_amboss_data}")  # Debug Amboss Fetcher
-            if not all_amboss_data:  # Check if all_amboss_data is empty
+            if not all_amboss_data:
                 logging.warning(
                     f"No Amboss data found for pubkey {pubkey}. Skipping fee adjustment."
                 )
@@ -390,9 +404,17 @@ def main():
                     trend_factor,
                     all_amboss_data,
                 )
-            # Example of writing to charge-lnd file
-            # charge_lnd_file_path = os.path.join(config['paths']['charge_lnd_path'], f'fee_adjuster_{pubkey}.txt')
-            # write_charge_lnd_file(channels_to_modify, charge_lnd_file_path)
+                if write_charge_lnd_file_enabled:
+                    charge_lnd_file_path = os.path.join(
+                        config["paths"]["charge_lnd_path"], "fee_adjuster.txt"
+                    )
+                    write_charge_lnd_file(
+                        charge_lnd_file_path,
+                        pubkey,
+                        channel_data["alias"],
+                        new_fee_rate,
+                    )
+
         except (AmbossAPIError, LNDGAPIError) as e:
             logging.error(f"Error processing node {pubkey}: {e}")
             continue

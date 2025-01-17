@@ -1,4 +1,5 @@
 {
+    "write_charge_lnd_file": true,
     "groups": {
         "sink": {
             "group_adjustment_percentage": 0.10,
