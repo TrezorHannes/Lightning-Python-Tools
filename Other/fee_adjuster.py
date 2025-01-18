@@ -178,6 +178,8 @@ def calculate_new_fee_rate(
     return round(new_fee_rate)
 
 
+# Need to fetch from LNDg since lncli listchannels doesn't provide local_fee
+# and want to avoid two lncli subprocesses per pubkey
 def get_channels_to_modify(pubkey, config):
     api_url = f"http://localhost:8889/api/channels?limit=1500"
     username = config["credentials"]["lndg_username"]
@@ -223,7 +225,7 @@ def get_channels_to_modify(pubkey, config):
         raise LNDGAPIError(f"Error fetching LNDg channels: {e}")
 
 
-""" # Write to LNDg
+# Write to LNDg
 def update_lndg_fee(chan_id, new_fee_rate, config):
     update_api_url = "http://localhost:8889/api/chanpolicy/"
     username = config["credentials"]["lndg_username"]
@@ -241,7 +243,6 @@ def update_lndg_fee(chan_id, new_fee_rate, config):
     except requests.exceptions.RequestException as e:
         logging.error(f"Error updating LNDg fee for channel {chan_id}: {e}")
         raise LNDGAPIError(f"Error updating LNDg fee for channel {chan_id}: {e}")
-"""
 
 
 def write_charge_lnd_file(file_path, pubkey, alias, new_fee_rate):
@@ -335,6 +336,7 @@ def main():
     node_definitions = load_node_definitions()
     groups = node_definitions.get("groups", {})
     write_charge_lnd_file_enabled = node_definitions.get("write_charge_lnd_file", False)
+    lndg_fee_update_enabled = node_definitions.get("LNDg_fee_update", False)
 
     if write_charge_lnd_file_enabled:
         charge_lnd_file_path = os.path.join(
@@ -390,6 +392,8 @@ def main():
             channels_to_modify = get_channels_to_modify(pubkey, config)
             for chan_id, channel_data in channels_to_modify.items():
                 # update_lndg_fee(chan_id, new_fee_rate, config)
+                if lndg_fee_update_enabled:
+                    update_lndg_fee(chan_id, new_fee_rate, config)
                 print_fee_adjustment(
                     channel_data["alias"],
                     pubkey,
