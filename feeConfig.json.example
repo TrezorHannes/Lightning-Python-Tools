@@ -1,4 +1,5 @@
 {
+    "Terminal_output": true,
     "LNDg_fee_update": False,
     "write_charge_lnd_file": true,
     "groups": {

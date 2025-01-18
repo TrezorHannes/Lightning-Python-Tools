@@ -18,13 +18,13 @@ Nodes can belong to multiple groups, such as "sink" or "expensive". The group_ad
 Usage:
 - Configure nodes and their settings in the feeConfig.json file.
 - Run the script to automatically adjust fees based on the configured settings and current trends.
+- Currently, it requires a running LNDg instance to retrieve local channel details and fees
 
 Installation:
 2 * * * * /path/Lightning-Python-Tools/.venv/bin/python3 /path/Lightning-Python-Tools/LNDg/disabled_fee-accelerator.py >/dev/null &1
 Or run a python scheduler via systemd
 """
 
-# from ast import alias
 import os
 import requests
 from datetime import datetime, timedelta
@@ -337,6 +337,7 @@ def main():
     groups = node_definitions.get("groups", {})
     write_charge_lnd_file_enabled = node_definitions.get("write_charge_lnd_file", False)
     lndg_fee_update_enabled = node_definitions.get("LNDg_fee_update", False)
+    terminal_output_enabled = node_definitions.get("Terminal_output", False)
 
     if write_charge_lnd_file_enabled:
         charge_lnd_file_path = os.path.join(
@@ -394,20 +395,21 @@ def main():
                 # update_lndg_fee(chan_id, new_fee_rate, config)
                 if lndg_fee_update_enabled:
                     update_lndg_fee(chan_id, new_fee_rate, config)
-                print_fee_adjustment(
-                    channel_data["alias"],
-                    pubkey,
-                    chan_id,
-                    channel_data["capacity"],
-                    channel_data["local_balance"],
-                    channel_data["local_fee_rate"],
-                    new_fee_rate,
-                    group_name,
-                    fee_base,
-                    fee_conditions,
-                    trend_factor,
-                    all_amboss_data,
-                )
+                if terminal_output_enabled:
+                    print_fee_adjustment(
+                        channel_data["alias"],
+                        pubkey,
+                        chan_id,
+                        channel_data["capacity"],
+                        channel_data["local_balance"],
+                        channel_data["local_fee_rate"],
+                        new_fee_rate,
+                        group_name,
+                        fee_base,
+                        fee_conditions,
+                        trend_factor,
+                        all_amboss_data,
+                    )
                 if write_charge_lnd_file_enabled:
                     charge_lnd_file_path = os.path.join(
                         config["paths"]["charge_lnd_path"], "fee_adjuster.txt"
