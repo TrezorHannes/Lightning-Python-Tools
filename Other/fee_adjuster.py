@@ -20,6 +20,12 @@ Usage:
 - Run the script to automatically adjust fees based on the configured settings and current trends.
 - Currently, it requires a running LNDg instance to retrieve local channel details and fees
 
+Charge-lnd Details:
+# charge-lnd.config
+[🤖 FeeAdjuster Import]
+strategy = use_config
+config_file = file:///home/chargelnd/charge-lnd/.config/fee_adjuster.txt
+
 Installation:
 2 * * * * /path/Lightning-Python-Tools/.venv/bin/python3 /path/Lightning-Python-Tools/LNDg/disabled_fee-accelerator.py >/dev/null &1
 Or run a python scheduler via systemd
@@ -392,8 +398,9 @@ def main():
             )
             channels_to_modify = get_channels_to_modify(pubkey, config)
             for chan_id, channel_data in channels_to_modify.items():
-                # update_lndg_fee(chan_id, new_fee_rate, config)
-                if lndg_fee_update_enabled:
+                fee_delta = abs(new_fee_rate - channel_data["local_fee_rate"])
+                # set the fee_delta to X to avoid spamming LN gossip with unnecessary updates
+                if lndg_fee_update_enabled and fee_delta > 10:
                     update_lndg_fee(chan_id, new_fee_rate, config)
                 if terminal_output_enabled:
                     print_fee_adjustment(
