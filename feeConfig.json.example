@@ -1,0 +1,42 @@
+{
+    "Terminal_output": true,
+    "LNDg_fee_update": False,
+    "write_charge_lnd_file": true,
+    "groups": {
+        "sink": {
+            "group_adjustment_percentage": 0.10,
+            "max_cap": 3500,
+            "trend_sensitivity": 0.5,
+            "fee_base": "median"
+        },
+        "expensive": {
+            "group_adjustment_percentage": 0.15,
+            "max_cap": 4000,
+            "trend_sensitivity": 0.6,
+            "fee_base": "mean"
+        }
+    },
+    "nodes": [
+        {
+            "pubkey": "021c97a90a411ff2b10dc2a8e32de2f29d2fa49d41bfbb52bd416e460db0747d0d",
+            "group": "sink"
+        },
+        {
+            "pubkey": "03cde60a6323f7122d5178255766e38114b4722ede08f7c9e0c5df9b912cc201d6",
+            "group": "expensive"
+        },
+                {
+            "pubkey": "someotherpubkey",
+            "group": "expensive"
+        },
+        {
+            "pubkey": "03someotherpubkey",
+            "fee_conditions": {
+                "base_adjustment_percentage": 0.05,
+                "max_cap": 3000,
+                "trend_sensitivity": 0.4,
+                "fee_base": "mean"
+            }
+        }
+    ]
+}
