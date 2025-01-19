@@ -434,9 +434,7 @@ def main():
 
     if args.scheduler:
         schedule.every(1).hour.do(main)
-        while True:
-            schedule.run_pending()
-            time.sleep(60)
+        schedule.run_pending()
 
 
 if __name__ == "__main__":
