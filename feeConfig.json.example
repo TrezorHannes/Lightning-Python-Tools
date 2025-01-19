@@ -25,6 +25,10 @@
             "pubkey": "03cde60a6323f7122d5178255766e38114b4722ede08f7c9e0c5df9b912cc201d6",
             "group": "expensive"
         },
+                {
+            "pubkey": "someotherpubkey",
+            "group": "expensive"
+        },
         {
             "pubkey": "03someotherpubkey",
             "fee_conditions": {
