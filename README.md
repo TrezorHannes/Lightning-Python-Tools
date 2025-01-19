@@ -27,6 +27,9 @@ LNBits
 Other
 - `swap_wallet.py`: [one-off] send a specified amount of Lightning funds to a specified LN address. 
 The user can specify the total amount to transfer, the amount per transaction, the interval between transactions, the maximum fee rate, and a message to include with the payments.
+- `fee_adjuster.py`: [systemd, cron] Automatically adjusts channel fees based on Amboss API data and user-defined settings. It requires a running LNDg instance to retrieve local channel details. To configure, adjust `feeConfig.json` and `config.ini`. Install via `sudo ./Other/install_fee_adjuster_service.sh` or run via cron.
+
+
 
 Entries with [command-line output] provide further help-text with `-h` or `--help`
 
