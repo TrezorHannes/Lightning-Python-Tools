@@ -2,16 +2,19 @@
     "child1": {
         "wallet_id": "WALLETID1",
         "invoice_key": "INVOICEID1",
-        "fiat_amount": 0.10
+        "fiat_amount": 0.10,
+        "fiat_currency": "USD"
     },
     "child2": {
         "wallet_id": "WALLETID2",
         "invoice_key": "INVOICEID2",
-        "fiat_amount": 0.15
+        "fiat_amount": 0.15,
+        "fiat_currency": "EUR"
     },
     "child3": {
         "wallet_id": "WALLETID3",
         "invoice_key": "INVOICEID3",
-        "fiat_amount": 0.20
+        "fiat_amount": 0.20,
+        "fiat_currency": "GBP"
     }
 }
