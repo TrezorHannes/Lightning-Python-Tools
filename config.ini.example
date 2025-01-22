@@ -48,10 +48,11 @@ capped_ceiling = 3100
 
 ## LNBits Pocket Money Settings
 [LNBits]
-# wallet_id and invoice_key for each child to be stored in ../wallets.json
+# http:// for localhost or https:// for your external domain
+base_url = https://yourdomain.com/api/v1
 
 # admin key for the main LNBits wallet (parent wallet)
-admin_key = "admin_key_1"
+admin_key = admin_key_1
 
 [Schedule]
 # Options: daily, weekly
