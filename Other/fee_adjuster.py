@@ -39,9 +39,7 @@ from datetime import datetime, timedelta
 import configparser
 import logging
 import json
-import argparse
 import time
-import schedule
 from prettytable import PrettyTable
 
 

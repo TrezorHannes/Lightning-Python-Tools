@@ -33,7 +33,9 @@ VENV_PYTHON="$SCRIPT_DIR/../.venv/bin/python3"
 FEE_ADJUSTER_SCRIPT="$SCRIPT_DIR/fee_adjuster.py"
 SYSTEMD_DIR="/etc/systemd/system"
 SERVICE_NAME="fee_adjuster.service"
+TIMER_NAME="fee_adjuster.timer"
 SERVICE_FILE="$SYSTEMD_DIR/$SERVICE_NAME"
+TIMER_FILE="$SYSTEMD_DIR/$TIMER_NAME"
 
 # Check if the virtual environment Python executable exists
 if [[ ! -f "$VENV_PYTHON" ]]; then
