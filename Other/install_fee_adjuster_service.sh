@@ -57,20 +57,35 @@ After=network.target
 Type=simple
 User=$USER
 WorkingDirectory=$SCRIPT_DIR
-ExecStart=$VENV_PYTHON $FEE_ADJUSTER_SCRIPT --scheduler
-Restart=always
+ExecStart=$VENV_PYTHON $FEE_ADJUSTER_SCRIPT
+Restart=on-failure
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+# Create the systemd timer file
+cat > "$TIMER_FILE" << EOF
+[Unit]
+Description=Run Fee Adjuster Service Hourly
+
+[Timer]
+OnCalendar=*:00:00
+Unit=$SERVICE_NAME
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
+EOF
+
 # Reload systemd to recognize the new service
 systemctl daemon-reload
 
-# Enable and start the service
-systemctl enable "$SERVICE_NAME"
-systemctl start "$SERVICE_NAME"
+# Enable and start the timer
+systemctl enable "$TIMER_NAME"
+systemctl start "$TIMER_NAME"
 
-echo "Successfully installed and started the fee_adjuster service."
+echo "Successfully installed and started the fee_adjuster service and timer."
 
 # --- End Script ---

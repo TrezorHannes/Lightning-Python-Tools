@@ -27,8 +27,10 @@ strategy = use_config
 config_file = file:///home/chargelnd/charge-lnd/.config/fee_adjuster.txt
 
 Installation:
-2 * * * * /path/Lightning-Python-Tools/.venv/bin/python3 /path/Lightning-Python-Tools/LNDg/disabled_fee-accelerator.py >/dev/null &1
-Or run a python scheduler via systemd
+crontab -e with 
+0 * * * * /path/Lightning-Python-Tools/.venv/bin/python3 /path/Lightning-Python-Tools/Other/fee_adjuster.py >/dev/null &1
+
+Or run the systemd-installer install_fee_adjuster_service.sh
 """
 
 import os
@@ -332,109 +334,108 @@ def print_fee_adjustment(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Automated Fee Adjuster")
-    parser.add_argument(
-        "--scheduler", action="store_true", help="Run the script with the scheduler"
-    )
-    args = parser.parse_args()
-
-    config = load_config()
-    node_definitions = load_node_definitions()
-    groups = node_definitions.get("groups", {})
-    write_charge_lnd_file_enabled = node_definitions.get("write_charge_lnd_file", False)
-    lndg_fee_update_enabled = node_definitions.get("LNDg_fee_update", False)
-    terminal_output_enabled = node_definitions.get("Terminal_output", False)
-
-    if write_charge_lnd_file_enabled:
-        charge_lnd_file_path = os.path.join(
-            config["paths"]["charge_lnd_path"], "fee_adjuster.txt"
-        )
-        # Open the file in write mode to clear any existing content
-        with open(charge_lnd_file_path, "w") as f:
-            pass
-
-    for node in node_definitions["nodes"]:
-        pubkey = node["pubkey"]
-        group_name = node.get("group")
-        fee_conditions = None  # Initialize fee_conditions to None
-        base_adjustment_percentage = 0  # Initialize base_adjustment_percentage
-
-        if "fee_conditions" in node:
-            fee_conditions = node["fee_conditions"]
-            base_adjustment_percentage = fee_conditions.get(
-                "base_adjustment_percentage", 0
-            )
-
-        group_adjustment_percentage = 0  # Initialize group_adjustment_percentage
-        if group_name and group_name in groups:
-            group_fee_conditions = groups[group_name]
-            group_adjustment_percentage = group_fee_conditions.get(
-                "group_adjustment_percentage", 0
-            )
-            if not fee_conditions:
-                fee_conditions = group_fee_conditions
-        elif not fee_conditions:
-            logging.warning(
-                f"No fee conditions found for pubkey {pubkey}. Skipping fee adjustment."
-            )
-            continue
-
-        fee_base = fee_conditions.get("fee_base", "median")
+    while True:
         try:
-            all_amboss_data = fetch_amboss_data(pubkey, config)
-            # print(f"Amboss Data: {all_amboss_data}")  # Debug Amboss Fetcher
-            if not all_amboss_data:
-                logging.warning(
-                    f"No Amboss data found for pubkey {pubkey}. Skipping fee adjustment."
-                )
-                continue  # Skip to the next node
-            trend_factor = analyze_fee_trends(all_amboss_data, fee_base)
-            new_fee_rate = calculate_new_fee_rate(
-                all_amboss_data,
-                fee_conditions,
-                trend_factor,
-                base_adjustment_percentage,
-                group_adjustment_percentage,
+            config = load_config()
+            node_definitions = load_node_definitions()
+            groups = node_definitions.get("groups", {})
+            write_charge_lnd_file_enabled = node_definitions.get(
+                "write_charge_lnd_file", False
             )
-            channels_to_modify = get_channels_to_modify(pubkey, config)
-            for chan_id, channel_data in channels_to_modify.items():
-                fee_delta = abs(new_fee_rate - channel_data["local_fee_rate"])
-                # set the fee_delta to X to avoid spamming LN gossip with unnecessary updates
-                if lndg_fee_update_enabled and fee_delta > 10:
-                    update_lndg_fee(chan_id, new_fee_rate, config)
-                if terminal_output_enabled:
-                    print_fee_adjustment(
-                        channel_data["alias"],
-                        pubkey,
-                        chan_id,
-                        channel_data["capacity"],
-                        channel_data["local_balance"],
-                        channel_data["local_fee_rate"],
-                        new_fee_rate,
-                        group_name,
-                        fee_base,
+            lndg_fee_update_enabled = node_definitions.get("LNDg_fee_update", False)
+            terminal_output_enabled = node_definitions.get("Terminal_output", False)
+
+            if write_charge_lnd_file_enabled:
+                charge_lnd_file_path = os.path.join(
+                    config["paths"]["charge_lnd_path"], "fee_adjuster.txt"
+                )
+                # Open the file in write mode to clear any existing content
+                with open(charge_lnd_file_path, "w") as f:
+                    pass
+
+            for node in node_definitions["nodes"]:
+                pubkey = node["pubkey"]
+                group_name = node.get("group")
+                fee_conditions = None  # Initialize fee_conditions to None
+                base_adjustment_percentage = 0  # Initialize base_adjustment_percentage
+
+                if "fee_conditions" in node:
+                    fee_conditions = node["fee_conditions"]
+                    base_adjustment_percentage = fee_conditions.get(
+                        "base_adjustment_percentage", 0
+                    )
+
+                group_adjustment_percentage = (
+                    0  # Initialize group_adjustment_percentage
+                )
+                if group_name and group_name in groups:
+                    group_fee_conditions = groups[group_name]
+                    group_adjustment_percentage = group_fee_conditions.get(
+                        "group_adjustment_percentage", 0
+                    )
+                    if not fee_conditions:
+                        fee_conditions = group_fee_conditions
+                elif not fee_conditions:
+                    logging.warning(
+                        f"No fee conditions found for pubkey {pubkey}. Skipping fee adjustment."
+                    )
+                    continue
+
+                fee_base = fee_conditions.get("fee_base", "median")
+                try:
+                    all_amboss_data = fetch_amboss_data(pubkey, config)
+                    # print(f"Amboss Data: {all_amboss_data}")  # Debug Amboss Fetcher
+                    if not all_amboss_data:
+                        logging.warning(
+                            f"No Amboss data found for pubkey {pubkey}. Skipping fee adjustment."
+                        )
+                        continue  # Skip to the next node
+                    trend_factor = analyze_fee_trends(all_amboss_data, fee_base)
+                    new_fee_rate = calculate_new_fee_rate(
+                        all_amboss_data,
                         fee_conditions,
                         trend_factor,
-                        all_amboss_data,
+                        base_adjustment_percentage,
+                        group_adjustment_percentage,
                     )
-                if write_charge_lnd_file_enabled:
-                    charge_lnd_file_path = os.path.join(
-                        config["paths"]["charge_lnd_path"], "fee_adjuster.txt"
-                    )
-                    write_charge_lnd_file(
-                        charge_lnd_file_path,
-                        pubkey,
-                        channel_data["alias"],
-                        new_fee_rate,
-                    )
+                    channels_to_modify = get_channels_to_modify(pubkey, config)
+                    for chan_id, channel_data in channels_to_modify.items():
+                        fee_delta = abs(new_fee_rate - channel_data["local_fee_rate"])
+                        # set the fee_delta to X to avoid spamming LN gossip with unnecessary updates
+                        if lndg_fee_update_enabled and fee_delta > 10:
+                            update_lndg_fee(chan_id, new_fee_rate, config)
+                        if terminal_output_enabled:
+                            print_fee_adjustment(
+                                channel_data["alias"],
+                                pubkey,
+                                chan_id,
+                                channel_data["capacity"],
+                                channel_data["local_balance"],
+                                channel_data["local_fee_rate"],
+                                new_fee_rate,
+                                group_name,
+                                fee_base,
+                                fee_conditions,
+                                trend_factor,
+                                all_amboss_data,
+                            )
+                        if write_charge_lnd_file_enabled:
+                            charge_lnd_file_path = os.path.join(
+                                config["paths"]["charge_lnd_path"], "fee_adjuster.txt"
+                            )
+                            write_charge_lnd_file(
+                                charge_lnd_file_path,
+                                pubkey,
+                                channel_data["alias"],
+                                new_fee_rate,
+                            )
 
-        except (AmbossAPIError, LNDGAPIError) as e:
-            logging.error(f"Error processing node {pubkey}: {e}")
-            continue
-
-    if args.scheduler:
-        schedule.every(1).hour.do(main)
-        schedule.run_pending()
+                except (AmbossAPIError, LNDGAPIError) as e:
+                    logging.error(f"Error processing node {pubkey}: {e}")
+                    continue
+        except Exception as e:
+            logging.error(f"An unexpected error occurred: {e}")
+            time.sleep(60)  # Sleep for 1 minute before retrying
 
 
 if __name__ == "__main__":
