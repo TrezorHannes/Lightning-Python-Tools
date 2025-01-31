@@ -42,11 +42,6 @@ TOKEN = config["telegram"]["lnbits_bot_token"]
 CHAT_ID = config["telegram"]["telegram_user_id"]
 THRESHOLD_BALANCE = 1000000
 
-# Parse the children wallets from the jason file
-wallets_file_path = os.path.join(parent_dir, "..", "wallets.json")
-with open(wallets_file_path, "r") as f:
-    CHILDREN_WALLETS = json.load(f)
-
 # Initialize Telegram bot
 bot = TeleBot(TOKEN)
 
@@ -152,6 +147,11 @@ def send_telegram_warning(balance):
 
 # Main function to run the scheduled transfer
 def scheduled_transfer():
+    # Parse the children wallets from the jason file
+    wallets_file_path = os.path.join(parent_dir, "..", "wallets.json")
+    with open(wallets_file_path, "r") as f:
+        CHILDREN_WALLETS = json.load(f)
+
     for child, wallet_info in CHILDREN_WALLETS.items():
         wallet_id = wallet_info["wallet_id"]
         invoice_key = wallet_info["invoice_key"]
