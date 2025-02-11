@@ -1,12 +1,3 @@
-# This script filters all channels which are deemed swap-out candidates.
-# It does this by retrieving all channels from the LNDg database with
-# 0 ppm fee from our side, active, not in our config.ini blacklist and
-# more liquidity than the capacity threshold available defined here in the header
-
-# This is shown in the terminal, but also written as channel-IDs into a file found
-# in directory data. From there, it can be picked up by swap-out scripts.
-# swap_out-candidates.py -h for help on the different options
-
 import os
 import requests
 import json
@@ -76,43 +67,28 @@ args = parser.parse_args()
 CAPACITY_THRESHOLD = args.capacity
 
 
-def get_chan_ids_to_write():
-    chan_ids_to_write = []  # Initialize the list
+def get_all_channels_info():
+    all_channels_info = []
     try:
         response = requests.get(api_url, auth=(username, password))
-
-        # Check if the request was successful (status code 200)
         if response.status_code == 200:
             data = response.json()
             if "results" in data:
                 results = data["results"]
-
-                sorted_results = sorted(
-                    results,
-                    key=lambda x: (x.get("local_balance", 0) / x.get("capacity", 1)),
-                    reverse=True,
-                )
-
-                for result in sorted_results:
-                    remote_pubkey = result.get("remote_pubkey", "")
-                    local_fee_rate = result.get("local_fee_rate", 0)
-                    is_active = result.get("is_active", "")
-                    local_balance = result.get("local_balance", 0)
-                    chan_id = result.get("chan_id", "")
-                    if (
-                        local_fee_rate <= args.fee_limit
-                        and remote_pubkey not in ignore_remote_pubkeys
-                        and local_balance > CAPACITY_THRESHOLD
-                        and is_active
-                    ):
-                        chan_ids_to_write.append(chan_id)
+                for result in results:
+                    channel_info = {
+                        "chan_id": result.get("chan_id", ""),
+                        "local_balance": result.get("local_balance", 0),
+                        "capacity": result.get("capacity", 0),
+                        "remote_pubkey": result.get("remote_pubkey", ""),
+                        "local_fee_rate": result.get("local_fee_rate", 0),
+                    }
+                    all_channels_info.append(channel_info)
         else:
             print(f"API request failed with status code: {response.status_code}")
-
     except Exception as e:
         print(f"Error: {e}")
-
-    return chan_ids_to_write
+    return all_channels_info
 
 
 def terminal_output():
@@ -260,11 +236,12 @@ def main():
         write_bos_tags()
 
     if args.file_export:
-        chan_ids = get_chan_ids_to_write()
-        if chan_ids:
-            with open(file_path, "w") as file:
-                file.write(",".join(chan_ids) + "\n")
-            print(f"Channel-ID data written to {file_path}")
+        # Remove chan_ids = get_chan_ids_to_write()
+        # Remove if chan_ids:
+        # Remove with open(file_path, 'w') as file:
+        # Remove file.write(','.join(chan_ids) + '\n')
+        # Remove print(f"Channel-ID data written to {file_path}")
+        pass
 
 
 if __name__ == "__main__":

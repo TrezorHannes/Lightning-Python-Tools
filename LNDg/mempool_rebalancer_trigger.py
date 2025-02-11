@@ -4,7 +4,7 @@
 # When the mempool fees are high, the script will disable AR to prevent the node from getting stuck with unconfirmed transactions.
 # When the mempool fees are low, the script will enable AR to allow the node to take advantage of the lower fees.
 
-'''
+"""
 To create a systemd service for the script, create a file with the following contents:
 
 [Unit]
@@ -24,7 +24,7 @@ Save the file with a .service extension (e.g., mempool_rebalancer_trigger.servic
 sudo systemctl daemon-reload
 sudo systemctl enable mempool_rebalancer_trigger.service
 sudo systemctl start mempool_rebalancer_trigger.service
-'''
+"""
 
 import requests
 import logging
@@ -38,26 +38,31 @@ import configparser
 parent_dir = os.path.dirname(os.path.abspath(__file__))
 
 # path to the config.ini file located in the parent directory
-config_file_path = os.path.join(parent_dir, '..', 'config.ini')
+config_file_path = os.path.join(parent_dir, "..", "config.ini")
 config = configparser.ConfigParser()
 config.read(config_file_path)
+
 
 # Get the current timestamp
 def get_current_timestamp():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+
 # Variables
-MEMPOOL_API_URL = 'https://mempool.space/api/v1/fees/recommended'
-AR_ENABLED_API_URL = 'http://localhost:8889/api/settings/AR-Enabled/?format=api'
+MEMPOOL_API_URL = "https://mempool.space/api/v1/fees/recommended"
+AR_ENABLED_API_URL = (
+    config["lndg"]["lndg_api_url"] + "/api/settings/AR-Enabled/?format=api"
+)
 MEMPOOL_FEE_THRESHOLD = 150  # Adjust this value as needed
 
 # LNDg API credentials and endpoints. Retrievable from lndg/data/lndg-admin.txt
-username = config['credentials']['lndg_username']
-password = config['credentials']['lndg_password']
+username = config["credentials"]["lndg_username"]
+password = config["credentials"]["lndg_password"]
 
 # Logfile definition
-log_file_path = os.path.join(parent_dir, '..', 'logs', 'mempool_rebalancer_trigger.log')
-logging.basicConfig(filename=log_file_path, level=logging.DEBUG) 
+log_file_path = os.path.join(parent_dir, "..", "logs", "mempool_rebalancer_trigger.log")
+logging.basicConfig(filename=log_file_path, level=logging.DEBUG)
+
 
 # Error classes
 class MempoolAPIError(Exception):
@@ -67,6 +72,7 @@ class MempoolAPIError(Exception):
         super().__init__(message)
         self.status_code = status_code
         self.response_data = response_data
+
 
 class LNDGAPIError(Exception):
     """Represents an error when interacting with the LNDg API."""
@@ -86,8 +92,10 @@ def check_mempool_fees():
 
         data = response.json()
         if data:
-            half_hour_fee = data['halfHourFee']
-            logging.info(f"{get_current_timestamp()}: [MEMPOOL] Half-hour mempool fee: {half_hour_fee}")
+            half_hour_fee = data["halfHourFee"]
+            logging.info(
+                f"{get_current_timestamp()}: [MEMPOOL] Half-hour mempool fee: {half_hour_fee}"
+            )
             if int(half_hour_fee) > MEMPOOL_FEE_THRESHOLD:
                 return False
             else:
@@ -106,14 +114,24 @@ def adjust_ar_enabled(ar_enabled):
     ar_enabled_str = "1" if ar_enabled else "0"
 
     try:
-        response = requests.put(AR_ENABLED_API_URL, json={"value": ar_enabled_str}, auth=(username, password))
-        
+        response = requests.put(
+            AR_ENABLED_API_URL,
+            json={"value": ar_enabled_str},
+            auth=(username, password),
+        )
+
         if response.status_code == 200:
-            logging.info(f"{timestamp}: AR-Enabled setting adjusted to {ar_enabled_str}")
+            logging.info(
+                f"{timestamp}: AR-Enabled setting adjusted to {ar_enabled_str}"
+            )
             print(f"{timestamp}: AR-Enabled setting adjusted to {ar_enabled_str}")
         else:
-            logging.error(f"{timestamp}: Failed to adjust AR-Enabled setting to {ar_enabled_str}: Status Code {response.status_code}")
-            print(f"{timestamp}: Failed to adjust AR-Enabled setting to {ar_enabled_str}: Status Code {response.status_code}")
+            logging.error(
+                f"{timestamp}: Failed to adjust AR-Enabled setting to {ar_enabled_str}: Status Code {response.status_code}"
+            )
+            print(
+                f"{timestamp}: Failed to adjust AR-Enabled setting to {ar_enabled_str}: Status Code {response.status_code}"
+            )
 
     except requests.exceptions.RequestException as e:
         logging.error(f"{timestamp}: LNDg API request failed: {e}")

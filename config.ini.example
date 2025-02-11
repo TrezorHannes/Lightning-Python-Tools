@@ -7,6 +7,9 @@ amboss_authorization =
 lndg_username = 
 lndg_password = 
 
+[lndg]
+lndg_api_url = http://localhost:8889
+
 [pubkey]
 #Add Pubkeys you want to ignore in automated LNDg updates, comma-separated for adding multiple pubkeys. 
 base_fee_ignore = pubkey1,pubkey2,pubkey3

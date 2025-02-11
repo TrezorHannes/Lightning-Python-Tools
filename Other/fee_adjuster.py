@@ -187,7 +187,8 @@ def calculate_new_fee_rate(
 # Need to fetch from LNDg since lncli listchannels doesn't provide local_fee
 # and want to avoid two lncli subprocesses per pubkey
 def get_channels_to_modify(pubkey, config):
-    api_url = f"http://localhost:8889/api/channels?limit=1500"
+    lndg_api_url = config["lndg"]["lndg_api_url"]
+    api_url = f"{lndg_api_url}/api/channels?limit=1500"
     username = config["credentials"]["lndg_username"]
     password = config["credentials"]["lndg_password"]
     channels_to_modify = {}
@@ -233,7 +234,8 @@ def get_channels_to_modify(pubkey, config):
 
 # Write to LNDg
 def update_lndg_fee(chan_id, new_fee_rate, config):
-    update_api_url = "http://localhost:8889/api/chanpolicy/"
+    lndg_api_url = config["lndg"]["lndg_api_url"]
+    update_api_url = f"{lndg_api_url}/api/chanpolicy/"
     username = config["credentials"]["lndg_username"]
     password = config["credentials"]["lndg_password"]
     payload = {"chan_id": chan_id, "fee_rate": new_fee_rate}
