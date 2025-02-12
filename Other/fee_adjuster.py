@@ -382,6 +382,7 @@ def main():
                     continue
 
                 fee_base = fee_conditions.get("fee_base", "median")
+                fee_delta_threshold = fee_conditions.get("fee_delta_threshold", 20)
                 try:
                     all_amboss_data = fetch_amboss_data(pubkey, config)
                     # print(f"Amboss Data: {all_amboss_data}")  # Debug Amboss Fetcher
@@ -402,7 +403,7 @@ def main():
                     for chan_id, channel_data in channels_to_modify.items():
                         fee_delta = abs(new_fee_rate - channel_data["local_fee_rate"])
                         # set the fee_delta to X to avoid spamming LN gossip with unnecessary updates
-                        if lndg_fee_update_enabled and fee_delta > 10:
+                        if lndg_fee_update_enabled and fee_delta > fee_delta_threshold:
                             update_lndg_fee(chan_id, new_fee_rate, config)
                         if terminal_output_enabled:
                             print_fee_adjustment(
