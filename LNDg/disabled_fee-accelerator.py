@@ -122,7 +122,7 @@ def get_channels_to_modify():
                     else:
                         fees_timing_condition = False
 
-                    if remote_pubkey in ignore_remote_pubkeys:
+                    if remote_pubkey in ignore_remote_pubkeys and is_active:
                         logging.info(
                             f"Ignoring channel {chan_id} with {alias} and current fee-rate of {local_fee_rate}"
                         )
