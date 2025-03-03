@@ -7,13 +7,18 @@
             "group_adjustment_percentage": 0.10,
             "max_cap": 3500,
             "trend_sensitivity": 0.5,
-            "fee_base": "median"
+            "fee_base": "median",
+            "fee_delta_threshold": 12,
+            "max_outbound": 0.8,
+            "min_outbound": 0.1
         },
         "expensive": {
             "group_adjustment_percentage": 0.15,
             "max_cap": 4000,
             "trend_sensitivity": 0.6,
-            "fee_base": "mean"
+            "fee_base": "mean",
+            "fee_delta_threshold": 25,
+            "min_outbound": 0.2
         }
     },
     "nodes": [
@@ -35,7 +40,9 @@
                 "base_adjustment_percentage": 0.05,
                 "max_cap": 3000,
                 "trend_sensitivity": 0.4,
-                "fee_base": "mean"
+                "fee_base": "mean",
+                "fee_delta_threshold": 10,
+                "min_outbound": 0.4
             }
         }
     ]

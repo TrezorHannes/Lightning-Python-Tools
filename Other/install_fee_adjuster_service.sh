@@ -56,12 +56,11 @@ Description=Fee Adjuster Service
 After=network.target
 
 [Service]
-Type=simple
+Type=oneshot
 User=$USER
 WorkingDirectory=$SCRIPT_DIR
 ExecStart=$VENV_PYTHON $FEE_ADJUSTER_SCRIPT
-Restart=on-failure
-RestartSec=10
+RemainAfterExit=no
 
 [Install]
 WantedBy=multi-user.target
