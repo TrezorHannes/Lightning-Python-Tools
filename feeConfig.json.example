@@ -9,7 +9,7 @@
             "trend_sensitivity": 0.5,
             "fee_base": "median",
             "fee_delta_threshold": 12,
-            "max_outbound": 0.8
+            "max_outbound": 0.8,
             "min_outbound": 0.1
         },
         "expensive": {
