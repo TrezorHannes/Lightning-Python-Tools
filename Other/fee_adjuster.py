@@ -11,6 +11,9 @@ Configuration Settings (see fee_adjuster_config_docs.txt for details):
 - trend_sensitivity: Determines how much trends influence fee adjustments. Higher values mean greater influence.
 - fee_base: The statistical measure used as the base for fee calculations. Options include "median", "mean", "min", "max", "weighted" and "weighted_corrected".
 - groups: Categories or tags for nodes. Used to apply specific strategies or adjustments.
+- max_outbound: (Optional) Maximum outbound liquidity percentage (0.0 to 1.0).  Only applies if the channel's outbound liquidity is *below* this value.
+- min_outbound: (Optional) Minimum outbound liquidity percentage (0.0 to 1.0). Only applies if the channel's outbound liquidity is *above* this value.
+
 
 Groups and group_adjustment_percentage:
 Nodes can belong to multiple groups, such as "sink" or "expensive". The group_adjustment_percentage is applied to nodes based on their group membership, allowing for tailored fee strategies. For example, nodes in the "expensive" group might have higher fees to reflect their role in the network.
@@ -398,8 +401,35 @@ def main():
                 )
                 channels_to_modify = get_channels_to_modify(pubkey, config)
                 for chan_id, channel_data in channels_to_modify.items():
-                    fee_delta = abs(new_fee_rate - channel_data["local_fee_rate"])
                     # set the fee_delta to X to avoid spamming LN gossip with unnecessary updates
+                    fee_delta = abs(new_fee_rate - channel_data["local_fee_rate"])
+
+                    # --- Outbound Liquidity Check ---
+                    local_balance_ratio = channel_data["local_balance_ratio"] / 100
+                    max_outbound = fee_conditions.get(
+                        "max_outbound", 1.0
+                    )  # Default to 1.0 (no limit)
+                    min_outbound = fee_conditions.get(
+                        "min_outbound", 0.0
+                    )  # Default to 0.0 (no limit)
+
+                    if not (
+                        local_balance_ratio <= max_outbound
+                        and local_balance_ratio >= min_outbound
+                    ):
+                        logging.info(
+                            f"Channel {chan_id} (Alias: {channel_data['alias']}) skipped due to outbound liquidity conditions. "
+                            f"Local balance ratio: {local_balance_ratio:.2f}, Max: {max_outbound}, Min: {min_outbound}"
+                        )
+                        if terminal_output_enabled:  # added for terminal output
+                            print(
+                                f"Channel {chan_id} (Alias: {channel_data['alias']}) skipped due to outbound liquidity conditions."
+                            )
+                            print(
+                                f"Local balance ratio: {local_balance_ratio:.2f}, Max: {max_outbound}, Min: {min_outbound}"
+                            )
+                        continue  # Skip to the next channel
+
                     if lndg_fee_update_enabled and fee_delta > fee_delta_threshold:
                         update_lndg_fee(chan_id, new_fee_rate, config)
                     if terminal_output_enabled:
