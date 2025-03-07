@@ -30,7 +30,7 @@ strategy = use_config
 config_file = file:///home/chargelnd/charge-lnd/.config/fee_adjuster.txt
 
 Installation:
-crontab -e with 
+crontab -e with
 0 * * * * /path/Lightning-Python-Tools/.venv/bin/python3 /path/Lightning-Python-Tools/Other/fee_adjuster.py >/dev/null &1
 
 Or run the systemd-installer install_fee_adjuster_service.sh
@@ -211,6 +211,7 @@ def get_channels_to_modify(pubkey, config):
                     capacity = result.get("capacity", 0)
                     local_balance = result.get("local_balance", 0)
                     fees_updated = result.get("fees_updated", "")
+                    auto_fees = result.get("auto_fees", False)
 
                     if is_open:
                         local_balance_ratio = (
@@ -228,6 +229,7 @@ def get_channels_to_modify(pubkey, config):
                             "local_balance_ratio": local_balance_ratio,
                             "fees_updated_datetime": fees_updated_datetime,
                             "local_fee_rate": local_fee_rate,
+                            "auto_fees": auto_fees,
                         }
         return channels_to_modify
     except requests.exceptions.RequestException as e:
@@ -236,18 +238,34 @@ def get_channels_to_modify(pubkey, config):
 
 
 # Write to LNDg
-def update_lndg_fee(chan_id, new_fee_rate, config):
+def update_lndg_fee(chan_id, new_fee_rate, channel_data, config):
     lndg_api_url = config["lndg"]["lndg_api_url"]
-    update_api_url = f"{lndg_api_url}/api/chanpolicy/"
     username = config["credentials"]["lndg_username"]
     password = config["credentials"]["lndg_password"]
-    payload = {"chan_id": chan_id, "fee_rate": new_fee_rate}
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # First, update auto_fees if needed
+    if channel_data["auto_fees"]:
+        auto_fees_url = f"{lndg_api_url}/api/channels/{chan_id}/"
+        auto_fees_payload = {"chan_id": chan_id, "auto_fees": False}
+        try:
+            response = requests.put(
+                auto_fees_url, json=auto_fees_payload, auth=(username, password)
+            )
+            response.raise_for_status()
+            logging.info(f"{timestamp}: Disabled auto_fees for channel {chan_id}")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error updating auto_fees for channel {chan_id}: {e}")
+            raise LNDGAPIError(f"Error updating auto_fees for channel {chan_id}: {e}")
+
+    # Then, update the fee rate
+    fee_update_url = f"{lndg_api_url}/api/chanpolicy/"
+    fee_payload = {"chan_id": chan_id, "fee_rate": new_fee_rate}
     try:
         response = requests.post(
-            update_api_url, json=payload, auth=(username, password)
+            fee_update_url, json=fee_payload, auth=(username, password)
         )
         response.raise_for_status()
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         logging.info(
             f"{timestamp}: API confirmed changing local fee to {new_fee_rate} for channel {chan_id}"
         )
@@ -431,7 +449,7 @@ def main():
                         continue  # Skip to the next channel
 
                     if lndg_fee_update_enabled and fee_delta > fee_delta_threshold:
-                        update_lndg_fee(chan_id, new_fee_rate, config)
+                        update_lndg_fee(chan_id, new_fee_rate, channel_data, config)
                     if terminal_output_enabled:
                         print_fee_adjustment(
                             channel_data["alias"],
