@@ -48,6 +48,7 @@ liquid_tx = https://liquid.network/tx/
 [parameters]
 fee_updated_hours_ago = 3
 capped_ceiling = 3100
+agg_liquidity_threshold = 10
 
 ## LNBits Pocket Money Settings
 [LNBits]
