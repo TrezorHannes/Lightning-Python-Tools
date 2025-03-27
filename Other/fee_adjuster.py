@@ -274,42 +274,60 @@ def update_lndg_fee(chan_id, new_fee_rate, channel_data, config):
         raise LNDGAPIError(f"Error updating LNDg fee for channel {chan_id}: {e}")
 
 
-def write_charge_lnd_file(file_path, pubkey, alias, new_fee_rate):
+def write_charge_lnd_file(
+    file_path, pubkey, alias, new_fee_rate, is_aggregated
+):  # Added is_aggregated
     with open(file_path, "a") as f:
-        f.write(f"[🤖 {alias}]\n")
+        f.write(
+            f"[🤖 {alias}{' (Aggregated)' if is_aggregated else ''}]\n"
+        )  # Add note to alias comment
         f.write(f"node.id = {pubkey}\n")
         f.write("strategy = static\n")
         f.write(f"fee_ppm = {new_fee_rate}\n")
-        f.write("min_htlc_msat = 1_000\n")
-        f.write("max_htlc_msat_ratio = 0.9\n")
+        f.write(
+            "min_htlc_msat = 1_000\n"
+        )  # Consider if these should be configurable per peer
+        f.write(
+            "max_htlc_msat_ratio = 0.9\n"
+        )  # Consider if these should be configurable per peer
         f.write("\n")
 
 
 def print_fee_adjustment(
     alias,
     pubkey,
-    chan_id,
-    capacity,
-    local_balance,
-    old_fee_rate,
+    channel_ids_list,  # Changed from chan_id
+    capacity,  # Now potentially aggregate
+    local_balance,  # Now potentially aggregate
+    old_fee_rate,  # Display purpose (e.g., from first channel)
     new_fee_rate,
     group_name,
     fee_base,
     fee_conditions,
     trend_factor,
     amboss_data,
+    is_aggregated,  # New flag
 ):
     print("-" * 80)
-    print(f"Alias: {alias}")
+    print(f"Alias: {alias}{' (Aggregated)' if is_aggregated else ''}")
     print(f"Pubkey: {pubkey}")
-    print(f"Channel ID: {chan_id}")
-    print(f"Local Capacity: {capacity}")
-    print(
-        f"Local Capacity: {local_balance} | (Outbound: {round(local_balance/capacity*100)}%)"
-    )
-    print(f"Old Fee Rate: {old_fee_rate}")
-    print(f"New Fee Rate: {new_fee_rate}")
-    print(f"Delta: {new_fee_rate - old_fee_rate}")
+    if is_aggregated:
+        print(f"Channel IDs: {', '.join(channel_ids_list)}")
+        print(f"Aggregate Capacity: {capacity}")
+        print(
+            f"Aggregate Local Balance: {local_balance} | (Outbound: {round(local_balance/capacity*100) if capacity else 0}%)"
+        )
+    else:
+        print(f"Channel ID: {channel_ids_list[0]}")  # Only one ID in the list
+        print(f"Capacity: {capacity}")
+        print(
+            f"Local Balance: {local_balance} | (Outbound: {round(local_balance/capacity*100) if capacity else 0}%)"
+        )
+    # Display old/new rate - Note: Actual updates depended on individual deltas
+    print(f"Old Fee Rate (Example): {old_fee_rate}")
+    print(f"New Fee Rate (Applied): {new_fee_rate}")
+    # Delta display might be less meaningful in aggregate view, consider removing or clarifying
+    # print(f"Delta: {new_fee_rate - old_fee_rate}")
     if group_name:
         print(f"Group: {group_name}")
     else:
@@ -318,6 +336,7 @@ def print_fee_adjustment(
     print(f"Fee Conditions: {json.dumps(fee_conditions)}")
     print(f"Trend Factor: {trend_factor}")
 
+    # Amboss data table remains the same
     table = PrettyTable()
     table.field_names = [
         "Time Range",
@@ -418,63 +437,117 @@ def main():
                     group_adjustment_percentage,
                 )
                 channels_to_modify = get_channels_to_modify(pubkey, config)
+                num_channels = len(channels_to_modify)
+
+                if not channels_to_modify:
+                    logging.info(
+                        f"No open channels found for pubkey {pubkey}. Skipping."
+                    )
+                    continue
+
+                # --- Aggregate Liquidity Calculation (if multiple channels) ---
+                total_capacity = 0
+                total_local_balance = 0
+                aggregate_local_balance_ratio = 0
+                first_channel_data = next(
+                    iter(channels_to_modify.values())
+                )  # Get data from one channel for later use
+
+                if num_channels > 1:
+                    logging.info(
+                        f"Found {num_channels} channels for peer {pubkey}. Aggregating liquidity."
+                    )
+                    for chan_data in channels_to_modify.values():
+                        total_capacity += chan_data["capacity"]
+                        total_local_balance += chan_data["local_balance"]
+                    aggregate_local_balance_ratio = (
+                        (total_local_balance / total_capacity) * 100
+                        if total_capacity
+                        else 0
+                    )
+                    check_ratio = (
+                        aggregate_local_balance_ratio / 100
+                    )  # Use aggregate ratio for check
+                else:
+                    # Use individual channel's ratio if only one channel
+                    total_capacity = first_channel_data["capacity"]
+                    total_local_balance = first_channel_data["local_balance"]
+                    check_ratio = first_channel_data["local_balance_ratio"] / 100
+
+                # --- Outbound Liquidity Check (using aggregate or individual ratio) ---
+                max_outbound = fee_conditions.get("max_outbound", 1.0)
+                min_outbound = fee_conditions.get("min_outbound", 0.0)
+
+                if not (check_ratio <= max_outbound and check_ratio >= min_outbound):
+                    alias_to_log = first_channel_data[
+                        "alias"
+                    ]  # Use first alias for logging consistency
+                    logging.info(
+                        f"Peer {pubkey} (Alias: {alias_to_log}, {num_channels} channels) skipped due to outbound liquidity conditions. "
+                        f"Ratio: {check_ratio:.2f}, Max: {max_outbound}, Min: {min_outbound}"
+                    )
+                    if terminal_output_enabled:
+                        print(
+                            f"Peer {pubkey} (Alias: {alias_to_log}, {num_channels} channels) skipped due to outbound liquidity conditions."
+                        )
+                        print(
+                            f"Aggregate Ratio: {check_ratio:.2f}, Max: {max_outbound}, Min: {min_outbound}"
+                        )
+                    continue  # Skip this entire peer
+
+                # --- Apply updates to individual channels ---
+                updated_any_channel = False
+                channel_ids_list = list(channels_to_modify.keys())
+
                 for chan_id, channel_data in channels_to_modify.items():
-                    # set the fee_delta to X to avoid spamming LN gossip with unnecessary updates
                     fee_delta = abs(new_fee_rate - channel_data["local_fee_rate"])
 
-                    # --- Outbound Liquidity Check ---
-                    local_balance_ratio = channel_data["local_balance_ratio"] / 100
-                    max_outbound = fee_conditions.get(
-                        "max_outbound", 1.0
-                    )  # Default to 1.0 (no limit)
-                    min_outbound = fee_conditions.get(
-                        "min_outbound", 0.0
-                    )  # Default to 0.0 (no limit)
-
-                    if not (
-                        local_balance_ratio <= max_outbound
-                        and local_balance_ratio >= min_outbound
-                    ):
-                        logging.info(
-                            f"Channel {chan_id} (Alias: {channel_data['alias']}) skipped due to outbound liquidity conditions. "
-                            f"Local balance ratio: {local_balance_ratio:.2f}, Max: {max_outbound}, Min: {min_outbound}"
-                        )
-                        if terminal_output_enabled:  # added for terminal output
-                            print(
-                                f"Channel {chan_id} (Alias: {channel_data['alias']}) skipped due to outbound liquidity conditions."
-                            )
-                            print(
-                                f"Local balance ratio: {local_balance_ratio:.2f}, Max: {max_outbound}, Min: {min_outbound}"
-                            )
-                        continue  # Skip to the next channel
-
                     if lndg_fee_update_enabled and fee_delta > fee_delta_threshold:
-                        update_lndg_fee(chan_id, new_fee_rate, channel_data, config)
+                        try:
+                            update_lndg_fee(chan_id, new_fee_rate, channel_data, config)
+                            updated_any_channel = True
+                        except LNDGAPIError as api_err:
+                            logging.error(
+                                f"Failed to update LNDg for {chan_id}: {api_err}"
+                            )
+                            # Decide if you want to continue with other channels or stop for this peer
+                            continue  # Continue with the next channel for this peer
+
+                # --- Output and File Writing (once per peer if any channel was updated or terminal output enabled) ---
+                if updated_any_channel or terminal_output_enabled:
                     if terminal_output_enabled:
+                        # Use the modified print function
                         print_fee_adjustment(
-                            channel_data["alias"],
+                            first_channel_data["alias"],  # Use first alias
                             pubkey,
-                            chan_id,
-                            channel_data["capacity"],
-                            channel_data["local_balance"],
-                            channel_data["local_fee_rate"],
+                            channel_ids_list,  # Pass list of all chan IDs
+                            total_capacity,  # Pass aggregate capacity
+                            total_local_balance,  # Pass aggregate balance
+                            # Pass old/new rates from the first channel for display consistency,
+                            # actual updates depend on individual deltas.
+                            first_channel_data["local_fee_rate"],
                             new_fee_rate,
                             group_name,
                             fee_base,
                             fee_conditions,
                             trend_factor,
                             all_amboss_data,
+                            num_channels > 1,  # Flag if aggregated
                         )
-                    if write_charge_lnd_file_enabled:
-                        charge_lnd_file_path = os.path.join(
-                            config["paths"]["charge_lnd_path"], "fee_adjuster.txt"
-                        )
-                        write_charge_lnd_file(
-                            charge_lnd_file_path,
-                            pubkey,
-                            channel_data["alias"],
-                            new_fee_rate,
-                        )
+
+                # Write to charge-lnd file once per peer if enabled and any channel updated
+                if write_charge_lnd_file_enabled and updated_any_channel:
+                    charge_lnd_file_path = os.path.join(
+                        config["paths"]["charge_lnd_path"], "fee_adjuster.txt"
+                    )
+                    # Use modified write function
+                    write_charge_lnd_file(
+                        charge_lnd_file_path,
+                        pubkey,
+                        first_channel_data["alias"],  # Use first alias
+                        new_fee_rate,
+                        num_channels > 1,  # Flag if aggregated
+                    )
 
             except (AmbossAPIError, LNDGAPIError) as e:
                 logging.error(f"Error processing node {pubkey}: {e}")
