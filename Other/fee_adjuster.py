@@ -49,6 +49,10 @@ For example, with a stuck_time_period of 7 days:
 - No forwarding for 21+ days: Move down 3 fee bands
 - No forwarding for 28+ days: Move down to band 0 (maximum discount)
 
+Important: Stuck channel adjustment is automatically disabled when local liquidity is below 20%. This prevents
+offering discounts on channels that are already heavily drained and likely need rebalancing instead of
+further incentives to route outbound payments.
+
 The script queries the LNDg API to determine the timestamp of the last forwarding through each channel.
 If a channel has no forwarding history at all, it receives the maximum discount.
 
@@ -259,6 +263,16 @@ def calculate_stuck_channel_band_adjustment(fee_conditions, channel_data, chan_i
     stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
     if not stuck_settings.get("enabled", False):
         return 0  # No adjustment
+    
+    # Skip stuck channel adjustment if local liquidity is too low (below 20%)
+    # This prevents reducing fees further when the channel is already heavily drained
+    capacity = channel_data.get("capacity", 0)
+    local_balance = channel_data.get("local_balance", 0)
+    
+    if capacity > 0:
+        local_ratio = local_balance / capacity
+        if local_ratio < 0.2:  # Less than 20% local liquidity
+            return 0  # Skip adjustment
     
     # Get the stuck time period in days
     stuck_time_period = stuck_settings.get("stuck_time_period", 7)
@@ -557,7 +571,15 @@ def print_fee_adjustment(
     stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
     if stuck_settings.get("enabled", False):
         stuck_time_period = stuck_settings.get("stuck_time_period", 7)
-        if stuck_band_adjustment > 0:
+        
+        # Check if we're in the low-liquidity band where stuck adjustment is skipped
+        outbound_ratio = local_balance/capacity if capacity else 0
+        is_low_liquidity = outbound_ratio < 0.2
+        
+        if is_low_liquidity:
+            print(f"Stuck Channel Adjustment: Skipped (Low Local Liquidity: {outbound_ratio*100:.1f}%)")
+            print(f"  - Note: Stuck channel adjustment is disabled when local liquidity is below 20%")
+        elif stuck_band_adjustment > 0:
             print(f"Stuck Channel Adjustment: Applied")
             print(f"  - Bands Adjusted Down: {stuck_band_adjustment}")
             print(f"  - Stuck Time Period: {stuck_time_period} days")
