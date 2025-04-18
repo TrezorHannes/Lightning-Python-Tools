@@ -13,10 +13,29 @@ Configuration Settings (see fee_adjuster_config_docs.txt for details):
 - groups: Categories or tags for nodes. Used to apply specific strategies or adjustments.
 - max_outbound: (Optional) Maximum outbound liquidity percentage (0.0 to 1.0).  Only applies if the channel's outbound liquidity is *below* this value.
 - min_outbound: (Optional) Minimum outbound liquidity percentage (0.0 to 1.0). Only applies if the channel's outbound liquidity is *above* this value.
+- fee_bands: (Optional) Adjusts fees based on local liquidity. Contains the following sub-settings:
+  - enabled: Whether to use fee bands (true/false)
+  - discount: Discount percentage (negative value) to apply when local balance is high (80-100%)
+  - premium: Premium percentage (positive value) to apply when local balance is low (0-40%)
 
 
 Groups and group_adjustment_percentage:
 Nodes can belong to multiple groups, such as "sink" or "expensive". The group_adjustment_percentage is applied to nodes based on their group membership, allowing for tailored fee strategies. For example, nodes in the "expensive" group might have higher fees to reflect their role in the network.
+
+Fee Bands:
+The fee_bands feature provides dynamic fee adjustments based on channel liquidity. It divides liquidity into 5 bands:
+- Band 0 (80-100% local balance): Maximum discount applied
+- Band 1 (60-80% local balance): High discount applied
+- Band 2 (40-60% local balance): Neutral adjustment
+- Band 3 (20-40% local balance): Maximum premium applied
+- Band 4 (0-20% local balance): Maximum premium applied (same as band 3)
+
+Note: The premium is capped at band 3 (40% liquidity threshold) to ensure rebalancing can happen profitably 
+when channels reach very low liquidity levels. This prevents charging escalating fees when channels are 
+almost depleted, which would make automated rebalancing unprofitable.
+
+This allows you to incentivize balanced channels by offering discounts when you have excess liquidity
+and charging premiums when your liquidity is low.
 
 Usage:
 - Configure nodes and their settings in the feeConfig.json file.
@@ -163,12 +182,62 @@ def analyze_fee_trends(all_fee_data, fee_base):
         return 0  # Fees are stable or mixed trends
 
 
+def calculate_fee_band_adjustment(fee_conditions, outbound_ratio):
+    """
+    Calculate fee adjustment based on outbound liquidity ratio bands.
+    
+    Divides the outbound liquidity into 5 percentile bands and applies a
+    graduated adjustment between the discount (high local balance) and
+    premium (low local balance).
+    
+    Bands:
+    - Band 0 (80-100% local): max discount
+    - Band 1 (60-80% local): partial discount
+    - Band 2 (40-60% local): neutral adjustment
+    - Band 3 (20-40% local): max premium (capped)
+    - Band 4 (0-20% local): max premium (same as band 3)
+    
+    Args:
+        fee_conditions: Dictionary containing fee band settings
+        outbound_ratio: Ratio of local balance to total capacity (0.0 to 1.0)
+        
+    Returns:
+        Adjustment factor to be applied to the fee (multiplicative)
+    """
+    # Check if fee bands are enabled
+    if not fee_conditions.get("fee_bands", {}).get("enabled", False):
+        return 1.0  # No adjustment
+    
+    # Get fee band parameters
+    fee_bands = fee_conditions.get("fee_bands", {})
+    discount = fee_bands.get("discount", 0)
+    premium = fee_bands.get("premium", 0)
+    
+    # Calculate the range between discount and premium
+    adjustment_range = premium - discount
+    
+    # Calculate which band the current outbound ratio falls into (5 bands)
+    raw_band = min(4, max(0, int((1 - outbound_ratio) * 5)))
+    
+    # Map bands 3 and 4 to have the same premium level
+    # This ensures 0-20% and 20-40% liquidity have the same fee
+    effective_band = min(3, raw_band)  # Cap at band 3 (premium maxes out at 40% liquidity)
+    
+    # Calculate the adjustment as a percentage between discount and premium
+    # Now using effective_band instead of raw_band for adjustment calculation
+    adjustment = discount + (effective_band / 3) * adjustment_range
+    
+    # Return the multiplicative factor
+    return 1 + adjustment
+
+
 def calculate_new_fee_rate(
     amboss_data,
     fee_conditions,
     trend_factor,
     base_adjustment_percentage,
     group_adjustment_percentage,
+    outbound_ratio=None,  # Add parameter for outbound liquidity ratio
 ):
     fee_base = fee_conditions.get("fee_base", "median")
     # Ensure the selected fee base is converted to a float
@@ -180,10 +249,16 @@ def calculate_new_fee_rate(
         trend_factor * trend_sensitivity
     )
 
-    new_fee_rate = (
-        base_fee * (1 + adjusted_base_percentage) * (1 + group_adjustment_percentage)
-    )
-    new_fee_rate = min(new_fee_rate, max_cap)
+    # Calculate basic fee rate with trend and group adjustments
+    basic_fee_rate = base_fee * (1 + adjusted_base_percentage) * (1 + group_adjustment_percentage)
+    
+    # Apply fee band adjustment if outbound_ratio is provided
+    if outbound_ratio is not None:
+        fee_band_factor = calculate_fee_band_adjustment(fee_conditions, outbound_ratio)
+        basic_fee_rate = basic_fee_rate * fee_band_factor
+
+    # Cap at max and round
+    new_fee_rate = min(basic_fee_rate, max_cap)
     return round(new_fee_rate)
 
 
@@ -333,6 +408,27 @@ def print_fee_adjustment(
     else:
         print(f"Group: No Group")
     print(f"Chosen Fee Base: {fee_base}")
+    
+    # Add fee bands information if enabled
+    fee_bands = fee_conditions.get("fee_bands", {})
+    if fee_bands.get("enabled", False):
+        outbound_ratio = local_balance/capacity if capacity else 0
+        raw_band = min(4, max(0, int((1 - outbound_ratio) * 5)))
+        band_names = [
+            "Max Discount (80-100%)", 
+            "High Discount (60-80%)", 
+            "Neutral (40-60%)",
+            "Max Premium (20-40%)",
+            "Max Premium (0-20%)"  # Same premium as band 3
+        ]
+        print(f"Fee Bands: Enabled")
+        print(f"  - Discount: {fee_bands.get('discount', 0)*100:.1f}%, Premium: {fee_bands.get('premium', 0)*100:.1f}%")
+        print(f"  - Current Band: {band_names[raw_band]} (Local Balance: {outbound_ratio*100:.1f}%)")
+        if raw_band == 4:
+            print(f"  - Note: Premium capped at 40% liquidity level")
+    else:
+        print(f"Fee Bands: Disabled")
+        
     print(f"Fee Conditions: {json.dumps(fee_conditions)}")
     print(f"Trend Factor: {trend_factor}")
 
@@ -429,13 +525,6 @@ def main():
                     )
                     continue  # Skip to the next node
                 trend_factor = analyze_fee_trends(all_amboss_data, fee_base)
-                new_fee_rate = calculate_new_fee_rate(
-                    all_amboss_data,
-                    fee_conditions,
-                    trend_factor,
-                    base_adjustment_percentage,
-                    group_adjustment_percentage,
-                )
                 channels_to_modify = get_channels_to_modify(pubkey, config)
                 num_channels = len(channels_to_modify)
 
@@ -494,6 +583,16 @@ def main():
                             f"Aggregate Ratio: {check_ratio:.2f}, Max: {max_outbound}, Min: {min_outbound}"
                         )
                     continue  # Skip this entire peer
+
+                # Calculate new fee rate with liquidity-based fee band adjustment
+                new_fee_rate = calculate_new_fee_rate(
+                    all_amboss_data,
+                    fee_conditions,
+                    trend_factor,
+                    base_adjustment_percentage,
+                    group_adjustment_percentage,
+                    check_ratio,  # Pass the outbound ratio for fee band calculation
+                )
 
                 # --- Apply updates to individual channels ---
                 updated_any_channel = False
