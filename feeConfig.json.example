@@ -15,6 +15,10 @@
                 "enabled": true,
                 "discount": -0.15,
                 "premium": 0.30
+            },
+            "stuck_channel_adjustment": {
+                "enabled": true,
+                "stuck_time_period": 7
             }
         },
         "expensive": {
@@ -28,6 +32,10 @@
                 "enabled": true,
                 "discount": -0.10,
                 "premium": 0.25
+            },
+            "stuck_channel_adjustment": {
+                "enabled": false,
+                "stuck_time_period": 5 
             }
         }
     },
@@ -57,6 +65,10 @@
                     "enabled": true,
                     "discount": -0.20,
                     "premium": 0.35
+                },
+                "stuck_channel_adjustment": {
+                    "enabled": true,
+                    "stuck_time_period": 3
                 }
             }
         }
