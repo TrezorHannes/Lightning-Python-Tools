@@ -33,8 +33,8 @@ The fee_bands feature provides dynamic fee adjustments based on channel liquidit
 - Band 3 (20-40% local balance): Maximum premium applied
 - Band 4 (0-20% local balance): Maximum premium applied (same as band 3)
 
-Note: The premium is capped at band 3 (40% liquidity threshold) to ensure rebalancing can happen profitably 
-when channels reach very low liquidity levels. This prevents charging escalating fees when channels are 
+Note: The premium is capped at band 3 (40% liquidity threshold) to ensure rebalancing can happen profitably
+when channels reach very low liquidity levels. This prevents charging escalating fees when channels are
 almost depleted, which would make automated rebalancing unprofitable.
 
 Stuck Channel Adjustment:
@@ -204,41 +204,41 @@ def analyze_fee_trends(all_fee_data, fee_base):
 def get_last_forwarding_timestamp(chan_id, config):
     """
     Fetch the last forwarding timestamp for a specific channel from LNDg API.
-    
+
     Args:
         chan_id: The channel ID to check
         config: Configuration containing LNDg API credentials
-        
+
     Returns:
         A datetime object of the last forwarding time, or None if no forwarding found
     """
     lndg_api_url = config["lndg"]["lndg_api_url"]
     username = config["credentials"]["lndg_username"]
     password = config["credentials"]["lndg_password"]
-    
+
     # Query for the most recent forwarding event through this channel (limit=1)
     api_url = f"{lndg_api_url}/api/forwards/?limit=1&chan_id_out={chan_id}"
     try:
         response = requests.get(api_url, auth=(username, password))
         response.raise_for_status()
         data = response.json()
-        
+
         if data.get("results") and len(data["results"]) > 0:
             # Get the timestamp from the most recent forwarding event
             forward_date_str = data["results"][0]["forward_date"]
             return datetime.strptime(forward_date_str, "%Y-%m-%dT%H:%M:%S")
-        
+
         # Also check if this channel was an inbound channel for forwarding
         api_url = f"{lndg_api_url}/api/forwards/?limit=1&chan_id_in={chan_id}"
         response = requests.get(api_url, auth=(username, password))
         response.raise_for_status()
         data = response.json()
-        
+
         if data.get("results") and len(data["results"]) > 0:
             # Get the timestamp from the most recent forwarding event
             forward_date_str = data["results"][0]["forward_date"]
             return datetime.strptime(forward_date_str, "%Y-%m-%dT%H:%M:%S")
-            
+
         # No forwarding events found
         return None
     except requests.exceptions.RequestException as e:
@@ -246,16 +246,18 @@ def get_last_forwarding_timestamp(chan_id, config):
         return None
 
 
-def calculate_stuck_channel_band_adjustment(fee_conditions, channel_data, chan_id, config):
+def calculate_stuck_channel_band_adjustment(
+    fee_conditions, channel_data, chan_id, config
+):
     """
     Calculate the band adjustment for stuck channels that haven't forwarded payments recently.
-    
+
     Args:
         fee_conditions: Dictionary containing stuck channel settings
         channel_data: Data about the channel
         chan_id: Channel ID
         config: Configuration containing LNDg API credentials
-        
+
     Returns:
         Number of bands to move down (0 if not stuck or adjustment disabled)
     """
@@ -263,88 +265,92 @@ def calculate_stuck_channel_band_adjustment(fee_conditions, channel_data, chan_i
     stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
     if not stuck_settings.get("enabled", False):
         return 0  # No adjustment
-    
+
     # Skip stuck channel adjustment if local liquidity is too low (below 20%)
     # This prevents reducing fees further when the channel is already heavily drained
     capacity = channel_data.get("capacity", 0)
     local_balance = channel_data.get("local_balance", 0)
-    
+
     if capacity > 0:
         local_ratio = local_balance / capacity
         if local_ratio < 0.2:  # Less than 20% local liquidity
             return 0  # Skip adjustment
-    
+
     # Get the stuck time period in days
     stuck_time_period = stuck_settings.get("stuck_time_period", 7)
-    
+
     # Get the last forwarding timestamp
     last_forward_time = get_last_forwarding_timestamp(chan_id, config)
-    
+
     if last_forward_time is None:
         # If no forwarding history found, consider it fully stuck
         # This will move it to maximum discount
         return 4  # Maximum band adjustment (to band 0)
-    
+
     # Calculate days since last forwarding
     current_time = datetime.now()
     days_since_last_forward = (current_time - last_forward_time).days
-    
+
     # Calculate how many stuck periods have passed
     stuck_periods = days_since_last_forward // stuck_time_period
-    
+
     # Cap at 4 band adjustments
     return min(stuck_periods, 4)
 
 
-def calculate_fee_band_adjustment(fee_conditions, outbound_ratio, stuck_band_adjustment=0):
+def calculate_fee_band_adjustment(
+    fee_conditions, outbound_ratio, stuck_band_adjustment=0
+):
     """
     Calculate fee adjustment based on outbound liquidity ratio bands.
-    
+
     Divides the outbound liquidity into 5 percentile bands and applies a
     graduated adjustment between the discount (high local balance) and
     premium (low local balance).
-    
+
     Bands:
     - Band 0 (80-100% local): max discount
     - Band 1 (60-80% local): partial discount
     - Band 2 (40-60% local): neutral adjustment
     - Band 3 (20-40% local): max premium (capped)
     - Band 4 (0-20% local): max premium (same as band 3)
-    
+
     Args:
         fee_conditions: Dictionary containing fee band settings
         outbound_ratio: Ratio of local balance to total capacity (0.0 to 1.0)
         stuck_band_adjustment: Number of bands to move down due to stuck channel (0-4)
-        
+
     Returns:
         Adjustment factor to be applied to the fee (multiplicative)
     """
     # Check if fee bands are enabled
     if not fee_conditions.get("fee_bands", {}).get("enabled", False):
         return 1.0  # No adjustment
-    
+
     # Get fee band parameters
     fee_bands = fee_conditions.get("fee_bands", {})
     discount = fee_bands.get("discount", 0)
     premium = fee_bands.get("premium", 0)
-    
+
     # Calculate the range between discount and premium
     adjustment_range = premium - discount
-    
+
     # Calculate which band the current outbound ratio falls into (5 bands)
     raw_band = min(4, max(0, int((1 - outbound_ratio) * 5)))
-    
+
     # Apply stuck channel adjustment (move down bands)
     raw_band = max(0, raw_band - stuck_band_adjustment)
-    
+
     # Map bands 3 and 4 to have the same premium level
     # This ensures 0-20% and 20-40% liquidity have the same fee
-    effective_band = min(3, raw_band)  # Cap at band 3 (premium maxes out at 40% liquidity)
-    
+    effective_band = min(
+        3, raw_band
+    )  # Cap at band 3 (premium maxes out at 40% liquidity)
+
     # Calculate the adjustment as a percentage between discount and premium
     # Now using effective_band instead of raw_band for adjustment calculation
     adjustment = discount + (effective_band / 3) * adjustment_range
-    
+
     # Return the multiplicative factor
     return 1 + adjustment, raw_band
 
@@ -368,8 +374,10 @@ def calculate_new_fee_rate(
     )
 
     # Calculate basic fee rate with trend and group adjustments
-    basic_fee_rate = base_fee * (1 + adjusted_base_percentage) * (1 + group_adjustment_percentage)
-    
+    basic_fee_rate = (
+        base_fee * (1 + adjusted_base_percentage) * (1 + group_adjustment_percentage)
+    )
+
     # Apply fee band adjustment if outbound_ratio is provided
     if outbound_ratio is not None:
         fee_band_result = calculate_fee_band_adjustment(fee_conditions, outbound_ratio)
@@ -490,6 +498,94 @@ def write_charge_lnd_file(
         f.write("\n")
 
 
+def update_channel_notes(
+    chan_id,
+    alias,
+    group_name,
+    fee_base,
+    fee_conditions,
+    outbound_ratio,
+    raw_band,
+    fee_band_factor,
+    config,
+    node_definitions,
+    new_fee_rate=None,  # Add as optional parameter with default None
+    stuck_band_adjustment=0,  # Add with default value 0
+):
+    """Update the channel notes in LNDg with fee adjuster information."""
+    update_channel_notes_enabled = node_definitions.get("update_channel_notes", False)
+
+    if not update_channel_notes_enabled:
+        logging.info(f"Channel notes updates are disabled in config")
+        return
+
+    lndg_api_url = config["lndg"]["lndg_api_url"]
+    username = config["credentials"]["lndg_username"]
+    password = config["credentials"]["lndg_password"]
+
+    # Log the API URL we're using
+    logging.debug(f"LNDg API URL for note updates: {lndg_api_url}")
+
+    # Build the notes text
+    notes = f"🔋 Channel managed by fee-adjuster | Group: {group_name if group_name else 'None'} | Base: {fee_base}"
+
+    # Add fee bands info in a condensed format
+    fee_bands = fee_conditions.get("fee_bands", {})
+    if fee_bands.get("enabled", False):
+        discount = fee_bands.get("discount", 0)
+        premium = fee_bands.get("premium", 0)
+
+        band_names = [
+            "Max Discount",
+            "High Discount",
+            "Neutral",
+            "Max Premium",
+            "Max Premium",
+        ]
+        effective_band = min(3, raw_band)
+        actual_adjustment = discount + (effective_band / 3) * (premium - discount)
+
+        notes += f"\nBands: ✅ | Disc: {discount*100:.0f}% | Prem: {premium*100:.0f}% | Bal: {outbound_ratio*100:.0f}%"
+        notes += f"\nCurrent: {band_names[raw_band]} | Adjustment: {actual_adjustment*100:.1f}%"
+    else:
+        notes += f"\nFee Bands: Disabled"
+
+    # Add fee rate info if available
+    if new_fee_rate is not None:  # Changed to check parameter instead of locals()
+        notes += f"\nCurrent Rate: {new_fee_rate} ppm"
+
+    # Add stuck channel info if applicable
+    stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
+    if stuck_settings.get("enabled", False):
+        stuck_period = stuck_settings.get("stuck_time_period", 7)
+        notes += f"\nStuck adjust: {'✅' if stuck_band_adjustment > 0 else '❌'} | Period: {stuck_period}d"
+
+    # Log the notes we're going to send
+    logging.debug(f"Channel {chan_id} notes to update: {notes}")
+
+    # Update the channel notes
+    payload = {"chan_id": chan_id, "notes": notes}
+    try:
+        put_url = f"{lndg_api_url}/api/channels/{chan_id}/"
+        logging.debug(f"Sending PUT request to: {put_url}")
+        logging.debug(f"With payload: {json.dumps(payload)}")
+
+        response = requests.put(put_url, json=payload, auth=(username, password))
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if response.status_code == 200:
+            logging.info(
+                f"{timestamp}: Successfully updated notes for channel {chan_id}"
+            )
+        else:
+            logging.error(
+                f"{timestamp}: Failed to update notes for channel {chan_id}: Status Code {response.status_code}, Response: {response.text}"
+            )
+
+    except Exception as e:
+        logging.error(f"Error updating notes for channel {chan_id}: {e}")
+
+
 def print_fee_adjustment(
     alias,
     pubkey,
@@ -505,7 +601,7 @@ def print_fee_adjustment(
     amboss_data,
     is_aggregated,  # New flag
     stuck_band_adjustment=0,  # Stuck channel adjustment
-    raw_band=None  # Raw band after adjustment
+    raw_band=None,  # Raw band after adjustment
 ):
     print("-" * 80)
     print(f"Alias: {alias}{' (Aggregated)' if is_aggregated else ''}")
@@ -532,53 +628,61 @@ def print_fee_adjustment(
     else:
         print(f"Group: No Group")
     print(f"Chosen Fee Base: {fee_base}")
-    
+
     # Add fee bands information if enabled
     fee_bands = fee_conditions.get("fee_bands", {})
     if fee_bands.get("enabled", False):
-        outbound_ratio = local_balance/capacity if capacity else 0
+        outbound_ratio = local_balance / capacity if capacity else 0
         if raw_band is None:
             raw_band = min(4, max(0, int((1 - outbound_ratio) * 5)))
-            
+
         band_names = [
-            "Max Discount (80-100%)", 
-            "High Discount (60-80%)", 
+            "Max Discount (80-100%)",
+            "High Discount (60-80%)",
             "Neutral (40-60%)",
             "Max Premium (20-40%)",
-            "Max Premium (0-20%)"  # Same premium as band 3
+            "Max Premium (0-20%)",  # Same premium as band 3
         ]
-        
+
         # Calculate the actual percentage adjustment for this band
         discount = fee_bands.get("discount", 0)
         premium = fee_bands.get("premium", 0)
         adjustment_range = premium - discount
-        
+
         # For display purposes, cap at band 3 since bands 3 and 4 use the same adjustment
         effective_band = min(3, raw_band)
         actual_adjustment = discount + (effective_band / 3) * adjustment_range
-        
+
         print(f"Fee Bands: Enabled")
-        print(f"  - Discount: {fee_bands.get('discount', 0)*100:.1f}%, Premium: {fee_bands.get('premium', 0)*100:.1f}%")
-        print(f"  - Current Band: {band_names[raw_band]} (Local Balance: {outbound_ratio*100:.1f}%)")
+        print(
+            f"  - Discount: {fee_bands.get('discount', 0)*100:.1f}%, Premium: {fee_bands.get('premium', 0)*100:.1f}%"
+        )
+        print(
+            f"  - Current Band: {band_names[raw_band]} (Local Balance: {outbound_ratio*100:.1f}%)"
+        )
         print(f"  - Applied Adjustment: {actual_adjustment*100:.1f}%")
-        
+
         if raw_band == 4:
             print(f"  - Note: Premium capped at 40% liquidity level")
     else:
         print(f"Fee Bands: Disabled")
-    
+
     # Add stuck channel information if adjustment was applied
     stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
     if stuck_settings.get("enabled", False):
         stuck_time_period = stuck_settings.get("stuck_time_period", 7)
-        
+
         # Check if we're in the low-liquidity band where stuck adjustment is skipped
-        outbound_ratio = local_balance/capacity if capacity else 0
+        outbound_ratio = local_balance / capacity if capacity else 0
         is_low_liquidity = outbound_ratio < 0.2
-        
+
         if is_low_liquidity:
-            print(f"Stuck Channel Adjustment: Skipped (Low Local Liquidity: {outbound_ratio*100:.1f}%)")
-            print(f"  - Note: Stuck channel adjustment is disabled when local liquidity is below 20%")
+            print(
+                f"Stuck Channel Adjustment: Skipped (Low Local Liquidity: {outbound_ratio*100:.1f}%)"
+            )
+            print(
+                f"  - Note: Stuck channel adjustment is disabled when local liquidity is below 20%"
+            )
         elif stuck_band_adjustment > 0:
             print(f"Stuck Channel Adjustment: Applied")
             print(f"  - Bands Adjusted Down: {stuck_band_adjustment}")
@@ -588,12 +692,18 @@ def print_fee_adjustment(
                 if original_band < 5:  # Check to avoid index error
                     # Calculate what the adjustment percentage would have been without stuck adjustment
                     original_effective_band = min(3, original_band)
-                    original_adjustment = discount + (original_effective_band / 3) * adjustment_range
-                    
-                    print(f"  - Original Band (Before Adjustment): {band_names[original_band]} ({original_adjustment*100:.1f}%)")
+                    original_adjustment = (
+                        discount + (original_effective_band / 3) * adjustment_range
+                    )
+
+                    print(
+                        f"  - Original Band (Before Adjustment): {band_names[original_band]} ({original_adjustment*100:.1f}%)"
+                    )
         else:
-            print(f"Stuck Channel Adjustment: None (Channel Active in the past {stuck_time_period} days)")
-    
+            print(
+                f"Stuck Channel Adjustment: None (Channel Active in the past {stuck_time_period} days)"
+            )
+
     print(f"Fee Conditions: {json.dumps(fee_conditions)}")
     print(f"Trend Factor: {trend_factor}")
 
@@ -706,7 +816,9 @@ def main():
                 first_channel_data = next(
                     iter(channels_to_modify.values())
                 )  # Get data from one channel for later use
-                first_chan_id = next(iter(channels_to_modify.keys()))  # Get first channel ID
+                first_chan_id = next(
+                    iter(channels_to_modify.keys())
+                )  # Get first channel ID
 
                 if num_channels > 1:
                     logging.info(
@@ -753,25 +865,29 @@ def main():
                 # Check for stuck channels and calculate adjustment
                 # If multiple channels, we'll use the least stuck channel to be conservative
                 least_stuck_band_adjustment = 4  # Start with maximum adjustment
-                
+
                 for chan_id in channels_to_modify.keys():
                     chan_stuck_adjustment = calculate_stuck_channel_band_adjustment(
                         fee_conditions, channels_to_modify[chan_id], chan_id, config
                     )
-                    least_stuck_band_adjustment = min(least_stuck_band_adjustment, chan_stuck_adjustment)
-                
+                    least_stuck_band_adjustment = min(
+                        least_stuck_band_adjustment, chan_stuck_adjustment
+                    )
+
                 # Calculate new fee rate with liquidity-based fee band adjustment and stuck channel adjustment
                 fee_band_result = calculate_fee_band_adjustment(
                     fee_conditions,
                     check_ratio,
-                    least_stuck_band_adjustment  # Apply the stuck channel adjustment
+                    least_stuck_band_adjustment,  # Apply the stuck channel adjustment
                 )
                 if isinstance(fee_band_result, tuple):
                     fee_band_factor, raw_band = fee_band_result
                 else:
                     fee_band_factor = fee_band_result
-                    raw_band = min(4, max(0, int((1 - check_ratio) * 5)))  # Calculate raw_band if not returned
-                
+                    raw_band = min(
+                        4, max(0, int((1 - check_ratio) * 5))
+                    )  # Calculate raw_band if not returned
+
                 # Calculate the final fee rate
                 new_fee_rate = calculate_new_fee_rate(
                     all_amboss_data,
@@ -800,6 +916,32 @@ def main():
                             # Decide if you want to continue with other channels or stop for this peer
                             continue  # Continue with the next channel for this peer
 
+                # --- Update LNDg Channel Notes so a mouseover in the GUI gives quick fee-update synopsis
+                update_channel_notes_enabled = node_definitions.get(
+                    "update_channel_notes", False
+                )
+                if update_channel_notes_enabled:
+                    logging.info(
+                        f"Updating channel notes for {len(channels_to_modify)} channels of peer {pubkey}"
+                    )
+                    for chan_id, channel_data in channels_to_modify.items():
+
+                        # Update the channel notes
+                        update_channel_notes(
+                            chan_id,
+                            channel_data["alias"],
+                            group_name,
+                            fee_base,
+                            fee_conditions,
+                            check_ratio,  # Use aggregate ratio instead of individual channel ratio
+                            raw_band,  # Use the already calculated raw band
+                            fee_band_factor,
+                            config,
+                            node_definitions,  # Pass node_definitions as well
+                            new_fee_rate,
+                            least_stuck_band_adjustment,
+                        )
+
                 # --- Output and File Writing (once per peer if any channel was updated or terminal output enabled) ---
                 if updated_any_channel or terminal_output_enabled:
                     if terminal_output_enabled:
@@ -821,7 +963,7 @@ def main():
                             all_amboss_data,
                             num_channels > 1,  # Flag if aggregated
                             least_stuck_band_adjustment,  # Pass stuck band adjustment
-                            raw_band  # Pass the raw band after adjustment
+                            raw_band,  # Pass the raw band after adjustment
                         )
 
                 # Write to charge-lnd file once per peer if enabled and any channel updated

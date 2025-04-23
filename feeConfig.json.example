@@ -2,6 +2,7 @@
     "Terminal_output": true,
     "LNDg_fee_update": False,
     "write_charge_lnd_file": true,
+    "update_channel_notes": true,
     "groups": {
         "sink": {
             "group_adjustment_percentage": 0.10,
