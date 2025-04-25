@@ -75,6 +75,7 @@ Or run the systemd-installer install_fee_adjuster_service.sh
 """
 
 import os
+import sys
 import requests
 from datetime import datetime, timedelta
 import configparser
@@ -201,133 +202,150 @@ def analyze_fee_trends(all_fee_data, fee_base):
         return 0  # Fees are stable or mixed trends
 
 
-def get_last_forwarding_timestamp(chan_id, config):
+def check_recent_outbound_forwarding(pubkey, chan_id, stuck_time_period, config):
     """
-    Fetch the last forwarding timestamp for a specific channel from LNDg API.
-
-    Args:
-        chan_id: The channel ID to check
-        config: Configuration containing LNDg API credentials
+    Checks for recent outbound forwarding for a single channel.
 
     Returns:
-        A datetime object of the last forwarding time, or None if no forwarding found
+        dict: {'status': 'active'|'stuck'|'error', 'reason': str,
+               'checked_chan_id': chan_id, 'api_url': str, 'api_response_data': dict|str}
     """
     lndg_api_url = config["lndg"]["lndg_api_url"]
     username = config["credentials"]["lndg_username"]
     password = config["credentials"]["lndg_password"]
+    cutoff_date = datetime.now() - timedelta(days=stuck_time_period)
+    cutoff_date_str = cutoff_date.strftime("%Y-%m-%dT%H:%M:%S")
+    api_url = f"{lndg_api_url}/api/forwards/?limit=1&chan_in_or_out={chan_id}&forward_date__gt={cutoff_date_str}"
+    result = {
+        "status": "stuck",  # Default to stuck
+        "reason": "unknown",
+        "checked_chan_id": chan_id,
+        "api_url": api_url,
+        "api_response_data": None,
+    }
 
-    # Query for the most recent forwarding event through this channel (limit=1)
-    api_url = f"{lndg_api_url}/api/forwards/?limit=1&chan_id_out={chan_id}"
     try:
         response = requests.get(api_url, auth=(username, password))
         response.raise_for_status()
         data = response.json()
+        result["api_response_data"] = data  # Store response data
 
         if data.get("results") and len(data["results"]) > 0:
-            # Get the timestamp from the most recent forwarding event
-            forward_date_str = data["results"][0]["forward_date"]
-            return datetime.strptime(forward_date_str, "%Y-%m-%dT%H:%M:%S")
+            forward_event = data["results"][0]
+            if str(forward_event.get("chan_id_out")) == str(chan_id):
+                result["status"] = "active"
+                result["reason"] = (
+                    f"outbound_found ({forward_event.get('forward_date', 'N/A')})"
+                )
+            elif str(forward_event.get("chan_id_in")) == str(chan_id):
+                result["status"] = "stuck"  # Still stuck for outbound purposes
+                result["reason"] = (
+                    f"inbound_found ({forward_event.get('forward_date', 'N/A')})"
+                )
+            else:
+                result["status"] = "stuck"  # Should not happen with filter
+                result["reason"] = "match_error"
+        else:
+            result["status"] = "stuck"
+            result["reason"] = "none_found"
 
-        # Also check if this channel was an inbound channel for forwarding
-        api_url = f"{lndg_api_url}/api/forwards/?limit=1&chan_id_in={chan_id}"
-        response = requests.get(api_url, auth=(username, password))
-        response.raise_for_status()
-        data = response.json()
-
-        if data.get("results") and len(data["results"]) > 0:
-            # Get the timestamp from the most recent forwarding event
-            forward_date_str = data["results"][0]["forward_date"]
-            return datetime.strptime(forward_date_str, "%Y-%m-%dT%H:%M:%S")
-
-        # No forwarding events found
-        return None
     except requests.exceptions.RequestException as e:
-        logging.error(f"Error fetching forwarding history for channel {chan_id}: {e}")
-        return None
+        logging.error(f"API Error checking fwd for {chan_id}: {e}")
+        result["status"] = "error"
+        result["reason"] = f"api_error: {e}"
+        result["api_response_data"] = str(e)
+    except Exception as e:
+        logging.error(f"Unexpected error checking fwd for {chan_id}: {e}")
+        result["status"] = "error"
+        result["reason"] = f"unexpected_error: {e}"
+        result["api_response_data"] = str(e)
+
+    return result
 
 
-def get_last_forwarding_timestamp_for_peer(channel_ids, config):
+def get_last_forwarding_timestamp_for_peer(
+    pubkey, channel_ids, stuck_time_period, config
+):
     """
-    Find the most recent forwarding timestamp across all channels to a peer.
-
-    Args:
-        channel_ids: List of channel IDs to check
-        config: Configuration containing LNDg API credentials
+    Checks peer stuck status based on outbound forwards in any channel.
 
     Returns:
-        A datetime object of the most recent forwarding time across all channels,
-        or None if no forwarding found in any channel
+        tuple: (overall_status: 'active'|'stuck'|'error', channel_details: list[dict])
+               overall_status is 'error' if any channel check resulted in error.
     """
-    most_recent_forward = None
+    channel_details = []
+    overall_status = "stuck"  # Default to stuck
+    has_error = False
 
     for chan_id in channel_ids:
-        # Get forwarding timestamp for this channel
-        channel_forward_time = get_last_forwarding_timestamp(chan_id, config)
+        check_result = check_recent_outbound_forwarding(
+            pubkey, chan_id, stuck_time_period, config
+        )
+        channel_details.append(check_result)
+        if check_result["status"] == "active":
+            overall_status = (
+                "active"  # Finding one active channel makes the peer active
+            )
+        elif check_result["status"] == "error":
+            has_error = True
 
-        # Update most recent time if this channel has more recent activity
-        if channel_forward_time is not None:
-            if (
-                most_recent_forward is None
-                or channel_forward_time > most_recent_forward
-            ):
-                most_recent_forward = channel_forward_time
-                logging.debug(
-                    f"Channel {chan_id} has more recent forwarding: {most_recent_forward}"
-                )
+    # If we found an active channel, status is active, otherwise it remains stuck,
+    # unless an error occurred during checks.
+    if has_error:
+        overall_status = "error"
+    elif overall_status == "stuck":
+        # If no channel was active and no errors, the peer is definitively stuck
+        pass  # overall_status is already 'stuck'
+    # else: overall_status is 'active'
 
-    return most_recent_forward
+    return overall_status, channel_details
 
 
 def calculate_stuck_channel_band_adjustment(
-    fee_conditions, channel_data, chan_id, config
+    fee_conditions, channel_data, chan_id, config, is_peer_stuck
 ):
     """
-    Calculate the band adjustment for stuck channels that haven't forwarded payments recently.
+    Calculate the band adjustment based on whether the peer is considered stuck.
 
     Args:
         fee_conditions: Dictionary containing stuck channel settings
-        channel_data: Data about the channel
-        chan_id: Channel ID
+        channel_data: Data about the channel (used for liquidity check)
+        chan_id: Channel ID (for logging/context)
         config: Configuration containing LNDg API credentials
+        is_peer_stuck: Boolean indicating if the peer (any channel) is stuck
 
     Returns:
-        Number of bands to move down (0 if not stuck or adjustment disabled)
+        Number of bands to move down (typically 4 if stuck, 0 otherwise)
     """
-    # Check if stuck channel adjustment is enabled
+    # Check if stuck channel adjustment is enabled globally in the config
     stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
     if not stuck_settings.get("enabled", False):
-        return 0  # No adjustment
+        print(f"DEBUG: Stuck adjustment disabled for chan_id={chan_id}")
+        return 0  # No adjustment if disabled
 
     # Skip stuck channel adjustment if local liquidity is too low (below 20%)
-    # This prevents reducing fees further when the channel is already heavily drained
     capacity = channel_data.get("capacity", 0)
     local_balance = channel_data.get("local_balance", 0)
-
     if capacity > 0:
         local_ratio = local_balance / capacity
         if local_ratio < 0.2:  # Less than 20% local liquidity
+            print(
+                f"DEBUG: Stuck adjustment skipped for chan_id={chan_id} due to low local liquidity ({local_ratio*100:.1f}%)"
+            )
             return 0  # Skip adjustment
 
-    # Get the stuck time period in days
-    stuck_time_period = stuck_settings.get("stuck_time_period", 7)
-
-    # Get the last forwarding timestamp
-    last_forward_time = get_last_forwarding_timestamp(chan_id, config)
-
-    if last_forward_time is None:
-        # If no forwarding history found, consider it fully stuck
-        # This will move it to maximum discount
-        return 4  # Maximum band adjustment (to band 0)
-
-    # Calculate days since last forwarding
-    current_time = datetime.now()
-    days_since_last_forward = (current_time - last_forward_time).days
-
-    # Calculate how many stuck periods have passed
-    stuck_periods = days_since_last_forward // stuck_time_period
-
-    # Cap at 4 band adjustments
-    return min(stuck_periods, 4)
+    # If the peer is determined to be stuck (no recent outbound forwards on any channel)
+    if is_peer_stuck:
+        print(
+            f"DEBUG: Applying max stuck adjustment (4 bands) for chan_id={chan_id} because peer is stuck."
+        )
+        return 4  # Apply maximum band adjustment (to band 0)
+    else:
+        # Peer is not stuck (had recent outbound forwarding)
+        print(
+            f"DEBUG: No stuck adjustment needed for chan_id={chan_id} because peer is active."
+        )
+        return 0
 
 
 def calculate_fee_band_adjustment(
@@ -834,6 +852,7 @@ def main():
                 trend_factor = analyze_fee_trends(all_amboss_data, fee_base)
                 channels_to_modify = get_channels_to_modify(pubkey, config)
                 num_channels = len(channels_to_modify)
+                channel_ids_list = list(channels_to_modify.keys())
 
                 if not channels_to_modify:
                     logging.info(
@@ -894,131 +913,93 @@ def main():
                         )
                     continue  # Skip this entire peer
 
-                # Check for stuck channels and calculate adjustment
-                # Calculate once per peer rather than per channel
-                least_stuck_band_adjustment = 0  # Default to no adjustment
+                # --- Stuck Check ---
+                peer_stuck_status = "not_checked"  # Default
+                channel_check_details = []
+                is_peer_stuck = False  # Default
+                stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
 
-                if fee_conditions.get("stuck_channel_adjustment", {}).get(
-                    "enabled", False
-                ):
-                    # Get all channel IDs for this peer
-                    peer_channel_ids = list(channels_to_modify.keys())
-
-                    # Get the most recent forwarding across all channels to this peer
-                    last_forward_time = get_last_forwarding_timestamp_for_peer(
-                        peer_channel_ids, config
+                if (
+                    stuck_settings.get("enabled", False) and channels_to_modify
+                ):  # Check only if enabled and channels exist
+                    stuck_time_period = stuck_settings.get("stuck_time_period", 7)
+                    peer_stuck_status, channel_check_details = (
+                        get_last_forwarding_timestamp_for_peer(
+                            pubkey,
+                            channel_ids_list,
+                            stuck_time_period,
+                            config,
+                        )
                     )
-
-                    # Calculate stuck adjustment based on most recent forwarding
-                    if last_forward_time is None:
-                        # If no forwarding history found in any channel, consider it fully stuck
-                        least_stuck_band_adjustment = (
-                            4  # Maximum band adjustment (to band 0)
+                    # Treat errors as 'stuck' for fee calculation purposes, but log it
+                    if peer_stuck_status == "error":
+                        logging.warning(
+                            f"Error occurred during stuck check for peer {pubkey}. Treating as stuck."
                         )
-                        logging.info(
-                            f"Peer {pubkey} has no forwarding history, applying maximum stuck adjustment"
-                        )
+                        is_peer_stuck = True
                     else:
-                        # Calculate days since last forwarding for this peer
-                        stuck_time_period = fee_conditions.get(
-                            "stuck_channel_adjustment", {}
-                        ).get("stuck_time_period", 7)
-                        current_time = datetime.now()
-                        days_since_last_forward = (
-                            current_time - last_forward_time
-                        ).days
+                        is_peer_stuck = peer_stuck_status == "stuck"
 
-                        # Calculate how many stuck periods have passed
-                        stuck_periods = days_since_last_forward // stuck_time_period
+                # --- Calculate Potential Stuck Adjustment ---
+                potential_stuck_adjustment = 0
+                if stuck_settings.get("enabled", False) and is_peer_stuck:
+                    if check_ratio >= 0.2:  # Only apply if liquidity is >= 20%
+                        potential_stuck_adjustment = 4
 
-                        # Cap at 4 band adjustments
-                        least_stuck_band_adjustment = min(stuck_periods, 4)
-
-                        if least_stuck_band_adjustment > 0:
-                            logging.info(
-                                f"Peer {pubkey} last forwarded {days_since_last_forward} days ago, applying stuck adjustment: {least_stuck_band_adjustment}"
-                            )
-
-                # Calculate new fee rate with liquidity-based fee band adjustment and stuck channel adjustment
+                # --- Fee Calculation ---
                 fee_band_result = calculate_fee_band_adjustment(
                     fee_conditions,
                     check_ratio,
-                    least_stuck_band_adjustment,  # Apply the stuck channel adjustment
+                    potential_stuck_adjustment,
                 )
+                # ... (get fee_band_factor, raw_band) ...
                 if isinstance(fee_band_result, tuple):
                     fee_band_factor, raw_band = fee_band_result
-                else:
+                else:  # Should not happen if fee bands enabled, but handle defensively
                     fee_band_factor = fee_band_result
-                    raw_band = min(
-                        4, max(0, int((1 - check_ratio) * 5))
-                    )  # Calculate raw_band if not returned
+                    # Recalculate raw_band if not returned, considering potential stuck adjustment
+                    initial_raw_band = min(4, max(0, int((1 - check_ratio) * 5)))
+                    raw_band = max(0, initial_raw_band - potential_stuck_adjustment)
 
-                # Calculate the final fee rate
                 new_fee_rate = calculate_new_fee_rate(
+                    # ... (arguments) ...
                     all_amboss_data,
                     fee_conditions,
                     trend_factor,
                     base_adjustment_percentage,
                     group_adjustment_percentage,
-                    check_ratio,  # Pass the outbound ratio for fee band calculation
+                    check_ratio,
                 )
+                stuck_adjustment_to_report = potential_stuck_adjustment
 
-                # --- Apply updates to individual channels ---
+                # --- Apply Updates ---
                 updated_any_channel = False
-                channel_ids_list = list(channels_to_modify.keys())
+                # ...(loop through channels_to_modify, call update_lndg_fee if needed)...
+                # Example within loop:
+                # fee_delta = abs(new_fee_rate - channel_data["local_fee_rate"])
+                # if lndg_fee_update_enabled and fee_delta > fee_delta_threshold:
+                #    try:
+                #        update_lndg_fee(chan_id, new_fee_rate, channel_data, config)
+                #        updated_any_channel = True
+                #    except LNDGAPIError as api_err: ...
 
-                for chan_id, channel_data in channels_to_modify.items():
-                    fee_delta = abs(new_fee_rate - channel_data["local_fee_rate"])
+                # --- Update Notes ---
+                # ... (call update_channel_notes in loop) ...
+                # Example within loop:
+                # if update_channel_notes_enabled:
+                #    update_channel_notes(
+                #        chan_id, ..., new_fee_rate, stuck_adjustment_to_report)
 
-                    if lndg_fee_update_enabled and fee_delta > fee_delta_threshold:
-                        try:
-                            update_lndg_fee(chan_id, new_fee_rate, channel_data, config)
-                            updated_any_channel = True
-                        except LNDGAPIError as api_err:
-                            logging.error(
-                                f"Failed to update LNDg for {chan_id}: {api_err}"
-                            )
-                            # Decide if you want to continue with other channels or stop for this peer
-                            continue  # Continue with the next channel for this peer
-
-                # --- Update LNDg Channel Notes so a mouseover in the GUI gives quick fee-update synopsis
-                update_channel_notes_enabled = node_definitions.get(
-                    "update_channel_notes", False
-                )
-                if update_channel_notes_enabled:
-                    logging.info(
-                        f"Updating channel notes for {len(channels_to_modify)} channels of peer {pubkey}"
-                    )
-                    for chan_id, channel_data in channels_to_modify.items():
-
-                        # Update the channel notes
-                        update_channel_notes(
-                            chan_id,
-                            channel_data["alias"],
-                            group_name,
-                            fee_base,
-                            fee_conditions,
-                            check_ratio,  # Use aggregate ratio instead of individual channel ratio
-                            raw_band,  # Use the already calculated raw band
-                            fee_band_factor,
-                            config,
-                            node_definitions,  # Pass node_definitions as well
-                            new_fee_rate,
-                            least_stuck_band_adjustment,
-                        )
-
-                # --- Output and File Writing (once per peer if any channel was updated or terminal output enabled) ---
+                # --- Main Summary Output ---
                 if updated_any_channel or terminal_output_enabled:
                     if terminal_output_enabled:
-                        # Use the modified print function
                         print_fee_adjustment(
-                            first_channel_data["alias"],  # Use first alias
+                            # ... (arguments) ...
+                            first_channel_data["alias"],
                             pubkey,
-                            channel_ids_list,  # Pass list of all chan IDs
-                            total_capacity,  # Pass aggregate capacity
-                            total_local_balance,  # Pass aggregate balance
-                            # Pass old/new rates from the first channel for display consistency,
-                            # actual updates depend on individual deltas.
+                            channel_ids_list,
+                            total_capacity,
+                            total_local_balance,
                             first_channel_data["local_fee_rate"],
                             new_fee_rate,
                             group_name,
@@ -1026,10 +1007,38 @@ def main():
                             fee_conditions,
                             trend_factor,
                             all_amboss_data,
-                            num_channels > 1,  # Flag if aggregated
-                            least_stuck_band_adjustment,  # Pass stuck band adjustment
-                            raw_band,  # Pass the raw band after adjustment
+                            num_channels > 1,
+                            stuck_adjustment_to_report,
+                            raw_band,
                         )
+                        sys.stdout.flush()
+                    if (
+                        terminal_output_enabled
+                        and stuck_settings.get("enabled", False)
+                        and channels_to_modify
+                    ):
+                        print(f"\n--- Stuck Check Debug for Peer {pubkey[:10]}... ---")
+                        for detail in channel_check_details:
+                            short_api_url = detail["api_url"].split("?")[0] + "?..."
+                            print(
+                                f"  ChanID: {detail['checked_chan_id']} -> Status: {detail['status']}, Reason: {detail['reason']} (API: {short_api_url})"
+                            )
+                        print(f"  Overall Peer Status: {peer_stuck_status}")
+                        if is_peer_stuck:
+                            adj_reason = (
+                                f"Applying {potential_stuck_adjustment} bands (Liquidity {check_ratio*100:.1f}% >= 20%)"
+                                if potential_stuck_adjustment > 0
+                                else f"Skipped (Liquidity {check_ratio*100:.1f}% < 20%)"
+                            )
+                            print(f"  Potential Stuck Adjustment: {adj_reason}")
+                        else:
+                            print(
+                                f"  Potential Stuck Adjustment: 0 bands (Peer Active)"
+                            )
+                        print(
+                            f"--- End Stuck Check Debug for Peer {pubkey[:10]}... ---"
+                        )
+                        sys.stdout.flush()
 
                 # Write to charge-lnd file once per peer if enabled and any channel updated
                 if write_charge_lnd_file_enabled and updated_any_channel:
