@@ -246,6 +246,38 @@ def get_last_forwarding_timestamp(chan_id, config):
         return None
 
 
+def get_last_forwarding_timestamp_for_peer(channel_ids, config):
+    """
+    Find the most recent forwarding timestamp across all channels to a peer.
+
+    Args:
+        channel_ids: List of channel IDs to check
+        config: Configuration containing LNDg API credentials
+
+    Returns:
+        A datetime object of the most recent forwarding time across all channels,
+        or None if no forwarding found in any channel
+    """
+    most_recent_forward = None
+
+    for chan_id in channel_ids:
+        # Get forwarding timestamp for this channel
+        channel_forward_time = get_last_forwarding_timestamp(chan_id, config)
+
+        # Update most recent time if this channel has more recent activity
+        if channel_forward_time is not None:
+            if (
+                most_recent_forward is None
+                or channel_forward_time > most_recent_forward
+            ):
+                most_recent_forward = channel_forward_time
+                logging.debug(
+                    f"Channel {chan_id} has more recent forwarding: {most_recent_forward}"
+                )
+
+    return most_recent_forward
+
+
 def calculate_stuck_channel_band_adjustment(
     fee_conditions, channel_data, chan_id, config
 ):
@@ -863,16 +895,49 @@ def main():
                     continue  # Skip this entire peer
 
                 # Check for stuck channels and calculate adjustment
-                # If multiple channels, we'll use the least stuck channel to be conservative
-                least_stuck_band_adjustment = 4  # Start with maximum adjustment
+                # Calculate once per peer rather than per channel
+                least_stuck_band_adjustment = 0  # Default to no adjustment
 
-                for chan_id in channels_to_modify.keys():
-                    chan_stuck_adjustment = calculate_stuck_channel_band_adjustment(
-                        fee_conditions, channels_to_modify[chan_id], chan_id, config
+                if fee_conditions.get("stuck_channel_adjustment", {}).get(
+                    "enabled", False
+                ):
+                    # Get all channel IDs for this peer
+                    peer_channel_ids = list(channels_to_modify.keys())
+
+                    # Get the most recent forwarding across all channels to this peer
+                    last_forward_time = get_last_forwarding_timestamp_for_peer(
+                        peer_channel_ids, config
                     )
-                    least_stuck_band_adjustment = min(
-                        least_stuck_band_adjustment, chan_stuck_adjustment
-                    )
+
+                    # Calculate stuck adjustment based on most recent forwarding
+                    if last_forward_time is None:
+                        # If no forwarding history found in any channel, consider it fully stuck
+                        least_stuck_band_adjustment = (
+                            4  # Maximum band adjustment (to band 0)
+                        )
+                        logging.info(
+                            f"Peer {pubkey} has no forwarding history, applying maximum stuck adjustment"
+                        )
+                    else:
+                        # Calculate days since last forwarding for this peer
+                        stuck_time_period = fee_conditions.get(
+                            "stuck_channel_adjustment", {}
+                        ).get("stuck_time_period", 7)
+                        current_time = datetime.now()
+                        days_since_last_forward = (
+                            current_time - last_forward_time
+                        ).days
+
+                        # Calculate how many stuck periods have passed
+                        stuck_periods = days_since_last_forward // stuck_time_period
+
+                        # Cap at 4 band adjustments
+                        least_stuck_band_adjustment = min(stuck_periods, 4)
+
+                        if least_stuck_band_adjustment > 0:
+                            logging.info(
+                                f"Peer {pubkey} last forwarded {days_since_last_forward} days ago, applying stuck adjustment: {least_stuck_band_adjustment}"
+                            )
 
                 # Calculate new fee rate with liquidity-based fee band adjustment and stuck channel adjustment
                 fee_band_result = calculate_fee_band_adjustment(
