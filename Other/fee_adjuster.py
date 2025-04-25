@@ -11,7 +11,7 @@ Configuration Settings (see fee_adjuster_config_docs.txt for details):
 - trend_sensitivity: Determines how much trends influence fee adjustments. Higher values mean greater influence.
 - fee_base: The statistical measure used as the base for fee calculations. Options include "median", "mean", "min", "max", "weighted" and "weighted_corrected".
 - groups: Categories or tags for nodes. Used to apply specific strategies or adjustments.
-- max_outbound: (Optional) Maximum outbound liquidity percentage (0.0 to 1.0).  Only applies if the channel's outbound liquidity is *below* this value.
+- max_outbound: (Optional) Maximum outbound liquidity percentage (0.0 to 1.0). Only applies if the channel's outbound liquidity is *below* this value.
 - min_outbound: (Optional) Minimum outbound liquidity percentage (0.0 to 1.0). Only applies if the channel's outbound liquidity is *above* this value.
 - fee_bands: (Optional) Adjusts fees based on local liquidity. Contains the following sub-settings:
   - enabled: Whether to use fee bands (true/false)
@@ -61,6 +61,9 @@ Usage:
 - Run the script to automatically adjust fees based on the configured settings and current trends.
 - Currently, it requires a running LNDg instance to retrieve local channel details and fees
 
+Command Line Arguments:
+- --debug: Enable detailed debug output, including stuck channel check results for each peer.
+
 Charge-lnd Details:
 # charge-lnd.config
 [🤖 FeeAdjuster Import]
@@ -82,6 +85,7 @@ import configparser
 import logging
 import json
 import time
+import argparse
 from prettytable import PrettyTable
 
 
@@ -636,157 +640,158 @@ def update_channel_notes(
         logging.error(f"Error updating notes for channel {chan_id}: {e}")
 
 
+# --- Redesigned print_fee_adjustment ---
 def print_fee_adjustment(
+    # Basic Info
     alias,
     pubkey,
-    channel_ids_list,  # Changed from chan_id
-    capacity,  # Now potentially aggregate
-    local_balance,  # Now potentially aggregate
-    old_fee_rate,  # Display purpose (e.g., from first channel)
-    new_fee_rate,
-    group_name,
+    channel_ids_list,
+    is_aggregated,
+    capacity,
+    local_balance,
+    outbound_ratio,
+    old_fee_rate,
+    # Waterfall Steps
+    base_fee,
     fee_base,
-    fee_conditions,
+    base_adjust_pct,
+    rate_after_base,
+    group_adjust_pct,
+    rate_after_group,
     trend_factor,
+    trend_sensitivity,
+    trend_adjust_pct,
+    rate_after_trend,
+    fee_band_factor,
+    rate_after_fee_band,
+    max_cap,
+    rate_before_rounding,  # rate_after_fee_band capped
+    final_rate,  # The actual applied rate (new_fee_rate)
+    # Context
+    group_name,
+    fee_conditions,
+    # Fee Band Context
+    fee_band_enabled,
+    fee_band_discount,
+    fee_band_premium,
+    initial_raw_band,
+    stuck_adj_bands_applied,
+    final_raw_band,
+    fee_band_adj_pct,
+    # Stuck Context
+    stuck_adj_enabled,
+    stuck_period,
+    peer_stuck_status,
+    is_low_liquidity_for_stuck,
+    # Amboss Data
     amboss_data,
-    is_aggregated,  # New flag
-    stuck_band_adjustment=0,  # Stuck channel adjustment
-    raw_band=None,  # Raw band after adjustment
 ):
     print("-" * 80)
     print(f"Alias: {alias}{' (Aggregated)' if is_aggregated else ''}")
     print(f"Pubkey: {pubkey}")
     if is_aggregated:
         print(f"Channel IDs: {', '.join(channel_ids_list)}")
-        print(f"Aggregate Capacity: {capacity}")
+        print(f"Aggregate Capacity: {capacity:,.0f}")
         print(
-            f"Aggregate Local Balance: {local_balance} | (Outbound: {round(local_balance/capacity*100) if capacity else 0}%)"
+            f"Aggregate Local Balance: {local_balance:,.0f} | (Outbound: {outbound_ratio*100:.1f}%)"
         )
     else:
         print(f"Channel ID: {channel_ids_list[0]}")  # Only one ID in the list
-        print(f"Capacity: {capacity}")
+        print(f"Capacity: {capacity:,.0f}")
         print(
-            f"Local Balance: {local_balance} | (Outbound: {round(local_balance/capacity*100) if capacity else 0}%)"
+            f"Local Balance: {local_balance:,.0f} | (Outbound: {outbound_ratio*100:.1f}%)"
         )
-    # Display old/new rate - Note: Actual updates depended on individual deltas
-    print(f"Old Fee Rate (Example): {old_fee_rate}")
-    print(f"New Fee Rate (Applied): {new_fee_rate}")
-    # Delta display might be less meaningful in aggregate view, consider removing or clarifying
-    # print(f"Delta: {new_fee_rate - old_fee_rate}")
-    if group_name:
-        print(f"Group: {group_name}")
+    print(f"Old Fee Rate (LNDg): {old_fee_rate}")
+
+    # --- Waterfall ---
+    print("\n--- Fee Calculation Waterfall ---")
+    print(f"  Start Fee (Amboss {fee_base.upper()}): {base_fee:,.1f} ppm")
+    print(f"  +/- Base Adj ({base_adjust_pct*100:+.1f}%): {rate_after_base:,.1f} ppm")
+    print(
+        f"  +/- Group Adj ({group_adjust_pct*100:+.1f}%): {rate_after_group:,.1f} ppm"
+    )
+    print(
+        f"  +/- Trend Adj ({trend_adjust_pct*100:+.1f}%): {rate_after_trend:,.1f} ppm"
+    )
+    if fee_band_enabled:
+        print(
+            f"  * Fee Band Adj ({fee_band_adj_pct*100:+.1f}%): {rate_after_fee_band:,.1f} ppm"
+        )
     else:
-        print(f"Group: No Group")
-    print(f"Chosen Fee Base: {fee_base}")
-
-    # Add fee bands information if enabled
-    fee_bands = fee_conditions.get("fee_bands", {})
-    if fee_bands.get("enabled", False):
-        outbound_ratio = local_balance / capacity if capacity else 0
-        if raw_band is None:
-            raw_band = min(4, max(0, int((1 - outbound_ratio) * 5)))
-
-        band_names = [
-            "Max Discount (80-100%)",
-            "High Discount (60-80%)",
-            "Neutral (40-60%)",
-            "Max Premium (20-40%)",
-            "Max Premium (0-20%)",  # Same premium as band 3
-        ]
-
-        # Calculate the actual percentage adjustment for this band
-        discount = fee_bands.get("discount", 0)
-        premium = fee_bands.get("premium", 0)
-        adjustment_range = premium - discount
-
-        # For display purposes, cap at band 3 since bands 3 and 4 use the same adjustment
-        effective_band = min(3, raw_band)
-        actual_adjustment = discount + (effective_band / 3) * adjustment_range
-
-        print(f"Fee Bands: Enabled")
-        print(
-            f"  - Discount: {fee_bands.get('discount', 0)*100:.1f}%, Premium: {fee_bands.get('premium', 0)*100:.1f}%"
-        )
-        print(
-            f"  - Current Band: {band_names[raw_band]} (Local Balance: {outbound_ratio*100:.1f}%)"
-        )
-        print(f"  - Applied Adjustment: {actual_adjustment*100:.1f}%")
-
-        if raw_band == 4:
-            print(f"  - Note: Premium capped at 40% liquidity level")
+        print(f"  * Fee Band Adj: Disabled")
+    if rate_before_rounding < max_cap:
+        print(f"  Max Cap ({max_cap} ppm): Not Applied")
+        print(f"  Calculated Rate (Rounded): {final_rate} ppm")
     else:
-        print(f"Fee Bands: Disabled")
+        print(f"  Max Cap ({max_cap} ppm): Applied")
+        print(f"  Calculated Rate (Capped & Rounded): {final_rate} ppm")
+    print("---------------------------------")
 
-    # Add stuck channel information if adjustment was applied
-    stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
-    if stuck_settings.get("enabled", False):
-        stuck_time_period = stuck_settings.get("stuck_time_period", 7)
+    # --- Context ---
+    print("\n--- Context & Settings ---")
+    print(f"  Group: {group_name if group_name else 'N/A'}")
+    print(f"  Fee Base Used: {fee_base}")
+    print(
+        f"  Trend Factor Used: {trend_factor:.2f} (Sensitivity: {trend_sensitivity:.2f})"
+    )
 
-        # Check if we're in the low-liquidity band where stuck adjustment is skipped
-        outbound_ratio = local_balance / capacity if capacity else 0
-        is_low_liquidity = outbound_ratio < 0.2
-
-        if is_low_liquidity:
-            print(
-                f"Stuck Channel Adjustment: Skipped (Low Local Liquidity: {outbound_ratio*100:.1f}%)"
-            )
-            print(
-                f"  - Note: Stuck channel adjustment is disabled when local liquidity is below 20%"
-            )
-        elif stuck_band_adjustment > 0:
-            print(f"Stuck Channel Adjustment: Applied")
-            print(f"  - Bands Adjusted Down: {stuck_band_adjustment}")
-            print(f"  - Stuck Time Period: {stuck_time_period} days")
-            if raw_band is not None:
-                original_band = min(4, raw_band + stuck_band_adjustment)
-                if original_band < 5:  # Check to avoid index error
-                    # Calculate what the adjustment percentage would have been without stuck adjustment
-                    original_effective_band = min(3, original_band)
-                    original_adjustment = (
-                        discount + (original_effective_band / 3) * adjustment_range
-                    )
-
-                    print(
-                        f"  - Original Band (Before Adjustment): {band_names[original_band]} ({original_adjustment*100:.1f}%)"
-                    )
-        else:
-            print(
-                f"Stuck Channel Adjustment: None (Channel Active in the past {stuck_time_period} days)"
-            )
-
-    print(f"Fee Conditions: {json.dumps(fee_conditions)}")
-    print(f"Trend Factor: {trend_factor}")
-
-    # Amboss data table remains the same
-    table = PrettyTable()
-    table.field_names = [
-        "Time Range",
-        "Max",
-        "Mean",
-        "Median",
-        "Weighted",
-        "Weighted Corrected",
+    band_names = [
+        "Max Discount (80-100%)",
+        "High Discount (60-80%)",
+        "Neutral (40-60%)",
+        "Max Premium (20-40%)",
+        "Max Premium (0-20%)",
     ]
+    print(f"  Fee Bands: {'Enabled' if fee_band_enabled else 'Disabled'}")
+    if fee_band_enabled:
+        print(
+            f"    - Discount: {fee_band_discount*100:.1f}%, Premium: {fee_band_premium*100:.1f}%"
+        )
+        print(
+            f"    - Initial Band (Liquidity {outbound_ratio*100:.1f}%): {band_names[initial_raw_band]}"
+        )
+        print(f"    - Stuck Adjustment Applied: -{stuck_adj_bands_applied} bands")
+        print(f"    - Final Band Used for Calc: {band_names[final_raw_band]}")
+        print(f"    - Resulting Adjustment: {fee_band_adj_pct*100:+.1f}%")
 
+    print(f"  Stuck Adjustment: {'Enabled' if stuck_adj_enabled else 'Disabled'}")
+    if stuck_adj_enabled:
+        print(f"    - Period: {stuck_period} days")
+        print(f"    - Peer Status: {peer_stuck_status}")
+        if is_low_liquidity_for_stuck:
+            print(
+                f"    - Adjustment Skipped: Low Liquidity ({outbound_ratio*100:.1f}% < 20%)"
+            )
+        elif stuck_adj_bands_applied > 0:
+            print(f"    - Adjustment Applied: {stuck_adj_bands_applied} bands down")
+        else:
+            print(f"    - Adjustment Applied: 0 bands (Peer Active)")
+
+    # print(f"  Full Fee Conditions: {json.dumps(fee_conditions)}") # Keep optional?
+
+    # --- Amboss Table ---
+    print("\n--- Amboss Peer Fee Data (Remote Perspective) ---")
+    table = PrettyTable()
+    table.field_names = ["Time", "Max", "Mean", "Median", "Weighted", "W.Corrected"]
     for time_range, fee_info in amboss_data.items():
         table.add_row(
             [
                 time_range,
                 fee_info.get("max", "N/A"),
                 (
-                    round(float(fee_info.get("mean", 0)), 1)
-                    if fee_info.get("mean")
+                    f"{float(fee_info.get('mean', 0)):.1f}"
+                    if fee_info.get("mean") is not None
                     else "N/A"
                 ),
                 fee_info.get("median", "N/A"),
                 (
-                    round(float(fee_info.get("weighted", 0)), 1)
-                    if fee_info.get("weighted")
+                    f"{float(fee_info.get('weighted', 0)):.1f}"
+                    if fee_info.get("weighted") is not None
                     else "N/A"
                 ),
                 (
-                    round(float(fee_info.get("weighted_corrected", 0)), 1)
-                    if fee_info.get("weighted_corrected")
+                    f"{float(fee_info.get('weighted_corrected', 0)):.1f}"
+                    if fee_info.get("weighted_corrected") is not None
                     else "N/A"
                 ),
             ]
@@ -795,6 +800,15 @@ def print_fee_adjustment(
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Adjust LND channel fees based on Amboss data and local conditions."
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable detailed debug output for stuck channel checks.",
+    )
+    args = parser.parse_args()
     try:
         config = load_config()
         node_definitions = load_node_definitions()
@@ -804,6 +818,7 @@ def main():
         )
         lndg_fee_update_enabled = node_definitions.get("LNDg_fee_update", False)
         terminal_output_enabled = node_definitions.get("Terminal_output", False)
+        show_debug_output = args.debug  # Use debug flag directly
 
         if write_charge_lnd_file_enabled:
             charge_lnd_file_path = os.path.join(
@@ -825,22 +840,37 @@ def main():
                     "base_adjustment_percentage", 0
                 )
 
-            group_adjustment_percentage = 0  # Initialize group_adjustment_percentage
+            # --- Group overrides/defaults ---
+            group_adjustment_percentage = 0
             if group_name and group_name in groups:
                 group_fee_conditions = groups[group_name]
                 group_adjustment_percentage = group_fee_conditions.get(
                     "group_adjustment_percentage", 0
                 )
+                # If node has no specific conditions, use group's; otherwise, node conditions take precedence
                 if not fee_conditions:
                     fee_conditions = group_fee_conditions
-            elif not fee_conditions:
-                logging.warning(
-                    f"No fee conditions found for pubkey {pubkey}. Skipping fee adjustment."
-                )
+            elif not fee_conditions:  # Node has no group and no specific conditions
+                logging.warning(f"No fee conditions for {pubkey}, skipping.")
                 continue
 
+            # --- Extract key parameters ---
             fee_base = fee_conditions.get("fee_base", "median")
             fee_delta_threshold = fee_conditions.get("fee_delta_threshold", 20)
+            max_cap = fee_conditions.get("max_cap", 1000)  # Default max_cap
+            trend_sensitivity = fee_conditions.get(
+                "trend_sensitivity", 1.0
+            )  # Default sensitivity
+
+            stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
+            stuck_adj_enabled = stuck_settings.get("enabled", False)
+            stuck_period = stuck_settings.get("stuck_time_period", 7)
+
+            fee_bands_settings = fee_conditions.get("fee_bands", {})
+            fee_band_enabled = fee_bands_settings.get("enabled", False)
+            fee_band_discount = fee_bands_settings.get("discount", 0)
+            fee_band_premium = fee_bands_settings.get("premium", 0)
+
             try:
                 all_amboss_data = fetch_amboss_data(pubkey, config)
                 # print(f"Amboss Data: {all_amboss_data}")  # Debug Amboss Fetcher
@@ -863,36 +893,20 @@ def main():
                 # --- Aggregate Liquidity Calculation (if multiple channels) ---
                 total_capacity = 0
                 total_local_balance = 0
-                aggregate_local_balance_ratio = 0
-                first_channel_data = next(
-                    iter(channels_to_modify.values())
-                )  # Get data from one channel for later use
-                first_chan_id = next(
-                    iter(channels_to_modify.keys())
-                )  # Get first channel ID
-
+                first_channel_data = next(iter(channels_to_modify.values()))
                 if num_channels > 1:
-                    logging.info(
-                        f"Found {num_channels} channels for peer {pubkey}. Aggregating liquidity."
-                    )
                     for chan_data in channels_to_modify.values():
                         total_capacity += chan_data["capacity"]
                         total_local_balance += chan_data["local_balance"]
-                    aggregate_local_balance_ratio = (
-                        (total_local_balance / total_capacity) * 100
-                        if total_capacity
-                        else 0
-                    )
-                    check_ratio = (
-                        aggregate_local_balance_ratio / 100
-                    )  # Use aggregate ratio for check
                 else:
-                    # Use individual channel's ratio if only one channel
                     total_capacity = first_channel_data["capacity"]
                     total_local_balance = first_channel_data["local_balance"]
-                    check_ratio = first_channel_data["local_balance_ratio"] / 100
 
-                # --- Outbound Liquidity Check (using aggregate or individual ratio) ---
+                check_ratio = (
+                    (total_local_balance / total_capacity) if total_capacity else 0
+                )
+
+                ## --- Liquidity Bounds Check ---
                 max_outbound = fee_conditions.get("max_outbound", 1.0)
                 min_outbound = fee_conditions.get("min_outbound", 0.0)
 
@@ -905,119 +919,181 @@ def main():
                         f"Ratio: {check_ratio:.2f}, Max: {max_outbound}, Min: {min_outbound}"
                     )
                     if terminal_output_enabled:
+                        print("-" * 80)
+                        print()
                         print(
-                            f"Peer {pubkey} (Alias: {alias_to_log}, {num_channels} channels) skipped due to outbound liquidity conditions."
+                            f"\033[91mPeer {pubkey} (Alias: {alias_to_log}, {num_channels} channels) skipped due to outbound liquidity conditions.\033[0m"  # ADDED ANSI color codes
                         )
                         print(
-                            f"Aggregate Ratio: {check_ratio:.2f}, Max: {max_outbound}, Min: {min_outbound}"
+                            f"\033[91mAggregate Ratio: {check_ratio:.2f}, Max: {max_outbound}, Min: {min_outbound}\033[0m"  # ADDED ANSI color codes
                         )
                     continue  # Skip this entire peer
 
                 # --- Stuck Check ---
-                peer_stuck_status = "not_checked"  # Default
+                peer_stuck_status = "not_applicable"  # If disabled
                 channel_check_details = []
-                is_peer_stuck = False  # Default
-                stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
-
-                if (
-                    stuck_settings.get("enabled", False) and channels_to_modify
-                ):  # Check only if enabled and channels exist
-                    stuck_time_period = stuck_settings.get("stuck_time_period", 7)
+                is_peer_stuck = False
+                if stuck_adj_enabled:
                     peer_stuck_status, channel_check_details = (
                         get_last_forwarding_timestamp_for_peer(
-                            pubkey,
-                            channel_ids_list,
-                            stuck_time_period,
-                            config,
+                            pubkey, channel_ids_list, stuck_period, config
                         )
                     )
-                    # Treat errors as 'stuck' for fee calculation purposes, but log it
                     if peer_stuck_status == "error":
                         logging.warning(
-                            f"Error occurred during stuck check for peer {pubkey}. Treating as stuck."
+                            f"Error checking stuck status for {pubkey}, treating as stuck."
                         )
                         is_peer_stuck = True
                     else:
                         is_peer_stuck = peer_stuck_status == "stuck"
 
-                # --- Calculate Potential Stuck Adjustment ---
-                potential_stuck_adjustment = 0
-                if stuck_settings.get("enabled", False) and is_peer_stuck:
-                    if check_ratio >= 0.2:  # Only apply if liquidity is >= 20%
-                        potential_stuck_adjustment = 4
+                # --- Calculate Adjustments ---
+                potential_stuck_adjustment_bands = 0
+                is_low_liquidity_for_stuck = check_ratio < 0.2
+                if (
+                    stuck_adj_enabled
+                    and is_peer_stuck
+                    and not is_low_liquidity_for_stuck
+                ):
+                    potential_stuck_adjustment_bands = 4  # Apply max discount
 
-                # --- Fee Calculation ---
-                fee_band_result = calculate_fee_band_adjustment(
-                    fee_conditions,
-                    check_ratio,
-                    potential_stuck_adjustment,
-                )
-                # ... (get fee_band_factor, raw_band) ...
-                if isinstance(fee_band_result, tuple):
-                    fee_band_factor, raw_band = fee_band_result
-                else:  # Should not happen if fee bands enabled, but handle defensively
-                    fee_band_factor = fee_band_result
-                    # Recalculate raw_band if not returned, considering potential stuck adjustment
+                fee_band_factor = 1.0
+                initial_raw_band = 0
+                final_raw_band = 0
+                fee_band_adj_pct = 0.0
+                if fee_band_enabled:
                     initial_raw_band = min(4, max(0, int((1 - check_ratio) * 5)))
-                    raw_band = max(0, initial_raw_band - potential_stuck_adjustment)
+                    fee_band_result = calculate_fee_band_adjustment(
+                        fee_conditions, check_ratio, potential_stuck_adjustment_bands
+                    )
+                    # Unpack only if fee bands are enabled
+                    if isinstance(fee_band_result, tuple):  # ADDED check for tuple type
+                        fee_band_factor, final_raw_band = fee_band_result
+                    else:  # If fee bands are disabled, fee_band_result is a float
+                        fee_band_factor = fee_band_result  # Should be 1.0
+                        final_raw_band = (
+                            0  # Initialize as it won't be used in this case
+                        )
 
-                new_fee_rate = calculate_new_fee_rate(
-                    # ... (arguments) ...
-                    all_amboss_data,
-                    fee_conditions,
-                    trend_factor,
-                    base_adjustment_percentage,
-                    group_adjustment_percentage,
-                    check_ratio,
+                    fee_band_adj_pct = (
+                        fee_band_factor - 1.0
+                    )  # Get the percentage adjustment
+
+                # --- Waterfall Calculation ---
+                base_fee = float(all_amboss_data.get("TODAY", {}).get(fee_base, 0))
+                trend_adjust_pct = trend_factor * trend_sensitivity
+
+                rate_after_base = base_fee * (1 + base_adjustment_percentage)
+                rate_after_group = rate_after_base * (1 + group_adjustment_percentage)
+                rate_after_trend = rate_after_group * (1 + trend_adjust_pct)
+
+                # Apply fee band factor only if bands are enabled
+                rate_after_fee_band = (
+                    rate_after_trend * fee_band_factor
+                    if fee_band_enabled
+                    else rate_after_trend
                 )
-                stuck_adjustment_to_report = potential_stuck_adjustment
 
-                # --- Apply Updates ---
+                rate_before_rounding = min(rate_after_fee_band, max_cap)
+                final_rate = round(rate_before_rounding)
+
+                # --- Apply Updates & Notes ---
                 updated_any_channel = False
-                # ...(loop through channels_to_modify, call update_lndg_fee if needed)...
-                # Example within loop:
-                # fee_delta = abs(new_fee_rate - channel_data["local_fee_rate"])
-                # if lndg_fee_update_enabled and fee_delta > fee_delta_threshold:
-                #    try:
-                #        update_lndg_fee(chan_id, new_fee_rate, channel_data, config)
-                #        updated_any_channel = True
-                #    except LNDGAPIError as api_err: ...
+                # ... (loops for update_lndg_fee and update_channel_notes using final_rate and potential_stuck_adjustment_bands) ...
+                for chan_id, channel_data in channels_to_modify.items():
+                    # Apply update if delta is sufficient
+                    fee_delta = abs(final_rate - channel_data["local_fee_rate"])
+                    if lndg_fee_update_enabled and fee_delta > fee_delta_threshold:
+                        try:
+                            update_lndg_fee(chan_id, final_rate, channel_data, config)
+                            updated_any_channel = True
+                        except LNDGAPIError as api_err:
+                            logging.error(
+                                f"Failed LNDg update for {chan_id}: {api_err}"
+                            )
+                            continue
 
-                # --- Update Notes ---
-                # ... (call update_channel_notes in loop) ...
-                # Example within loop:
-                # if update_channel_notes_enabled:
-                #    update_channel_notes(
-                #        chan_id, ..., new_fee_rate, stuck_adjustment_to_report)
+                    # Update notes regardless of fee change if enabled
+                    update_channel_notes_enabled = node_definitions.get(
+                        "update_channel_notes", False
+                    )
+                    if update_channel_notes_enabled:
+                        try:
+                            update_channel_notes(
+                                chan_id,
+                                channel_data["alias"],
+                                group_name,
+                                fee_base,
+                                fee_conditions,
+                                check_ratio,  # Use aggregate ratio for notes
+                                final_raw_band,  # Pass final band after stuck adjust
+                                fee_band_factor,
+                                config,
+                                node_definitions,
+                                final_rate,
+                                potential_stuck_adjustment_bands,  # Pass stuck bands applied
+                            )
+                        except Exception as note_err:
+                            logging.error(
+                                f"Failed to update notes for {chan_id}: {note_err}"
+                            )
 
-                # --- Main Summary Output ---
+                # --- Terminal Output ---
                 if updated_any_channel or terminal_output_enabled:
                     if terminal_output_enabled:
                         print_fee_adjustment(
-                            # ... (arguments) ...
-                            first_channel_data["alias"],
-                            pubkey,
-                            channel_ids_list,
-                            total_capacity,
-                            total_local_balance,
-                            first_channel_data["local_fee_rate"],
-                            new_fee_rate,
-                            group_name,
-                            fee_base,
-                            fee_conditions,
-                            trend_factor,
-                            all_amboss_data,
-                            num_channels > 1,
-                            stuck_adjustment_to_report,
-                            raw_band,
+                            # Basic Info
+                            alias=first_channel_data["alias"],
+                            pubkey=pubkey,
+                            channel_ids_list=channel_ids_list,
+                            is_aggregated=(num_channels > 1),
+                            capacity=total_capacity,
+                            local_balance=total_local_balance,
+                            outbound_ratio=check_ratio,
+                            old_fee_rate=first_channel_data["local_fee_rate"],
+                            # Waterfall
+                            base_fee=base_fee,
+                            fee_base=fee_base,
+                            base_adjust_pct=base_adjustment_percentage,
+                            rate_after_base=rate_after_base,
+                            group_adjust_pct=group_adjustment_percentage,
+                            rate_after_group=rate_after_group,
+                            trend_factor=trend_factor,
+                            trend_sensitivity=trend_sensitivity,
+                            trend_adjust_pct=trend_adjust_pct,
+                            rate_after_trend=rate_after_trend,
+                            fee_band_factor=fee_band_factor,
+                            rate_after_fee_band=rate_after_fee_band,  # Pass fee_band_factor instead of adj_pct here
+                            max_cap=max_cap,
+                            rate_before_rounding=rate_before_rounding,
+                            final_rate=final_rate,
+                            # Context
+                            group_name=group_name,
+                            fee_conditions=fee_conditions,
+                            # Fee Band Context
+                            fee_band_enabled=fee_band_enabled,
+                            fee_band_discount=fee_band_discount,
+                            fee_band_premium=fee_band_premium,
+                            initial_raw_band=initial_raw_band,
+                            stuck_adj_bands_applied=potential_stuck_adjustment_bands,
+                            final_raw_band=final_raw_band,
+                            fee_band_adj_pct=fee_band_adj_pct,
+                            # Stuck Context
+                            stuck_adj_enabled=stuck_adj_enabled,
+                            stuck_period=stuck_period,
+                            peer_stuck_status=peer_stuck_status,
+                            is_low_liquidity_for_stuck=is_low_liquidity_for_stuck,
+                            # Amboss Data
+                            amboss_data=all_amboss_data,
                         )
-                        sys.stdout.flush()
+                        sys.stdout.flush()  # Flush main block
+
+                    # Conditional Debug Output
                     if (
-                        terminal_output_enabled
-                        and stuck_settings.get("enabled", False)
-                        and channels_to_modify
-                    ):
+                        show_debug_output and stuck_adj_enabled
+                    ):  # Check debug flag and if stuck adj is enabled
                         print(f"\n--- Stuck Check Debug for Peer {pubkey[:10]}... ---")
+                        # ... (debug printing logic as before) ...
                         for detail in channel_check_details:
                             short_api_url = detail["api_url"].split("?")[0] + "?..."
                             print(
@@ -1026,8 +1102,8 @@ def main():
                         print(f"  Overall Peer Status: {peer_stuck_status}")
                         if is_peer_stuck:
                             adj_reason = (
-                                f"Applying {potential_stuck_adjustment} bands (Liquidity {check_ratio*100:.1f}% >= 20%)"
-                                if potential_stuck_adjustment > 0
+                                f"Applying {potential_stuck_adjustment_bands} bands (Liquidity {check_ratio*100:.1f}% >= 20%)"
+                                if potential_stuck_adjustment_bands > 0
                                 else f"Skipped (Liquidity {check_ratio*100:.1f}% < 20%)"
                             )
                             print(f"  Potential Stuck Adjustment: {adj_reason}")
@@ -1038,7 +1114,7 @@ def main():
                         print(
                             f"--- End Stuck Check Debug for Peer {pubkey[:10]}... ---"
                         )
-                        sys.stdout.flush()
+                        sys.stdout.flush()  # Flush debug block
 
                 # Write to charge-lnd file once per peer if enabled and any channel updated
                 if write_charge_lnd_file_enabled and updated_any_channel:
@@ -1050,7 +1126,7 @@ def main():
                         charge_lnd_file_path,
                         pubkey,
                         first_channel_data["alias"],  # Use first alias
-                        new_fee_rate,
+                        final_rate,
                         num_channels > 1,  # Flag if aggregated
                     )
 
