@@ -343,7 +343,7 @@ def calculate_stuck_channel_band_adjustment(
         print(
             f"DEBUG: Applying max stuck adjustment (4 bands) for chan_id={chan_id} because peer is stuck."
         )
-        return 4  # Apply maximum band adjustment (to band 0)
+        return 1  # Apply 1 band discount adjustment (band -1)
     else:
         # Peer is not stuck (had recent outbound forwarding)
         print(
@@ -922,11 +922,12 @@ def main():
                         print("-" * 80)
                         print()
                         print(
-                            f"\033[91mPeer {pubkey} (Alias: {alias_to_log}, {num_channels} channels) skipped due to outbound liquidity conditions.\033[0m"  # ADDED ANSI color codes
+                            f"\033[91mPeer {pubkey} (Alias: {alias_to_log}, {num_channels} channels) skipped due to outbound liquidity conditions.\033[0m"
                         )
                         print(
-                            f"\033[91mAggregate Ratio: {check_ratio:.2f}, Max: {max_outbound}, Min: {min_outbound}\033[0m"  # ADDED ANSI color codes
+                            f"\033[91mAggregate Ratio: {check_ratio:.2f}, Max: {max_outbound}, Min: {min_outbound}\033[0m"
                         )
+                        print()
                     continue  # Skip this entire peer
 
                 # --- Stuck Check ---
@@ -955,7 +956,7 @@ def main():
                     and is_peer_stuck
                     and not is_low_liquidity_for_stuck
                 ):
-                    potential_stuck_adjustment_bands = 4  # Apply max discount
+                    potential_stuck_adjustment_bands = 1  # Apply one discount band
 
                 fee_band_factor = 1.0
                 initial_raw_band = 0
