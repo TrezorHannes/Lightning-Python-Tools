@@ -527,7 +527,7 @@ def update_channel_notes(
     logging.debug(f"LNDg API URL for note updates: {lndg_api_url}")
 
     # Build the notes text
-    notes = f"🔋 Channel managed by fee-adjuster | Group: {group_name if group_name else 'None'} | Base: {fee_base}"
+    notes = f"🔋 Group: {group_name if group_name else 'None'} | Base: {fee_base}"
 
     # Add fee bands info in a condensed format
     fee_bands = fee_conditions.get("fee_bands", {})
@@ -545,8 +545,8 @@ def update_channel_notes(
         effective_band = min(3, raw_band)
         actual_adjustment = discount + (effective_band / 3) * (premium - discount)
 
-        notes += f"\nBands: ✅ | Disc: {discount*100:.0f}% | Prem: {premium*100:.0f}% | Bal: {outbound_ratio*100:.0f}%"
         notes += f"\nCurrent: {band_names[raw_band]} | Adjustment: {actual_adjustment*100:.1f}%"
+        notes += f"\nBands: ✅ | Disc: {discount*100:.0f}% | Prem: {premium*100:.0f}% | Bal: {outbound_ratio*100:.0f}%"
     else:
         notes += f"\nFee Bands: Disabled"
 
