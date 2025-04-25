@@ -62,7 +62,7 @@ logging.getLogger("requests").setLevel(logging.WARNING)
 # Function to get the current exchange rate
 def get_exchange_rate(fiat_currency):
     try:
-        url = f"{LNBITS_URL}/rate/{fiat_currency}"
+        url = f"{LNBITS_URL}/api/v1/rate/{fiat_currency}"
         logger.debug(f"Requesting exchange rate from: {url}")
         response = requests.get(url, headers={"accept": "application/json"})
         logger.debug(f"Response status code: {response.status_code}")
@@ -87,14 +87,33 @@ def create_invoice(wallet_id, invoice_key, amount_eur, child_name, fiat_currency
     amount_sats = int(amount_eur * exchange_rate)
     memo = f"Pocket Money for {child_name} - {RECURRENCE.capitalize()}"
     try:
+        logger.debug(
+            f"Creating invoice for {child_name} with amount {amount_sats} sats"
+        )
         response = requests.post(
-            f"{LNBITS_URL}/payments",
-            headers={"X-Api-Key": invoice_key},
+            f"{LNBITS_URL}/api/v1/payments",
+            headers={"X-Api-Key": invoice_key, "Content-type": "application/json"},
             json={"out": False, "amount": amount_sats, "memo": memo},
         )
+        logger.debug(f"Invoice creation response status: {response.status_code}")
+        logger.debug(f"Invoice creation response: {response.text}")
         response.raise_for_status()
         invoice_data = response.json()
-        return invoice_data.get("payment_request"), amount_sats
+        logger.debug(f"Invoice data: {invoice_data}")
+
+        # API returns bolt11 instead of payment_request in newer versions
+        if "bolt11" in invoice_data:
+            return invoice_data.get("bolt11"), amount_sats
+        elif "payment_request" in invoice_data:
+            return invoice_data.get("payment_request"), amount_sats
+        else:
+            logger.error(f"Missing bolt11/payment_request in response: {invoice_data}")
+            bot.send_message(
+                CHAT_ID,
+                f"Error creating invoice: missing payment information in response",
+            )
+            return None, None
+
     except requests.exceptions.RequestException as e:
         logger.error(
             f"Error creating invoice for {child_name} with wallet {wallet_id}: {e}"
@@ -109,15 +128,31 @@ def create_invoice(wallet_id, invoice_key, amount_eur, child_name, fiat_currency
 # Function to pay an invoice
 def pay_invoice(payment_request):
     try:
+        logger.debug(f"Paying invoice with bolt11: {payment_request[:30]}...")
         response = requests.post(
-            f"{LNBITS_URL}/payments",
-            headers={"X-Api-Key": ADMIN_KEY},
+            f"{LNBITS_URL}/api/v1/payments",
+            headers={
+                "X-Api-Key": ADMIN_KEY,
+                "Content-type": "application/json",  # Added Content-type header
+            },
             json={"out": True, "bolt11": payment_request},
         )
+        logger.debug(f"Payment response status: {response.status_code}")
+        logger.debug(f"Payment response: {response.text}")
+
+        # Check if status code indicates success but isn't exactly 201
+        if response.status_code in (200, 201, 202):
+            payment_data = response.json()
+            logger.info(f"Payment successful: {payment_data}")
+            return payment_data
+
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
         logger.error(f"Error paying invoice: {e}")
+        logger.error(
+            f"Request details: URL={LNBITS_URL}/api/v1/payments, Headers={{'X-Api-Key': '[REDACTED]', 'Content-type': 'application/json'}}"
+        )
         bot.send_message(CHAT_ID, f"Error paying invoice: {e}")
         return None
 
@@ -126,7 +161,7 @@ def pay_invoice(payment_request):
 def check_balance():
     try:
         response = requests.get(
-            f"{LNBITS_URL}/wallet", headers={"X-Api-Key": ADMIN_KEY}
+            f"{LNBITS_URL}/api/v1/wallet", headers={"X-Api-Key": ADMIN_KEY}
         )
         response.raise_for_status()
         balance = response.json().get("balance")
