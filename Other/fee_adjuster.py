@@ -1,80 +1,63 @@
 """
 Guidelines for the Fee Adjuster Script
 
-This script automates the adjustment of channel fees based on various conditions and trends.
-It uses data from the Amboss API to determine appropriate fee rates for each node.
+This script automates the adjustment of channel fees based on network conditions, peer behavior,
+and local liquidity using data from the Amboss API and LNDg API.
 
 Configuration Settings (see fee_adjuster_config_docs.txt for details):
-- base_adjustment_percentage: Adjusts your local fee by this percentage. Applied to the selected fee base (e.g., median, mean).
-- group_adjustment_percentage: Additional adjustment based on node groups. Allows for differentiated strategies.
-- max_cap: Maximum fee rate allowed. Prevents fees from exceeding this value.
-- trend_sensitivity: Determines how much trends influence fee adjustments. Higher values mean greater influence.
-- fee_base: The statistical measure used as the base for fee calculations. Options include "median", "mean", "min", "max", "weighted" and "weighted_corrected".
-- groups: Categories or tags for nodes. Used to apply specific strategies or adjustments.
-- max_outbound: (Optional) Maximum outbound liquidity percentage (0.0 to 1.0). Only applies if the channel's outbound liquidity is *below* this value.
-- min_outbound: (Optional) Minimum outbound liquidity percentage (0.0 to 1.0). Only applies if the channel's outbound liquidity is *above* this value.
-- fee_bands: (Optional) Adjusts fees based on local liquidity. Contains the following sub-settings:
-  - enabled: Whether to use fee bands (true/false)
-  - discount: Discount percentage (negative value) to apply when local balance is high (80-100%)
-  - premium: Premium percentage (positive value) to apply when local balance is low (0-40%)
-- stuck_channel_adjustment: (Optional) Adjusts fees for channels that haven't forwarded payments recently:
-  - enabled: Whether to use stuck channel adjustment (true/false)
-  - stuck_time_period: Number of days after which a channel is considered "stuck" (e.g., 7)
-
+- base_adjustment_percentage: Percentage adjustment applied to the selected fee base (median, mean, etc.).
+- group_adjustment_percentage: Additional adjustment based on node group membership.
+- max_cap: Maximum allowed fee rate (in ppm).
+- trend_sensitivity: Multiplier for the influence of Amboss fee trends on the adjustment.
+- fee_base: Statistical measure from Amboss used as the fee calculation base ("median", "mean", etc.).
+- groups: Node categories for applying differentiated strategies via group_adjustment_percentage.
+- max_outbound: (Optional) Maximum outbound liquidity percentage (0.0-1.0). Script only applies adjustments if channel's outbound liquidity is *below* this value.
+- min_outbound: (Optional) Minimum outbound liquidity percentage (0.0-1.0). Script only applies adjustments if channel's outbound liquidity is *above* this value.
+- fee_bands: (Optional) Dynamic fee adjustments based on local liquidity.
+  - enabled: true/false.
+  - discount: Negative percentage adjustment for high local balance (80-100%).
+  - premium: Positive percentage adjustment for low local balance (0-40%).
+- stuck_channel_adjustment: (Optional) Gradually reduces fees for channels without recent forwards.
+  - enabled: true/false.
+  - stuck_time_period: Number of days defining one 'stuck period' interval (e.g., 7).
 
 Groups and group_adjustment_percentage:
-Nodes can belong to multiple groups, such as "sink" or "expensive". The group_adjustment_percentage is applied to nodes based on their group membership, allowing for tailored fee strategies. For example, nodes in the "expensive" group might have higher fees to reflect their role in the network.
+Allows tailored fee strategies for nodes in specific categories (e.g., "sink", "expensive").
 
 Fee Bands:
-The fee_bands feature provides dynamic fee adjustments based on channel liquidity. It divides liquidity into 5 bands:
-- Band 0 (80-100% local balance): Maximum discount applied
-- Band 1 (60-80% local balance): High discount applied
-- Band 2 (40-60% local balance): Neutral adjustment
-- Band 3 (20-40% local balance): Maximum premium applied
-- Band 4 (0-20% local balance): Maximum premium applied (same as band 3)
-
-Note: The premium is capped at band 3 (40% liquidity threshold) to ensure rebalancing can happen profitably
-when channels reach very low liquidity levels. This prevents charging escalating fees when channels are
-almost depleted, which would make automated rebalancing unprofitable.
+Adjusts fees based on local balance ratio, dividing liquidity into 5 bands (0-20%, 20-40%, 40-60%, 60-80%, 80-100%). A graduated adjustment is applied between the configured discount (high local balance) and premium (low local balance). The premium is capped at the 20-40% liquidity band to avoid excessively high fees on nearly drained channels.
 
 Stuck Channel Adjustment:
-The stuck_channel_adjustment feature gradually reduces fees for channels that haven't forwarded payments recently.
-For each "stuck_time_period" (in days) that a channel goes without forwarding a payment, its fee band is
-moved down by one level (toward the maximum discount). This makes inactive channels more attractive to use
-and can help reactivate channels that haven't been routing payments.
-
-For example, with a stuck_time_period of 7 days:
-- No forwarding for 7+ days: Move down 1 fee band (e.g., from band 3 to band 2)
-- No forwarding for 14+ days: Move down 2 fee bands
-- No forwarding for 21+ days: Move down 3 fee bands
-- No forwarding for 28+ days: Move down to band 0 (maximum discount)
-
-Important: Stuck channel adjustment is automatically disabled when local liquidity is below 20%. This prevents
-offering discounts on channels that are already heavily drained and likely need rebalancing instead of
-further incentives to route outbound payments.
-
-The script queries the LNDg API to determine the timestamp of the last forwarding through each channel.
-If a channel has no forwarding history at all, it receives the maximum discount.
+This feature incrementally reduces fees for channels that haven't forwarded payments recently.
+For each multiple of the `stuck_time_period` (in days) that a peer's channels have gone without an *outbound* forwarding, the fee band is moved down by one level (towards the maximum discount).
+The adjustment is capped at moving down 4 bands (reaching the maximum discount band).
+If an outbound forward is detected for any channel of the peer, the stuck adjustment is reset to 0 bands down.
+This adjustment is automatically skipped if the aggregate local liquidity for the peer is below 20%, preventing discounts on heavily imbalanced channels needing rebalancing. The script queries the LNDg API to find the timestamp of the last outbound forward for the peer.
 
 Usage:
-- Configure nodes and their settings in the feeConfig.json file.
-- Run the script to automatically adjust fees based on the configured settings and current trends.
-- Currently, it requires a running LNDg instance to retrieve local channel details and fees
+- Configure nodes and their settings in `feeConfig.json`.
+- Run the script to automatically adjust fees based on configured settings.
+- Requires a running LNDg instance for local channel details and fee updates.
 
 Command Line Arguments:
-- --debug: Enable detailed debug output, including stuck channel check results for each peer.
+- --debug: Enable detailed debug output, including stuck channel check results.
 
 Charge-lnd Details:
+Configure charge-lnd to use the output file:
+```ini
 # charge-lnd.config
 [🤖 FeeAdjuster Import]
 strategy = use_config
-config_file = file:///home/chargelnd/charge-lnd/.config/fee_adjuster.txt
+config_file = file:///path/to/your/charge-lnd/.config/fee_adjuster.txt
+```
 
 Installation:
-crontab -e with
-0 * * * * /path/Lightning-Python-Tools/.venv/bin/python3 /path/Lightning-Python-Tools/Other/fee_adjuster.py >/dev/null &1
-
-Or run the systemd-installer install_fee_adjuster_service.sh
+Add to crontab or use the systemd installer script:
+```bash
+crontab -e
+# Add the following line (adjust path as needed)
+0 * * * * /path/Lightning-Python-Tools/.venv/bin/python3 /path/Lightning-Python-Tools/Other/fee_adjuster.py >/dev/null 2>&1
+```
 """
 
 import os
@@ -206,207 +189,232 @@ def analyze_fee_trends(all_fee_data, fee_base):
         return 0  # Fees are stable or mixed trends
 
 
-def check_recent_outbound_forwarding(pubkey, chan_id, stuck_time_period, config):
+def get_last_peer_forwarding_timestamp(pubkey, days_to_check_back, channel_ids, config):
     """
-    Checks for recent outbound forwarding for a single channel.
+    Finds the timestamp of the most recent *outbound* forward for *any* channel
+    belonging to the specified peer within the last `days_to_check_back`,
+    by querying the API for each channel ID.
+
+    Args:
+        pubkey (str): The pubkey of the peer (used for logging/context).
+        days_to_check_back (int): The number of days to check back for forwards.
+        channel_ids (list): List of channel IDs belonging to the peer.
+        config (configparser.ConfigParser): The configuration object.
 
     Returns:
-        dict: {'status': 'active'|'stuck'|'error', 'reason': str,
-               'checked_chan_id': chan_id, 'api_url': str, 'api_response_data': dict|str}
+        datetime or None: The datetime object of the last outbound forward,
+                          or None if no outbound forward was found within the period
+                          for any of the peer's channels.
     """
     lndg_api_url = config["lndg"]["lndg_api_url"]
     username = config["credentials"]["lndg_username"]
     password = config["credentials"]["lndg_password"]
-    cutoff_date = datetime.now() - timedelta(days=stuck_time_period)
+    cutoff_date = datetime.now() - timedelta(days=days_to_check_back)
     cutoff_date_str = cutoff_date.strftime("%Y-%m-%dT%H:%M:%S")
-    api_url = f"{lndg_api_url}/api/forwards/?limit=1&chan_in_or_out={chan_id}&forward_date__gt={cutoff_date_str}"
-    result = {
-        "status": "stuck",  # Default to stuck
-        "reason": "unknown",
-        "checked_chan_id": chan_id,
-        "api_url": api_url,
-        "api_response_data": None,
-    }
 
-    try:
-        response = requests.get(api_url, auth=(username, password))
-        response.raise_for_status()
-        data = response.json()
-        result["api_response_data"] = data  # Store response data
+    latest_outbound_timestamp = None
 
-        if data.get("results") and len(data["results"]) > 0:
-            forward_event = data["results"][0]
-            if str(forward_event.get("chan_id_out")) == str(chan_id):
-                result["status"] = "active"
-                result["reason"] = (
-                    f"outbound_found ({forward_event.get('forward_date', 'N/A')})"
-                )
-            elif str(forward_event.get("chan_id_in")) == str(chan_id):
-                result["status"] = "stuck"  # Still stuck for outbound purposes
-                result["reason"] = (
-                    f"inbound_found ({forward_event.get('forward_date', 'N/A')})"
-                )
-            else:
-                result["status"] = "stuck"  # Should not happen with filter
-                result["reason"] = "match_error"
-        else:
-            result["status"] = "stuck"
-            result["reason"] = "none_found"
-
-    except requests.exceptions.RequestException as e:
-        logging.error(f"API Error checking fwd for {chan_id}: {e}")
-        result["status"] = "error"
-        result["reason"] = f"api_error: {e}"
-        result["api_response_data"] = str(e)
-    except Exception as e:
-        logging.error(f"Unexpected error checking fwd for {chan_id}: {e}")
-        result["status"] = "error"
-        result["reason"] = f"unexpected_error: {e}"
-        result["api_response_data"] = str(e)
-
-    return result
-
-
-def get_last_forwarding_timestamp_for_peer(
-    pubkey, channel_ids, stuck_time_period, config
-):
-    """
-    Checks peer stuck status based on outbound forwards in any channel.
-
-    Returns:
-        tuple: (overall_status: 'active'|'stuck'|'error', channel_details: list[dict])
-               overall_status is 'error' if any channel check resulted in error.
-    """
-    channel_details = []
-    overall_status = "stuck"  # Default to stuck
-    has_error = False
+    logging.debug(
+        f"Checking last outbound forward for peer {pubkey} across {len(channel_ids)} channels in last {days_to_check_back} days."
+    )
 
     for chan_id in channel_ids:
-        check_result = check_recent_outbound_forwarding(
-            pubkey, chan_id, stuck_time_period, config
-        )
-        channel_details.append(check_result)
-        if check_result["status"] == "active":
-            overall_status = (
-                "active"  # Finding one active channel makes the peer active
+        # Query LNDg API for forwards involving this specific channel, ordered by date descending.
+        # We look for the most recent forward involving this channel after the cutoff date.
+        api_url = f"{lndg_api_url}/api/forwards/?format=json&chan_in_or_out={chan_id}&forward_date__gt={cutoff_date_str}&ordering=-forward_date&limit=1"
+
+        logging.debug(f"Querying LNDg for channel {chan_id}: {api_url}")
+
+        try:
+            response = requests.get(api_url, auth=(username, password))
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get("results"):
+                most_recent_forward = data["results"][0]
+                forward_timestamp_str = most_recent_forward.get("forward_date")
+                chan_id_out = str(most_recent_forward.get("chan_id_out"))
+
+                if forward_timestamp_str and chan_id_out == str(chan_id):
+                    # Found an outbound forward for THIS channel.
+                    try:
+                        # Attempt parsing with microseconds first
+                        forward_timestamp = datetime.strptime(
+                            forward_timestamp_str, "%Y-%m-%dT%H:%M:%S.%f"
+                        )
+                    except ValueError:
+                        # Fallback if no microseconds
+                        forward_timestamp = datetime.strptime(
+                            forward_timestamp_str, "%Y-%m-%dT%H:%M:%S"
+                        )
+
+                    logging.debug(
+                        f"Found outbound forward for channel {chan_id} at {forward_timestamp_str}"
+                    )
+
+                    # Update the latest_outbound_timestamp if this one is more recent
+                    if (
+                        latest_outbound_timestamp is None
+                        or forward_timestamp > latest_outbound_timestamp
+                    ):
+                        latest_outbound_timestamp = forward_timestamp
+                        logging.debug(
+                            f"Updated latest_outbound_timestamp for peer {pubkey} to {latest_outbound_timestamp}"
+                        )
+
+                else:
+                    # Found a forward, but it was inbound for this channel, or missing data.
+                    logging.debug(
+                        f"Most recent forward for channel {chan_id} was inbound or incomplete data."
+                    )
+
+            else:
+                # No forwards found for this channel within the window.
+                logging.debug(
+                    f"No forwards found for channel {chan_id} in last {days_to_check_back} days."
+                )
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"API Error checking forward for channel {chan_id}: {e}")
+            # Continue to the next channel on error, don't fail the whole peer check
+
+        except Exception as e:
+            logging.error(
+                f"Unexpected error processing forward for channel {chan_id}: {e}"
             )
-        elif check_result["status"] == "error":
-            has_error = True
+            # Continue to the next channel on error
 
-    # If we found an active channel, status is active, otherwise it remains stuck,
-    # unless an error occurred during checks.
-    if has_error:
-        overall_status = "error"
-    elif overall_status == "stuck":
-        # If no channel was active and no errors, the peer is definitively stuck
-        pass  # overall_status is already 'stuck'
-    # else: overall_status is 'active'
-
-    return overall_status, channel_details
+    # After checking all channels, return the single latest outbound timestamp found for the peer.
+    return latest_outbound_timestamp
 
 
 def calculate_stuck_channel_band_adjustment(
-    fee_conditions, channel_data, chan_id, config, is_peer_stuck
+    fee_conditions,
+    channel_data,  # Used for liquidity check
+    last_forward_timestamp,  # New parameter: datetime of last outbound forward (or None)
+    stuck_time_period,  # New parameter: the configured stuck period in days
 ):
     """
-    Calculate the band adjustment based on whether the peer is considered stuck.
+    Calculate the number of bands to move down based on how long the peer
+    has been stuck, applying incremental adjustment per stuck_time_period.
 
     Args:
-        fee_conditions: Dictionary containing stuck channel settings
-        channel_data: Data about the channel (used for liquidity check)
-        chan_id: Channel ID (for logging/context)
-        config: Configuration containing LNDg API credentials
-        is_peer_stuck: Boolean indicating if the peer (any channel) is stuck
+        fee_conditions: Dictionary containing stuck channel settings.
+        channel_data: Data about the channel (used for liquidity check).
+        last_forward_timestamp: datetime object of the last outbound forward, or None.
+        stuck_time_period: The configured stuck time period in days.
 
     Returns:
-        Number of bands to move down (typically 4 if stuck, 0 otherwise)
+        tuple: (bands_to_move_down: int, days_stuck: int)
+               bands_to_move_down is the calculated number of bands (0-4).
+               days_stuck is the number of days since the last forward.
     """
-    # Check if stuck channel adjustment is enabled globally in the config
     stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
     if not stuck_settings.get("enabled", False):
-        print(f"DEBUG: Stuck adjustment disabled for chan_id={chan_id}")
-        return 0  # No adjustment if disabled
+        return 0, 0  # Return 0 bands down and 0 days stuck if disabled
 
     # Skip stuck channel adjustment if local liquidity is too low (below 20%)
     capacity = channel_data.get("capacity", 0)
     local_balance = channel_data.get("local_balance", 0)
-    if capacity > 0:
-        local_ratio = local_balance / capacity
-        if local_ratio < 0.2:  # Less than 20% local liquidity
-            print(
-                f"DEBUG: Stuck adjustment skipped for chan_id={chan_id} due to low local liquidity ({local_ratio*100:.1f}%)"
-            )
-            return 0  # Skip adjustment
+    outbound_ratio = (local_balance / capacity) if capacity > 0 else 0
 
-    # If the peer is determined to be stuck (no recent outbound forwards on any channel)
-    if is_peer_stuck:
-        print(
-            f"DEBUG: Applying max stuck adjustment (4 bands) for chan_id={chan_id} because peer is stuck."
-        )
-        return 1  # Apply 1 band discount adjustment (band -1)
+    if outbound_ratio < 0.2:  # Less than 20% local liquidity
+        # If liquidity is low, we might still want to know days stuck for logging/notes
+        if last_forward_timestamp is None:
+            days_stuck = 365  # Indicate long stuck if no timestamp
+        else:
+            days_stuck = (datetime.now() - last_forward_timestamp).days
+        return 0, days_stuck  # Return 0 bands down if liquidity is low
+
+    if last_forward_timestamp is None:
+        # No outbound forward ever found within the checked period (e.g., 365 days)
+        # Treat as very stuck, max bands down
+        days_stuck = 365  # Represent 'very stuck'
+        calculated_bands_to_move_down = 4  # Apply max bands down
     else:
-        # Peer is not stuck (had recent outbound forwarding)
-        print(
-            f"DEBUG: No stuck adjustment needed for chan_id={chan_id} because peer is active."
-        )
-        return 0
+        time_difference = datetime.now() - last_forward_timestamp
+        days_stuck = time_difference.days
+
+        # Calculate bands to move down: 1 band per stuck_time_period interval
+        # Use integer division to count how many full periods have passed
+        # e.g., if stuck_period is 7:
+        # days_stuck 0-6 -> 0 bands down
+        # days_stuck 7-13 -> 1 band down
+        # days_stuck 14-20 -> 2 bands down
+        # etc.
+        calculated_bands_to_move_down = days_stuck // stuck_time_period
+
+    # Cap the total bands moved down at 4 (as Band 4 is the furthest premium band)
+    # Moving 4 bands down from Band 4 (0-20% liq) effectively gets us to Band 0 (max discount).
+    bands_to_move_down = min(calculated_bands_to_move_down, 4)  # Cap at 4 bands down
+
+    logging.debug(
+        f"Stuck calculation: days_stuck={days_stuck}, stuck_period={stuck_time_period}, calculated_bands={calculated_bands_to_move_down}, final_bands_to_move_down={bands_to_move_down}"
+    )
+
+    return bands_to_move_down, days_stuck
 
 
 def calculate_fee_band_adjustment(
-    fee_conditions, outbound_ratio, stuck_band_adjustment=0
+    fee_conditions,
+    outbound_ratio,
+    stuck_bands_to_move_down=0,  # New parameter: Number of bands to move down due to stuck status
 ):
     """
-    Calculate fee adjustment based on outbound liquidity ratio bands.
-
-    Divides the outbound liquidity into 5 percentile bands and applies a
-    graduated adjustment between the discount (high local balance) and
-    premium (low local balance).
-
-    Bands:
-    - Band 0 (80-100% local): max discount
-    - Band 1 (60-80% local): partial discount
-    - Band 2 (40-60% local): neutral adjustment
-    - Band 3 (20-40% local): max premium (capped)
-    - Band 4 (0-20% local): max premium (same as band 3)
+    Calculate fee adjustment based on outbound liquidity ratio bands, applying
+    an additional adjustment based on how many bands to move down due to stuck status.
 
     Args:
-        fee_conditions: Dictionary containing fee band settings
-        outbound_ratio: Ratio of local balance to total capacity (0.0 to 1.0)
-        stuck_band_adjustment: Number of bands to move down due to stuck channel (0-4)
+        fee_conditions: Dictionary containing fee band settings.
+        outbound_ratio: Ratio of local balance to total capacity (0.0 to 1.0).
+        stuck_bands_to_move_down: Number of bands to move down due to stuck channel (0-4).
 
     Returns:
-        Adjustment factor to be applied to the fee (multiplicative)
+        tuple: (adjustment_factor: float, initial_raw_band: int, final_raw_band: int)
+               adjustment_factor is the multiplicative factor to apply to the fee.
+               initial_raw_band is the band based on liquidity before stuck adjustment.
+               final_raw_band is the band after applying stuck adjustment (used for calc).
     """
     # Check if fee bands are enabled
     if not fee_conditions.get("fee_bands", {}).get("enabled", False):
-        return 1.0  # No adjustment
+        # Return 1.0, 0, 0 if disabled (bands don't apply)
+        return 1.0, 0, 0
 
     # Get fee band parameters
     fee_bands = fee_conditions.get("fee_bands", {})
     discount = fee_bands.get("discount", 0)
     premium = fee_bands.get("premium", 0)
 
-    # Calculate the range between discount and premium
+    # Calculate the initial band based on current liquidity (0-4)
+    # Band 0 (80-100% local) -> index 0
+    # Band 1 (60-80% local) -> index 1
+    # Band 2 (40-60% local) -> index 2
+    # Band 3 (20-40% local) -> index 3
+    # Band 4 (0-20% local) -> index 4
+    initial_raw_band = min(4, max(0, int((1 - outbound_ratio) * 5)))
+
+    # Apply stuck channel adjustment: move down bands towards Band 0 (max discount)
+    # Cap the resulting band index at 0 (cannot move below Band 0).
+    adjusted_raw_band = max(0, initial_raw_band - stuck_bands_to_move_down)
+
+    # Map bands 3 and 4 to have the same premium level for fee calculation
+    # The calculation is based on the adjusted_raw_band.
+    effective_band_for_calc = min(
+        3, adjusted_raw_band
+    )  # Cap calculation basis at band 3
+
+    # Calculate the adjustment percentage: linearly interpolate between discount (band 0)
+    # and premium (band 3).
     adjustment_range = premium - discount
+    if adjustment_range == 0:
+        adjustment = discount  # Or 0, since premium == discount
+    else:
+        # Calculate adjustment percentage based on the effective band (0-3)
+        adjustment_per_band_step = adjustment_range / 3.0
+        adjustment = discount + effective_band_for_calc * adjustment_per_band_step
 
-    # Calculate which band the current outbound ratio falls into (5 bands)
-    raw_band = min(4, max(0, int((1 - outbound_ratio) * 5)))
-
-    # Apply stuck channel adjustment (move down bands)
-    raw_band = max(0, raw_band - stuck_band_adjustment)
-
-    # Map bands 3 and 4 to have the same premium level
-    # This ensures 0-20% and 20-40% liquidity have the same fee
-    effective_band = min(
-        3, raw_band
-    )  # Cap at band 3 (premium maxes out at 40% liquidity)
-
-    # Calculate the adjustment as a percentage between discount and premium
-    # Now using effective_band instead of raw_band for adjustment calculation
-    adjustment = discount + (effective_band / 3) * adjustment_range
-
-    # Return the multiplicative factor
-    return 1 + adjustment, raw_band
+    # Return the multiplicative factor and the initial/final bands for printing/notes
+    return 1 + adjustment, initial_raw_band, adjusted_raw_band
 
 
 def calculate_new_fee_rate(
@@ -436,10 +444,11 @@ def calculate_new_fee_rate(
     if outbound_ratio is not None:
         fee_band_result = calculate_fee_band_adjustment(fee_conditions, outbound_ratio)
         if isinstance(fee_band_result, tuple):
-            fee_band_factor, _ = fee_band_result
+            fee_band_factor, initial_raw_band, final_raw_band = fee_band_result
+            basic_fee_rate = basic_fee_rate * fee_band_factor
         else:
             fee_band_factor = fee_band_result
-        basic_fee_rate = basic_fee_rate * fee_band_factor
+            basic_fee_rate = basic_fee_rate * fee_band_factor
 
     # Cap at max and round
     new_fee_rate = min(basic_fee_rate, max_cap)
@@ -557,14 +566,16 @@ def update_channel_notes(
     alias,
     group_name,
     fee_base,
-    fee_conditions,
+    fee_conditions,  # Keep fee_conditions to access stuck settings
     outbound_ratio,
-    raw_band,
-    fee_band_factor,
+    initial_raw_band,  # Pass initial raw band for notes clarity
+    fee_band_factor,  # Pass the factor if needed for debug in notes (optional)
     config,
     node_definitions,
-    new_fee_rate=None,  # Add as optional parameter with default None
-    stuck_band_adjustment=0,  # Add with default value 0
+    new_fee_rate=None,
+    stuck_bands_to_move_down=0,  # Renamed parameter
+    days_stuck=None,  # New parameter: days since last forward
+    is_low_liquidity_for_stuck=False,  # New parameter: flag if low liquidity skipped
 ):
     """Update the channel notes in LNDg with fee adjuster information."""
     update_channel_notes_enabled = node_definitions.get("update_channel_notes", False)
@@ -577,42 +588,64 @@ def update_channel_notes(
     username = config["credentials"]["lndg_username"]
     password = config["credentials"]["lndg_password"]
 
-    # Log the API URL we're using
-    logging.debug(f"LNDg API URL for note updates: {lndg_api_url}")
-
     # Build the notes text
     notes = f"🔋 Group: {group_name if group_name else 'None'} | Base: {fee_base}"
 
     # Add fee bands info in a condensed format
     fee_bands = fee_conditions.get("fee_bands", {})
-    if fee_bands.get("enabled", False):
+    fee_band_enabled = fee_bands.get("enabled", False)
+    if fee_band_enabled:
         discount = fee_bands.get("discount", 0)
         premium = fee_bands.get("premium", 0)
 
-        band_names = [
-            "Max Discount",
-            "High Discount",
-            "Neutral",
-            "Max Premium",
-            "Max Premium",
-        ]
-        effective_band = min(3, raw_band)
-        actual_adjustment = discount + (effective_band / 3) * (premium - discount)
+        # Calculate the effective adjustment percentage based on the final band
+        adjustment_range = premium - discount
+        # Recalculate adjusted band based on initial and stuck_bands_to_move_down
+        adjusted_raw_band = max(0, initial_raw_band - stuck_bands_to_move_down)
+        effective_band_for_calc = min(3, adjusted_raw_band)
+        if adjustment_range == 0:
+            actual_adjustment = discount
+        else:
+            adjustment_per_band_step = adjustment_range / 3.0
+            actual_adjustment = (
+                discount + effective_band_for_calc * adjustment_per_band_step
+            )
 
-        notes += f"\nCurrent: {band_names[raw_band]} | Adjustment: {actual_adjustment*100:.1f}%"
+        notes += f"\nCurrent Adj: {actual_adjustment*100:.1f}%"
         notes += f"\nBands: ✅ | Disc: {discount*100:.0f}% | Prem: {premium*100:.0f}% | Bal: {outbound_ratio*100:.0f}%"
+        # Add initial and final band info to notes
+        band_names_short = [
+            "D+",
+            "D",
+            "N",
+            "P",
+            "P+",
+        ]  # MaxDisc, HighDisc, Neutral, Prem, MaxPrem
+        notes += f" | Initial Band: {band_names_short[initial_raw_band]} | Final Band: {band_names_short[adjusted_raw_band]}"  # Use adjusted_raw_band for final position
+
     else:
         notes += f"\nFee Bands: Disabled"
 
     # Add fee rate info if available
-    if new_fee_rate is not None:  # Changed to check parameter instead of locals()
+    if new_fee_rate is not None:
         notes += f"\nCurrent Rate: {new_fee_rate} ppm"
 
     # Add stuck channel info if applicable
     stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
     if stuck_settings.get("enabled", False):
         stuck_period = stuck_settings.get("stuck_time_period", 7)
-        notes += f"\nStuck adjust: {'✅' if stuck_band_adjustment > 0 else '❌'} | Period: {stuck_period}d"
+        stuck_notes_part = (
+            f"\nStuck adjust: {'✅' if stuck_bands_to_move_down > 0 else '❌'}"
+        )
+        stuck_notes_part += f" | Period: {stuck_period}d"
+        if days_stuck is not None:
+            stuck_notes_part += f" | Stuck: {days_stuck}d"
+        if is_low_liquidity_for_stuck:
+            stuck_notes_part += " (Low Liq Skip)"
+        if stuck_bands_to_move_down > 0:
+            stuck_notes_part += f" | Bands Down: {stuck_bands_to_move_down}"
+
+        notes += stuck_notes_part
 
     # Log the notes we're going to send
     logging.debug(f"Channel {chan_id} notes to update: {notes}")
@@ -662,10 +695,10 @@ def print_fee_adjustment(
     trend_sensitivity,
     trend_adjust_pct,
     rate_after_trend,
-    fee_band_factor,
-    rate_after_fee_band,
+    fee_band_factor,  # Pass the factor calculated by calculate_fee_band_adjustment
+    rate_after_fee_band,  # The rate after applying fee band factor
     max_cap,
-    rate_before_rounding,  # rate_after_fee_band capped
+    rate_before_rounding,  # rate_after_fee_band capped at max_cap
     final_rate,  # The actual applied rate (new_fee_rate)
     # Context
     group_name,
@@ -674,15 +707,16 @@ def print_fee_adjustment(
     fee_band_enabled,
     fee_band_discount,
     fee_band_premium,
-    initial_raw_band,
-    stuck_adj_bands_applied,
-    final_raw_band,
-    fee_band_adj_pct,
-    # Stuck Context
+    initial_raw_band,  # Initial band based on liquidity
+    stuck_adj_bands_applied,  # How many bands were moved down due to stuck status
+    final_raw_band,  # Final band used for adjustment calculation
+    fee_band_adj_pct,  # The resulting percentage adjustment from fee bands + stuck
+    # Stuck Context # Add these new parameters
     stuck_adj_enabled,
     stuck_period,
-    peer_stuck_status,
-    is_low_liquidity_for_stuck,
+    peer_stuck_status,  # Now a detailed status string
+    is_low_liquidity_for_stuck,  # Flag indicating if low liquidity skipped adjustment
+    days_stuck,  # Days since last outbound forward
     # Amboss Data
     amboss_data,
 ):
@@ -750,14 +784,21 @@ def print_fee_adjustment(
         print(
             f"    - Initial Band (Liquidity {outbound_ratio*100:.1f}%): {band_names[initial_raw_band]}"
         )
-        print(f"    - Stuck Adjustment Applied: -{stuck_adj_bands_applied} bands")
-        print(f"    - Final Band Used for Calc: {band_names[final_raw_band]}")
+        if stuck_adj_enabled:  # Only show stuck band adjustment if stuck is enabled
+            print(f"    - Stuck Adjustment Applied: -{stuck_adj_bands_applied} bands")
+            print(f"    - Final Band Used for Calc: {band_names[final_raw_band]}")
+        else:
+            print(
+                f"    - Final Band Used for Calc: {band_names[final_raw_band]} (No Stuck Adj)"
+            )
+
         print(f"    - Resulting Adjustment: {fee_band_adj_pct*100:+.1f}%")
 
     print(f"  Stuck Adjustment: {'Enabled' if stuck_adj_enabled else 'Disabled'}")
     if stuck_adj_enabled:
         print(f"    - Period: {stuck_period} days")
-        print(f"    - Peer Status: {peer_stuck_status}")
+        print(f"    - Days Stuck: {days_stuck} days")  # Print actual days stuck
+        print(f"    - Peer Status: {peer_stuck_status}")  # Print detailed status
         if is_low_liquidity_for_stuck:
             print(
                 f"    - Adjustment Skipped: Low Liquidity ({outbound_ratio*100:.1f}% < 20%)"
@@ -765,9 +806,9 @@ def print_fee_adjustment(
         elif stuck_adj_bands_applied > 0:
             print(f"    - Adjustment Applied: {stuck_adj_bands_applied} bands down")
         else:
-            print(f"    - Adjustment Applied: 0 bands (Peer Active)")
-
-    # print(f"  Full Fee Conditions: {json.dumps(fee_conditions)}") # Keep optional?
+            # This case means stuck is enabled, not low liquidity, but 0 bands applied.
+            # This happens if days_stuck < stuck_period.
+            print(f"    - Adjustment Applied: 0 bands (Days stuck < Period)")
 
     # --- Amboss Table ---
     print("\n--- Amboss Peer Fee Data (Remote Perspective) ---")
@@ -865,6 +906,9 @@ def main():
             stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
             stuck_adj_enabled = stuck_settings.get("enabled", False)
             stuck_period = stuck_settings.get("stuck_time_period", 7)
+            stuck_check_window_days = (
+                365  # Define the maximum window to check for stuck status
+            )
 
             fee_bands_settings = fee_conditions.get("fee_bands", {})
             fee_band_enabled = fee_bands_settings.get("enabled", False)
@@ -930,55 +974,97 @@ def main():
                         print()
                     continue  # Skip this entire peer
 
-                # --- Stuck Check ---
-                peer_stuck_status = "not_applicable"  # If disabled
-                channel_check_details = []
-                is_peer_stuck = False
+                # --- Stuck Check & Adjustment Calculation ---
+                stuck_bands_to_move_down = 0
+                days_stuck = 0  # Initialize days stuck
+                last_forward_timestamp = None  # Initialize last forward timestamp
+
+                is_low_liquidity_for_stuck = (
+                    check_ratio < 0.2
+                )  # Check liquidity for stuck skip
+
+                peer_stuck_status = "N/A (Disabled)"  # Default status for printing
+
                 if stuck_adj_enabled:
-                    peer_stuck_status, channel_check_details = (
-                        get_last_forwarding_timestamp_for_peer(
-                            pubkey, channel_ids_list, stuck_period, config
-                        )
+                    peer_stuck_status = "Checking..."
+                    # First, check within the configured stuck_period for efficiency
+                    last_forward_short_check = get_last_peer_forwarding_timestamp(
+                        pubkey, stuck_period, channel_ids_list, config
                     )
-                    if peer_stuck_status == "error":
-                        logging.warning(
-                            f"Error checking stuck status for {pubkey}, treating as stuck."
+
+                    if last_forward_short_check is not None:
+                        # Peer is active within the stuck period
+                        stuck_bands_to_move_down = 0
+                        last_forward_timestamp = last_forward_short_check
+                        time_since_last_fwd = datetime.now() - last_forward_short_check
+                        days_stuck = time_since_last_fwd.days
+                        peer_stuck_status = "Active"
+                        logging.debug(
+                            f"Peer {pubkey} active within {stuck_period} days ({days_stuck} days since last fwd). No stuck adjustment."
                         )
-                        is_peer_stuck = True
+                    elif is_low_liquidity_for_stuck:
+                        # Peer is stuck (no forwards in stuck_period) but liquidity is low.
+                        # Get actual days stuck for reporting if possible, but skip adjustment.
+                        peer_stuck_status = "Stuck (Low Liquidity Skip)"
+                        logging.debug(
+                            f"Peer {pubkey} stuck but low liquidity ({check_ratio*100:.1f}%). Skipping stuck adjustment."
+                        )
+
+                        # Check longer window to get actual days stuck for printing/notes
+                        last_forward_long_check = get_last_peer_forwarding_timestamp(
+                            pubkey, stuck_check_window_days, channel_ids_list, config
+                        )
+                        last_forward_timestamp = (
+                            last_forward_long_check  # Store for notes/printing
+                        )
+                        if last_forward_long_check is None:
+                            days_stuck = (
+                                stuck_check_window_days + 1
+                            )  # Indicate stuck for >= window
+                        else:
+                            time_since_last_fwd_long = (
+                                datetime.now() - last_forward_long_check
+                            )
+                            days_stuck = time_since_last_fwd_long.days
+
                     else:
-                        is_peer_stuck = peer_stuck_status == "stuck"
+                        # Peer is stuck (no forwards in stuck_period) and liquidity is not low.
+                        # Need to find the actual last forward timestamp from a longer window.
+                        peer_stuck_status = "Stuck (Calculating Bands)"
+                        logging.debug(
+                            f"Peer {pubkey} stuck and not low liquidity. Checking longer window ({stuck_check_window_days} days)."
+                        )
+                        last_forward_long_check = get_last_peer_forwarding_timestamp(
+                            pubkey, stuck_check_window_days, channel_ids_list, config
+                        )
+                        last_forward_timestamp = (
+                            last_forward_long_check  # Store for notes/printing
+                        )
+
+                        # Calculate the number of bands to move down based on the long check result
+                        bands_calc_result = calculate_stuck_channel_band_adjustment(
+                            fee_conditions,
+                            first_channel_data,  # Pass channel_data for liquidity check inside func
+                            last_forward_long_check,  # Use the timestamp from the longer check
+                            stuck_period,
+                        )
+                        stuck_bands_to_move_down, days_stuck = (
+                            bands_calc_result  # Unpack the two values
+                        )
+
+                        peer_stuck_status = f"Stuck ({days_stuck} days stuck, {stuck_bands_to_move_down} bands down)"
+                        logging.debug(
+                            f"Peer {pubkey}: Stuck adjustment calculated: {stuck_bands_to_move_down} bands down."
+                        )
 
                 # --- Calculate Adjustments ---
-                potential_stuck_adjustment_bands = 0
-                is_low_liquidity_for_stuck = check_ratio < 0.2
-                if (
-                    stuck_adj_enabled
-                    and is_peer_stuck
-                    and not is_low_liquidity_for_stuck
-                ):
-                    potential_stuck_adjustment_bands = 1  # Apply one discount band
-
-                fee_band_factor = 1.0
-                initial_raw_band = 0
-                final_raw_band = 0
-                fee_band_adj_pct = 0.0
-                if fee_band_enabled:
-                    initial_raw_band = min(4, max(0, int((1 - check_ratio) * 5)))
-                    fee_band_result = calculate_fee_band_adjustment(
-                        fee_conditions, check_ratio, potential_stuck_adjustment_bands
-                    )
-                    # Unpack only if fee bands are enabled
-                    if isinstance(fee_band_result, tuple):  # ADDED check for tuple type
-                        fee_band_factor, final_raw_band = fee_band_result
-                    else:  # If fee bands are disabled, fee_band_result is a float
-                        fee_band_factor = fee_band_result  # Should be 1.0
-                        final_raw_band = (
-                            0  # Initialize as it won't be used in this case
-                        )
-
-                    fee_band_adj_pct = (
-                        fee_band_factor - 1.0
-                    )  # Get the percentage adjustment
+                # Call calculate_fee_band_adjustment with the determined stuck_bands_to_move_down
+                # It now returns factor, initial_raw_band, final_raw_band
+                fee_band_result = calculate_fee_band_adjustment(
+                    fee_conditions, check_ratio, stuck_bands_to_move_down
+                )
+                fee_band_factor, initial_raw_band, final_raw_band = fee_band_result
+                fee_band_adj_pct = fee_band_factor - 1.0
 
                 # --- Waterfall Calculation ---
                 base_fee = float(all_amboss_data.get("TODAY", {}).get(fee_base, 0))
@@ -1000,7 +1086,7 @@ def main():
 
                 # --- Apply Updates & Notes ---
                 updated_any_channel = False
-                # ... (loops for update_lndg_fee and update_channel_notes using final_rate and potential_stuck_adjustment_bands) ...
+                # Loop through channels to apply updates and notes
                 for chan_id, channel_data in channels_to_modify.items():
                     # Apply update if delta is sufficient
                     fee_delta = abs(final_rate - channel_data["local_fee_rate"])
@@ -1012,7 +1098,7 @@ def main():
                             logging.error(
                                 f"Failed LNDg update for {chan_id}: {api_err}"
                             )
-                            continue
+                            continue  # Continue to the next channel for notes update
 
                     # Update notes regardless of fee change if enabled
                     update_channel_notes_enabled = node_definitions.get(
@@ -1020,19 +1106,22 @@ def main():
                     )
                     if update_channel_notes_enabled:
                         try:
+                            # Pass all relevant stuck info to update_channel_notes
                             update_channel_notes(
                                 chan_id,
                                 channel_data["alias"],
                                 group_name,
                                 fee_base,
-                                fee_conditions,
+                                fee_conditions,  # Pass full fee_conditions
                                 check_ratio,  # Use aggregate ratio for notes
-                                final_raw_band,  # Pass final band after stuck adjust
-                                fee_band_factor,
+                                initial_raw_band,  # Pass initial raw band
+                                fee_band_factor,  # Pass fee band factor for debug in notes function if needed
                                 config,
                                 node_definitions,
-                                final_rate,
-                                potential_stuck_adjustment_bands,  # Pass stuck bands applied
+                                final_rate,  # Pass the final calculated fee rate
+                                stuck_bands_to_move_down,  # Pass the calculated stuck bands applied
+                                days_stuck,  # Pass the calculated days stuck
+                                is_low_liquidity_for_stuck,  # Pass the low liquidity flag for notes
                             )
                         except Exception as note_err:
                             logging.error(
@@ -1044,7 +1133,9 @@ def main():
                     if terminal_output_enabled:
                         print_fee_adjustment(
                             # Basic Info
-                            alias=first_channel_data["alias"],
+                            alias=first_channel_data.get(
+                                "alias", pubkey[:8]
+                            ),  # Use first alias, fallback to pubkey
                             pubkey=pubkey,
                             channel_ids_list=channel_ids_list,
                             is_aggregated=(num_channels > 1),
@@ -1063,8 +1154,8 @@ def main():
                             trend_sensitivity=trend_sensitivity,
                             trend_adjust_pct=trend_adjust_pct,
                             rate_after_trend=rate_after_trend,
-                            fee_band_factor=fee_band_factor,
-                            rate_after_fee_band=rate_after_fee_band,  # Pass fee_band_factor instead of adj_pct here
+                            fee_band_factor=fee_band_factor,  # Pass fee_band_factor here
+                            rate_after_fee_band=rate_after_fee_band,  # Pass rate_after_fee_band here
                             max_cap=max_cap,
                             rate_before_rounding=rate_before_rounding,
                             final_rate=final_rate,
@@ -1075,47 +1166,20 @@ def main():
                             fee_band_enabled=fee_band_enabled,
                             fee_band_discount=fee_band_discount,
                             fee_band_premium=fee_band_premium,
-                            initial_raw_band=initial_raw_band,
-                            stuck_adj_bands_applied=potential_stuck_adjustment_bands,
-                            final_raw_band=final_raw_band,
-                            fee_band_adj_pct=fee_band_adj_pct,
+                            initial_raw_band=initial_raw_band,  # Pass initial raw band
+                            stuck_adj_bands_applied=stuck_bands_to_move_down,  # Pass stuck bands applied
+                            final_raw_band=final_raw_band,  # Pass final raw band used for calc
+                            fee_band_adj_pct=fee_band_adj_pct,  # Pass fee band adj pct
                             # Stuck Context
                             stuck_adj_enabled=stuck_adj_enabled,
                             stuck_period=stuck_period,
-                            peer_stuck_status=peer_stuck_status,
-                            is_low_liquidity_for_stuck=is_low_liquidity_for_stuck,
+                            peer_stuck_status=peer_stuck_status,  # Pass the status string
+                            is_low_liquidity_for_stuck=is_low_liquidity_for_stuck,  # Pass low liquidity flag
+                            days_stuck=days_stuck,  # Pass days stuck
                             # Amboss Data
                             amboss_data=all_amboss_data,
                         )
-                        sys.stdout.flush()  # Flush main block
-
-                    # Conditional Debug Output
-                    if (
-                        show_debug_output and stuck_adj_enabled
-                    ):  # Check debug flag and if stuck adj is enabled
-                        print(f"\n--- Stuck Check Debug for Peer {pubkey[:10]}... ---")
-                        # ... (debug printing logic as before) ...
-                        for detail in channel_check_details:
-                            short_api_url = detail["api_url"].split("?")[0] + "?..."
-                            print(
-                                f"  ChanID: {detail['checked_chan_id']} -> Status: {detail['status']}, Reason: {detail['reason']} (API: {short_api_url})"
-                            )
-                        print(f"  Overall Peer Status: {peer_stuck_status}")
-                        if is_peer_stuck:
-                            adj_reason = (
-                                f"Applying {potential_stuck_adjustment_bands} bands (Liquidity {check_ratio*100:.1f}% >= 20%)"
-                                if potential_stuck_adjustment_bands > 0
-                                else f"Skipped (Liquidity {check_ratio*100:.1f}% < 20%)"
-                            )
-                            print(f"  Potential Stuck Adjustment: {adj_reason}")
-                        else:
-                            print(
-                                f"  Potential Stuck Adjustment: 0 bands (Peer Active)"
-                            )
-                        print(
-                            f"--- End Stuck Check Debug for Peer {pubkey[:10]}... ---"
-                        )
-                        sys.stdout.flush()  # Flush debug block
+                        sys.stdout.flush()  # Ensure output is shown immediately
 
                 # Write to charge-lnd file once per peer if enabled and any channel updated
                 if write_charge_lnd_file_enabled and updated_any_channel:
