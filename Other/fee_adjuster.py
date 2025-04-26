@@ -223,6 +223,7 @@ def get_last_peer_forwarding_timestamp(pubkey, days_to_check_back, channel_ids, 
         # We look for the most recent forward involving this channel after the cutoff date.
         api_url = f"{lndg_api_url}/api/forwards/?format=json&chan_in_or_out={chan_id}&forward_date__gt={cutoff_date_str}&ordering=-forward_date&limit=1"
 
+        # Use logging.debug for per-channel check details, which are only visible with --debug
         logging.debug(f"Querying LNDg for channel {chan_id}: {api_url}")
 
         try:
@@ -234,6 +235,9 @@ def get_last_peer_forwarding_timestamp(pubkey, days_to_check_back, channel_ids, 
                 most_recent_forward = data["results"][0]
                 forward_timestamp_str = most_recent_forward.get("forward_date")
                 chan_id_out = str(most_recent_forward.get("chan_id_out"))
+                forward_id = most_recent_forward.get(
+                    "id", "N/A"
+                )  # Get forward ID for debug
 
                 if forward_timestamp_str and chan_id_out == str(chan_id):
                     # Found an outbound forward for THIS channel.
@@ -249,7 +253,7 @@ def get_last_peer_forwarding_timestamp(pubkey, days_to_check_back, channel_ids, 
                         )
 
                     logging.debug(
-                        f"Found outbound forward for channel {chan_id} at {forward_timestamp_str}"
+                        f"  [Chan {chan_id}] Found outbound fwd (ID: {forward_id}) at {forward_timestamp_str}"
                     )
 
                     # Update the latest_outbound_timestamp if this one is more recent
@@ -259,40 +263,42 @@ def get_last_peer_forwarding_timestamp(pubkey, days_to_check_back, channel_ids, 
                     ):
                         latest_outbound_timestamp = forward_timestamp
                         logging.debug(
-                            f"Updated latest_outbound_timestamp for peer {pubkey} to {latest_outbound_timestamp}"
+                            f"  [Peer {pubkey[:8]}] Updated latest overall outbound timestamp to {latest_outbound_timestamp}"
                         )
 
                 else:
                     # Found a forward, but it was inbound for this channel, or missing data.
                     logging.debug(
-                        f"Most recent forward for channel {chan_id} was inbound or incomplete data."
+                        f"  [Chan {chan_id}] Most recent fwd (ID: {forward_id}) was inbound or incomplete data."
                     )
 
             else:
                 # No forwards found for this channel within the window.
                 logging.debug(
-                    f"No forwards found for channel {chan_id} in last {days_to_check_back} days."
+                    f"  [Chan {chan_id}] No forwards found in last {days_to_check_back} days."
                 )
 
         except requests.exceptions.RequestException as e:
-            logging.error(f"API Error checking forward for channel {chan_id}: {e}")
+            logging.error(f"  [Chan {chan_id}] API Error checking forward: {e}")
             # Continue to the next channel on error, don't fail the whole peer check
 
         except Exception as e:
             logging.error(
-                f"Unexpected error processing forward for channel {chan_id}: {e}"
+                f"  [Chan {chan_id}] Unexpected error processing forward: {e}"
             )
             # Continue to the next channel on error
 
     # After checking all channels, return the single latest outbound timestamp found for the peer.
+    # Add final debug log for the overall result for the peer
     return latest_outbound_timestamp
 
 
 def calculate_stuck_channel_band_adjustment(
     fee_conditions,
     channel_data,  # Used for liquidity check
-    last_forward_timestamp,  # New parameter: datetime of last outbound forward (or None)
-    stuck_time_period,  # New parameter: the configured stuck period in days
+    last_forward_timestamp,  # datetime of last outbound forward (or None)
+    stuck_time_period,  # configured stuck period in days
+    checked_window_days,  # New parameter: The number of days checked back by the API call
 ):
     """
     Calculate the number of bands to move down based on how long the peer
@@ -303,15 +309,18 @@ def calculate_stuck_channel_band_adjustment(
         channel_data: Data about the channel (used for liquidity check).
         last_forward_timestamp: datetime object of the last outbound forward, or None.
         stuck_time_period: The configured stuck time period in days.
+        checked_window_days: The number of days the API checked back for forwards.
 
     Returns:
         tuple: (bands_to_move_down: int, days_stuck: int)
                bands_to_move_down is the calculated number of bands (0-4).
-               days_stuck is the number of days since the last forward.
+               days_stuck is the number of days since the last forward, or
+               checked_window_days + 1 if no forward was found in the window.
     """
     stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
     if not stuck_settings.get("enabled", False):
-        return 0, 0  # Return 0 bands down and 0 days stuck if disabled
+        # If disabled, days_stuck can be represented as 0 or None, let's use 0 for simplicity
+        return 0, 0
 
     # Skip stuck channel adjustment if local liquidity is too low (below 20%)
     capacity = channel_data.get("capacity", 0)
@@ -319,37 +328,47 @@ def calculate_stuck_channel_band_adjustment(
     outbound_ratio = (local_balance / capacity) if capacity > 0 else 0
 
     if outbound_ratio < 0.2:  # Less than 20% local liquidity
-        # If liquidity is low, we might still want to know days stuck for logging/notes
+        # If liquidity is low, calculate days stuck for logging/notes if timestamp is available,
+        # otherwise indicate it's beyond the checked window.
         if last_forward_timestamp is None:
-            days_stuck = 365  # Indicate long stuck if no timestamp
+            # No forward in the window, and low liquidity skips adjustment
+            days_stuck = checked_window_days + 1  # Indicate beyond the window
         else:
+            # Forward found, but low liquidity skips adjustment
             days_stuck = (datetime.now() - last_forward_timestamp).days
+
         return 0, days_stuck  # Return 0 bands down if liquidity is low
 
     if last_forward_timestamp is None:
-        # No outbound forward ever found within the checked period (e.g., 365 days)
-        # Treat as very stuck, max bands down
-        days_stuck = 365  # Represent 'very stuck'
-        calculated_bands_to_move_down = 4  # Apply max bands down
+        # No outbound forward found within the checked_window_days.
+        # Calculate bands based on the minimum possible stuck duration beyond the window,
+        # and represent days stuck as beyond the window.
+        days_stuck = checked_window_days + 1  # Indicate beyond the window
+
+        # Since no forward was found in the window, the channel is stuck for at least checked_window_days.
+        # Calculate how many stuck_time_period intervals fit into checked_window_days.
+        calculated_bands_to_move_down = checked_window_days // stuck_time_period
+        # If checked_window_days is exactly a multiple, it means it's stuck for that many periods.
+        # If it's more, it's stuck for more periods. We add 1 to ensure we count the *start*
+        # of the interval just passed.
+        # Example: stuck_period=7, checked_window=12. days_stuck would be 13.
+        # calculated_bands_to_move_down = 12 // 7 = 1. This is correct for days 7-13.
+        # If checked_window=14, days_stuck would be 15. 14 // 7 = 2. Correct for days 14-20.
+        # This logic seems sound for calculating minimum bands down when timestamp is None.
+
     else:
+        # Outbound forward found within the checked_window_days.
         time_difference = datetime.now() - last_forward_timestamp
         days_stuck = time_difference.days
 
-        # Calculate bands to move down: 1 band per stuck_time_period interval
-        # Use integer division to count how many full periods have passed
-        # e.g., if stuck_period is 7:
-        # days_stuck 0-6 -> 0 bands down
-        # days_stuck 7-13 -> 1 band down
-        # days_stuck 14-20 -> 2 bands down
-        # etc.
+        # Calculate bands to move down based on actual days stuck.
         calculated_bands_to_move_down = days_stuck // stuck_time_period
 
     # Cap the total bands moved down at 4 (as Band 4 is the furthest premium band)
-    # Moving 4 bands down from Band 4 (0-20% liq) effectively gets us to Band 0 (max discount).
     bands_to_move_down = min(calculated_bands_to_move_down, 4)  # Cap at 4 bands down
 
     logging.debug(
-        f"Stuck calculation: days_stuck={days_stuck}, stuck_period={stuck_time_period}, calculated_bands={calculated_bands_to_move_down}, final_bands_to_move_down={bands_to_move_down}"
+        f"Stuck calculation (within {checked_window_days}d window): days_stuck={days_stuck}, stuck_period={stuck_time_period}, calculated_bands={calculated_bands_to_move_down}, final_bands_to_move_down={bands_to_move_down}"
     )
 
     return bands_to_move_down, days_stuck
@@ -906,9 +925,10 @@ def main():
             stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
             stuck_adj_enabled = stuck_settings.get("enabled", False)
             stuck_period = stuck_settings.get("stuck_time_period", 7)
-            stuck_check_window_days = (
-                365  # Define the maximum window to check for stuck status
-            )
+
+            # Calculate the maximum relevant historical window for stuck checks
+            # 4 is the maximum number of bands down, so we only need to check back 4 * stuck_time_period days
+            stuck_check_window_days = stuck_period * 4
 
             fee_bands_settings = fee_conditions.get("fee_bands", {})
             fee_band_enabled = fee_bands_settings.get("enabled", False)
@@ -987,75 +1007,55 @@ def main():
 
                 if stuck_adj_enabled:
                     peer_stuck_status = "Checking..."
-                    # First, check within the configured stuck_period for efficiency
-                    last_forward_short_check = get_last_peer_forwarding_timestamp(
-                        pubkey, stuck_period, channel_ids_list, config
+                    # Check within the dynamically calculated window
+                    # get_last_peer_forwarding_timestamp will log details when --debug is enabled
+                    last_forward_timestamp = get_last_peer_forwarding_timestamp(
+                        pubkey, stuck_check_window_days, channel_ids_list, config
                     )
 
-                    if last_forward_short_check is not None:
-                        # Peer is active within the stuck period
-                        stuck_bands_to_move_down = 0
-                        last_forward_timestamp = last_forward_short_check
-                        time_since_last_fwd = datetime.now() - last_forward_short_check
-                        days_stuck = time_since_last_fwd.days
+                    # Calculate the number of bands to move down based on the check result
+                    bands_calc_result = calculate_stuck_channel_band_adjustment(
+                        fee_conditions,
+                        first_channel_data,  # Pass channel_data for liquidity check inside func
+                        last_forward_timestamp,  # Use the timestamp from the check
+                        stuck_period,
+                        stuck_check_window_days,  # Pass the checked_window_days to the function
+                    )
+                    stuck_bands_to_move_down, days_stuck = (
+                        bands_calc_result  # Unpack the two values
+                    )
+
+                    # Determine the final peer status string for printing/notes
+                    if last_forward_timestamp is not None:
                         peer_stuck_status = "Active"
-                        logging.debug(
-                            f"Peer {pubkey} active within {stuck_period} days ({days_stuck} days since last fwd). No stuck adjustment."
-                        )
                     elif is_low_liquidity_for_stuck:
-                        # Peer is stuck (no forwards in stuck_period) but liquidity is low.
-                        # Get actual days stuck for reporting if possible, but skip adjustment.
                         peer_stuck_status = "Stuck (Low Liquidity Skip)"
-                        logging.debug(
-                            f"Peer {pubkey} stuck but low liquidity ({check_ratio*100:.1f}%). Skipping stuck adjustment."
-                        )
-
-                        # Check longer window to get actual days stuck for printing/notes
-                        last_forward_long_check = get_last_peer_forwarding_timestamp(
-                            pubkey, stuck_check_window_days, channel_ids_list, config
-                        )
-                        last_forward_timestamp = (
-                            last_forward_long_check  # Store for notes/printing
-                        )
-                        if last_forward_long_check is None:
-                            days_stuck = (
-                                stuck_check_window_days + 1
-                            )  # Indicate stuck for >= window
-                        else:
-                            time_since_last_fwd_long = (
-                                datetime.now() - last_forward_long_check
-                            )
-                            days_stuck = time_since_last_fwd_long.days
-
                     else:
-                        # Peer is stuck (no forwards in stuck_period) and liquidity is not low.
-                        # Need to find the actual last forward timestamp from a longer window.
-                        peer_stuck_status = "Stuck (Calculating Bands)"
-                        logging.debug(
-                            f"Peer {pubkey} stuck and not low liquidity. Checking longer window ({stuck_check_window_days} days)."
-                        )
-                        last_forward_long_check = get_last_peer_forwarding_timestamp(
-                            pubkey, stuck_check_window_days, channel_ids_list, config
-                        )
-                        last_forward_timestamp = (
-                            last_forward_long_check  # Store for notes/printing
-                        )
+                        # If stuck_adj_enabled, not low liquidity, and no timestamp found,
+                        # it's stuck beyond the check window. days_stuck is already set
+                        # to checked_window_days + 1 in calculate_stuck_channel_band_adjustment.
+                        peer_stuck_status = f"Stuck (>{stuck_check_window_days} days, {stuck_bands_to_move_down} bands down)"
 
-                        # Calculate the number of bands to move down based on the long check result
-                        bands_calc_result = calculate_stuck_channel_band_adjustment(
-                            fee_conditions,
-                            first_channel_data,  # Pass channel_data for liquidity check inside func
-                            last_forward_long_check,  # Use the timestamp from the longer check
-                            stuck_period,
-                        )
-                        stuck_bands_to_move_down, days_stuck = (
-                            bands_calc_result  # Unpack the two values
-                        )
-
-                        peer_stuck_status = f"Stuck ({days_stuck} days stuck, {stuck_bands_to_move_down} bands down)"
-                        logging.debug(
-                            f"Peer {pubkey}: Stuck adjustment calculated: {stuck_bands_to_move_down} bands down."
-                        )
+                # Add the debug print block here
+                if show_debug_output and stuck_adj_enabled:
+                    print("-" * 80)  # Use separator like in main output
+                    print(f"--- Stuck Check Debug for Peer {pubkey[:10]}... ---")
+                    print(f"  Configured stuck_time_period: {stuck_period} days")
+                    print(f"  API Check Window: {stuck_check_window_days} days")
+                    print(
+                        f"  Last outbound forward timestamp found: {last_forward_timestamp if last_forward_timestamp else 'None'}"
+                    )
+                    print(
+                        f"  Calculated days since last forward: {days_stuck}"
+                    )  # This will now show >window_size if stuck
+                    print(f"  Aggregate Outbound Ratio: {check_ratio*100:.1f}%")
+                    print(
+                        f"  Low liquidity skip check (ratio < 20%): {is_low_liquidity_for_stuck}"
+                    )
+                    print(f"  Calculated stuck bands down: {stuck_bands_to_move_down}")
+                    print(f"  Final Peer Status determination: {peer_stuck_status}")
+                    print("--- End Stuck Check Debug ---")
+                    sys.stdout.flush()  # Ensure output is shown immediately
 
                 # --- Calculate Adjustments ---
                 # Call calculate_fee_band_adjustment with the determined stuck_bands_to_move_down
