@@ -192,8 +192,8 @@ def analyze_fee_trends(all_fee_data, fee_base):
 def get_last_peer_forwarding_timestamp(pubkey, days_to_check_back, channel_ids, config):
     """
     Finds the timestamp of the most recent *outbound* forward for *any* channel
-    belonging to the specified peer within the last `days_to_check_back`,
-    by querying the API for each channel ID.
+    belonging to the specified peer within the last `days_to_check_back`.
+    Queries a batch of recent forwards for each channel and checks if any were outbound.
 
     Args:
         pubkey (str): The pubkey of the peer (used for logging/context).
@@ -202,9 +202,9 @@ def get_last_peer_forwarding_timestamp(pubkey, days_to_check_back, channel_ids, 
         config (configparser.ConfigParser): The configuration object.
 
     Returns:
-        datetime or None: The datetime object of the last outbound forward,
-                          or None if no outbound forward was found within the period
-                          for any of the peer's channels.
+        datetime or None: The datetime object of the last outbound forward across
+                          all of the peer's channels, or None if no outbound forward
+                          was found within the period among the fetched batches.
     """
     lndg_api_url = config["lndg"]["lndg_api_url"]
     username = config["credentials"]["lndg_username"]
@@ -219,11 +219,13 @@ def get_last_peer_forwarding_timestamp(pubkey, days_to_check_back, channel_ids, 
     )
 
     for chan_id in channel_ids:
-        # Query LNDg API for forwards involving this specific channel, ordered by date descending.
-        # We look for the most recent forward involving this channel after the cutoff date.
-        api_url = f"{lndg_api_url}/api/forwards/?format=json&chan_in_or_out={chan_id}&forward_date__gt={cutoff_date_str}&ordering=-forward_date&limit=1"
+        # Query LNDg API for a batch of recent forwards involving this specific channel
+        # within the time window, ordered by date descending.
+        # Using a larger limit (e.g., 1000) to increase the chance of finding the
+        # most recent outbound forward within the batch, even if interleaved with inbound.
+        api_url = f"{lndg_api_url}/api/forwards/?format=json&chan_in_or_out={chan_id}&forward_date__gt={cutoff_date_str}&ordering=-forward_date&limit=1000"
 
-        # Use logging.debug for per-channel check details, which are only visible with --debug
+        # Use logging.debug for per-channel check details, visible with --debug
         logging.debug(f"Querying LNDg for channel {chan_id}: {api_url}")
 
         try:
@@ -231,51 +233,47 @@ def get_last_peer_forwarding_timestamp(pubkey, days_to_check_back, channel_ids, 
             response.raise_for_status()
             data = response.json()
 
-            if data.get("results"):
-                most_recent_forward = data["results"][0]
-                forward_timestamp_str = most_recent_forward.get("forward_date")
-                chan_id_out = str(most_recent_forward.get("chan_id_out"))
-                forward_id = most_recent_forward.get(
-                    "id", "N/A"
-                )  # Get forward ID for debug
+            # Iterate through the batch of forwards for this channel, looking for the most recent outbound one
+            found_outbound_for_channel = False
+            for result in data["results"]:
+                forward_timestamp_str = result.get("forward_date")
+                forward_id = result.get("id", "N/A")  # Get forward ID for debug
 
-                if forward_timestamp_str and chan_id_out == str(chan_id):
-                    # Found an outbound forward for THIS channel.
+                if forward_timestamp_str and result.get("chan_id_out") == str(chan_id):
+                    # Found an outbound forward for THIS channel within the fetched batch.
+                    # Since results are ordered by date descending, this is the most recent *outbound*
+                    # forward for this specific channel within the checked time window.
                     try:
-                        # Attempt parsing with microseconds first
                         forward_timestamp = datetime.strptime(
                             forward_timestamp_str, "%Y-%m-%dT%H:%M:%S.%f"
                         )
                     except ValueError:
-                        # Fallback if no microseconds
                         forward_timestamp = datetime.strptime(
                             forward_timestamp_str, "%Y-%m-%dT%H:%M:%S"
                         )
 
                     logging.debug(
-                        f"  [Chan {chan_id}] Found outbound fwd (ID: {forward_id}) at {forward_timestamp_str}"
+                        f"  [Chan {chan_id}] Found most recent outbound fwd (ID: {forward_id}) at {forward_timestamp_str}"
                     )
 
-                    # Update the latest_outbound_timestamp if this one is more recent
+                    # Update the overall latest_outbound_timestamp for the peer if this one is more recent
                     if (
                         latest_outbound_timestamp is None
                         or forward_timestamp > latest_outbound_timestamp
                     ):
                         latest_outbound_timestamp = forward_timestamp
                         logging.debug(
-                            f"  [Peer {pubkey[:8]}] Updated latest overall outbound timestamp to {latest_outbound_timestamp}"
+                            f"  [Peer {pubkey[:8]}] Updated overall latest outbound timestamp to {latest_outbound_timestamp}"
                         )
 
-                else:
-                    # Found a forward, but it was inbound for this channel, or missing data.
-                    logging.debug(
-                        f"  [Chan {chan_id}] Most recent fwd (ID: {forward_id}) was inbound or incomplete data."
+                    found_outbound_for_channel = (
+                        True  # Mark that we found at least one outbound in the batch
                     )
+                    break  # Stop checking older forwards for *this channel* and move to the next channel
 
-            else:
-                # No forwards found for this channel within the window.
+            if not found_outbound_for_channel:
                 logging.debug(
-                    f"  [Chan {chan_id}] No forwards found in last {days_to_check_back} days."
+                    f"  [Chan {chan_id}] No outbound forwards found in last {days_to_check_back} days among the top 1000 recent forwards."
                 )
 
         except requests.exceptions.RequestException as e:
@@ -289,7 +287,6 @@ def get_last_peer_forwarding_timestamp(pubkey, days_to_check_back, channel_ids, 
             # Continue to the next channel on error
 
     # After checking all channels, return the single latest outbound timestamp found for the peer.
-    # Add final debug log for the overall result for the peer
     return latest_outbound_timestamp
 
 
