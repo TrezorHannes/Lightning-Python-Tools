@@ -863,7 +863,7 @@ def main():
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Enable detailed debug output for stuck channel checks.",
+        help="Enable detailed debug output for stuck channel checks. Disables LNDg and charge-lnd file updates.",
     )
     args = parser.parse_args()
     try:
@@ -875,15 +875,11 @@ def main():
         )
         lndg_fee_update_enabled = node_definitions.get("LNDg_fee_update", False)
         terminal_output_enabled = node_definitions.get("Terminal_output", False)
-        show_debug_output = args.debug  # Use debug flag directly
-
-        if write_charge_lnd_file_enabled:
-            charge_lnd_file_path = os.path.join(
-                config["paths"]["charge_lnd_path"], "fee_adjuster.txt"
-            )
-            # Open the file in write mode to clear any existing content
-            with open(charge_lnd_file_path, "w") as f:
-                pass
+        skip_charge_lnd_file_write = False
+        if args.debug:
+            terminal_output_enabled = True
+            lndg_fee_update_enabled = False
+            skip_charge_lnd_file_write = True
 
         for node in node_definitions["nodes"]:
             pubkey = node["pubkey"]
@@ -1034,7 +1030,7 @@ def main():
                         peer_stuck_status = f"Stuck (>{stuck_check_window_days} days, {stuck_bands_to_move_down} bands down)"
 
                 # Add the debug print block here
-                if show_debug_output and stuck_adj_enabled:
+                if terminal_output_enabled and stuck_adj_enabled:
                     print("-" * 80)  # Use separator like in main output
                     print(f"--- Stuck Check Debug for Peer {pubkey[:10]}... ---")
                     print(f"  Configured stuck_time_period: {stuck_period} days")
@@ -1179,11 +1175,14 @@ def main():
                         sys.stdout.flush()  # Ensure output is shown immediately
 
                 # Write to charge-lnd file once per peer if enabled and any channel updated
-                if write_charge_lnd_file_enabled and updated_any_channel:
+                if (
+                    write_charge_lnd_file_enabled
+                    and updated_any_channel
+                    and not skip_charge_lnd_file_write
+                ):
                     charge_lnd_file_path = os.path.join(
                         config["paths"]["charge_lnd_path"], "fee_adjuster.txt"
                     )
-                    # Use modified write function
                     write_charge_lnd_file(
                         charge_lnd_file_path,
                         pubkey,
