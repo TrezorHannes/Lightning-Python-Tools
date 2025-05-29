@@ -2,6 +2,7 @@
     "Terminal_output": true,
     "LNDg_fee_update": False,
     "write_charge_lnd_file": true,
+    "update_channel_notes": true,
     "groups": {
         "sink": {
             "group_adjustment_percentage": 0.10,
@@ -9,8 +10,6 @@
             "trend_sensitivity": 0.5,
             "fee_base": "median",
             "fee_delta_threshold": 12,
-            "max_outbound": 0.8,
-            "min_outbound": 0.1,
             "fee_bands": {
                 "enabled": true,
                 "discount": -0.15,
@@ -18,7 +17,8 @@
             },
             "stuck_channel_adjustment": {
                 "enabled": true,
-                "stuck_time_period": 7
+                "stuck_time_period": 7,
+                "min_local_balance_for_stuck_discount": 0.2
             }
         },
         "expensive": {
@@ -27,7 +27,6 @@
             "trend_sensitivity": 0.6,
             "fee_base": "mean",
             "fee_delta_threshold": 25,
-            "min_outbound": 0.2,
             "fee_bands": {
                 "enabled": true,
                 "discount": -0.10,
@@ -35,7 +34,8 @@
             },
             "stuck_channel_adjustment": {
                 "enabled": false,
-                "stuck_time_period": 5 
+                "stuck_time_period": 5,
+                "min_local_balance_for_stuck_discount": 0.4 
             }
         }
     },
@@ -60,7 +60,6 @@
                 "trend_sensitivity": 0.4,
                 "fee_base": "mean",
                 "fee_delta_threshold": 10,
-                "min_outbound": 0.4,
                 "fee_bands": {
                     "enabled": true,
                     "discount": -0.20,
@@ -68,7 +67,8 @@
                 },
                 "stuck_channel_adjustment": {
                     "enabled": true,
-                    "stuck_time_period": 3
+                    "stuck_time_period": 3,
+                    "min_local_balance_for_stuck_discount": 0.1
                 }
             }
         }
