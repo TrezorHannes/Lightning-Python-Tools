@@ -70,3 +70,8 @@ recurrence = weekly
 time = 09:00
 # Only used if recurrence is weekly
 day_of_week = friday
+
+[lnd]
+rpcserver = your_lnd_host:port
+tlscertpath = /path/to/your/lnd/tls.cert
+macaroonpath = /path/to/your/lnd/admin.macaroon

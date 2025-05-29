@@ -27,27 +27,31 @@ Usage:
 python boltz_swap-out.py --amount <sats_to_swap> [OPTIONS]
 
 Example:
-python boltz_swap-out.py --amount 1000000 --capacity 2000000 --fee-limit 5 --debug
+python boltz_swap-out.py --amount 1000000 --capacity 2000000 --local-fee-limit 5 --debug
 
 Options:
   --amount SATS          (Required) The amount in satoshis to swap from LN to L-BTC.
   --capacity SATS        Minimum local balance on a channel to be a swap candidate.
                          (Default: 3000000)
-  --fee-limit PPM        Maximum local fee rate (ppm) for candidate channels.
+  --local-fee-limit PPM  Maximum local fee rate (ppm) for candidate channels.
                          (Default: 10)
   --max-parts INT        Max parts for `lncli payinvoice --max_parts`. (Default: 16)
   --payment-timeout STR  Timeout for `lncli payinvoice` (e.g., "10m", "1h").
                          (Default: "10m")
+  --payment_fee_limit_percent FLOAT
+                        Maximum total fee for the LN payment as a percentage of the payment amount (e.g., 0.5 for 0.5%%).
+                        (Default: 1.0)
   --description STR      Optional description for the Boltz swap invoice.
                          (Default: "LNDg-Boltz-Swap-Out")
   --debug                Enable debug mode: prints commands, no actual execution.
                          (Highly recommended for first runs).
+  --verbose              Enable verbose output, showing full details of executed commands like LND connection parameters.
   -h, --help             Show this help message and exit.
 
 Workflow:
 1.  Fetches a new L-BTC address using `pscli`.
 2.  Queries LNDg API to find suitable outgoing channels based on `--capacity`
-    and `--fee-limit`.
+    and `--local-fee-limit`.
 3.  Initiates a "reverse swap" (LN -> L-BTC) using `boltzcli createreverseswap`.
     This command requires the `--external-pay` flag to prevent auto-payment and
     will be called with `boltzd`'s TLS cert and admin macaroon.
@@ -71,6 +75,8 @@ import subprocess
 import sys
 import time
 import requests  # Added for LNDg API calls
+import math
+import re
 
 
 # --- ANSI Color Codes ---
@@ -94,77 +100,169 @@ def print_color(text, color_code, bold=False):
         print(f"{color_code}{text}{Colors.ENDC}")
 
 
+def print_bold_step(text, is_subprocess=False, color_code=Colors.OKBLUE):
+    """Prints a step description in bold, optionally with a specific color."""
+    # The is_subprocess parameter isn't used yet, but kept for potential future use.
+    # You might want to change the color or add a prefix based on it.
+    print(f"{color_code}{Colors.BOLD}{text}{Colors.ENDC}")
+
+
 def parse_arguments():
     """Parses command-line arguments."""
-    # Prepare epilog text safely
+
+    # --- Dynamic Epilog/Disclaimer Logic ---
     epilog_text = "Automated LN to L-BTC swaps. Use with caution. Refer to script source for full disclaimer."  # Default fallback
-    if __doc__:
+    current_docstring = __doc__  # Assign to a variable to ensure it's fetched once
+    if current_docstring:  # Check if __doc__ is not None
         disclaimer_marker = "Disclaimer:"
-        disclaimer_start_index = __doc__.find(disclaimer_marker)
+        disclaimer_start_index = current_docstring.find(disclaimer_marker)
         if disclaimer_start_index != -1:
             # Take everything from "Disclaimer:" onwards
-            epilog_text = __doc__[disclaimer_start_index:].strip()
+            epilog_text = current_docstring[disclaimer_start_index:].strip()
+        else:
+            # Fallback if "Disclaimer:" marker not found in __doc__ but __doc__ exists
+            epilog_text = "Disclaimer: Use at your own risk. This script involves real cryptocurrency transactions."
+    # --- End Dynamic Epilog/Disclaimer Logic ---
 
     parser = argparse.ArgumentParser(
-        description="Automates LN to L-BTC swaps using Boltz Client (`boltzcli`).\n"
-        "Executable paths and `boltzd` RPC connection details are read from config.ini.",
-        formatter_class=argparse.RawTextHelpFormatter,  # To preserve help text formatting
-        epilog=epilog_text,  # Use the safely prepared epilog_text
+        description="--- Boltz LN to L-BTC Swap Initiator ---",
+        epilog=epilog_text,
+        formatter_class=argparse.RawTextHelpFormatter,  # To preserve newlines in epilog
     )
+
+    # Calculate default config path relative to the script's location
+    # Assumes config.ini is in the parent directory of the script's parent directory
+    # e.g., if script is /.../project_name/Other/script.py, config.ini is /.../project_name/config.ini
+    script_file_path = os.path.abspath(__file__)
+    project_root_dir = os.path.dirname(
+        os.path.dirname(script_file_path)
+    )  # Gets to .../Lightning-Python-Tools/
+    default_config_location = os.path.join(project_root_dir, "config.ini")
+
     parser.add_argument(
         "--amount",
+        "-a",
         type=int,
         required=True,
-        help="(Required) The amount in satoshis to swap from LN to L-BTC.",
+        help="Amount in satoshis for the swap.",
     )
     parser.add_argument(
         "--capacity",
+        "-c",
         type=int,
-        default=3000000,
-        help="Minimum local balance on a channel to be a swap candidate (sats).\n(Default: 3000000)",
+        default=2000000,
+        help="Minimum local balance of channels to consider for payment (default: 2,000,000 sats).",
     )
     parser.add_argument(
-        "--fee-limit",
+        "--local-fee-limit",
+        "-lfl",
         type=int,
-        default=10,  # Defaulting to a low fee limit
-        help="Maximum local fee rate (ppm) for candidate channels.\n(Default: 10)",
+        default=10,
+        help="Maximum local routing fee in PPM for LNDg channels to consider for payment (default: 10 ppm).",
     )
     parser.add_argument(
-        "--max-parts",
-        type=int,
-        default=16,
-        help="Max parts for `lncli payinvoice --max_parts`.\n(Default: 16)",
+        "--lndg-api",
+        type=str,
+        default="http://localhost:8080",
+        help="LNDg API endpoint (default: http://localhost:8080).",
     )
     parser.add_argument(
         "--payment-timeout",
+        "-T",
         type=str,
-        default="10m",
-        help='Timeout for `lncli payinvoice` (e.g., "10m", "1h").\n(Default: "10m")',
+        default="5m",
+        help="Timeout for lncli payment attempts (e.g., 1m, 5m, 10m - default: 5m).",
+    )
+
+    parser.add_argument(
+        "--ppm",
+        "-P",
+        type=int,
+        help="Maximum fee in Parts Per Million (PPM) for the lncli payment, calculated based on the swap amount. If not set, defaults to 0 sats for lncli --fee_limit.",
+    )
+
+    parser.add_argument(
+        "--max-parts",
+        "-mp",
+        type=int,
+        default=None,
+        help="Maximum number of parts for Multi-Path Payments (MPP) for the lncli payment. If omitted, lncli's default (currently 16) is used. Set to 1 to effectively disable MPP via this flag.",
+    )
+
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=default_config_location,  # Use the calculated relative path
+        help="Path to the configuration file (default: ../config.ini relative to script's parent dir).",
     )
     parser.add_argument(
         "--description",
+        "-d",
         type=str,
         default="LNDg-Boltz-Swap-Out",
-        help='Optional description for the Boltz swap invoice.\n(Default: "LNDg-Boltz-Swap-Out")',
+        help="Description for the Boltz swap invoice.",
     )
     parser.add_argument(
         "--debug",
+        "-D",
         action="store_true",
-        help="Enable debug mode: prints commands, no actual execution.\n(Highly recommended for first runs).",
+        help="Enable debug mode (no actual transactions).",
     )
-    # --help is added automatically by argparse
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose output, showing full details of executed commands like LND connection parameters.",
+    )
+    parser.add_argument(
+        "--max-payment-attempts",
+        type=int,
+        default=None,
+        help="Maximum number of payment attempts with different channel batches (default: try all available candidates in batches of 3).",
+    )
 
-    if len(sys.argv) == 1:  # If no arguments are passed, print help and exit
-        parser.print_help(sys.stderr)
-        sys.exit(1)
+    # Using parser.description which should be set from the constructor.
+    # No need to check __doc__ here again for the main title printout,
+    # as parser.description is used for the help message's title.
+    args = parser.parse_args()
 
-    return parser.parse_args()
+    # This part prints the title at the start of the script execution
+    # It's separate from the help message's description/epilog
+    main_title = "--- Boltz LN to L-BTC Swap Initiator ---"  # Default title
+    if current_docstring:
+        first_line_match = re.match(r"^\s*---(.*?)---", current_docstring)
+        if first_line_match:
+            main_title = f"--- {first_line_match.group(1).strip()} ---"
+    print(main_title)
+
+    if args.debug:
+        print("DEBUG MODE ENABLED: No actual transactions.")
+    print(f"Swap Amount (LN): {args.amount} sats")
+    print(f"Min Local Balance (candidates): {args.capacity} sats")
+    print(f"Max Local Fee (LNDg candidates): {args.local_fee_limit} ppm")
+    print(f"LNDg API: {args.lndg_api}")
+    print(f"LNCLI Payment Timeout: {args.payment_timeout}")
+
+    if args.max_parts is not None:
+        print(f"LNCLI Max Parts (MPP): {args.max_parts}")
+    else:
+        print("LNCLI Max Parts (MPP): Using lncli's default (currently 16)")
+
+    if args.ppm is not None:
+        calculated_fee_sats = math.floor(args.amount * args.ppm / 1_000_000)
+        print(
+            f"LNCLI Payment Fee Limit: {args.ppm} PPM (approx. {calculated_fee_sats} sats for this amount)"
+        )
+    else:
+        print(
+            "LNCLI Payment Fee Limit: Using 0 sats (explicitly setting --fee_limit 0 for lncli as --ppm not provided)"
+        )
+
+    return args, parser
 
 
-def load_config():
+def load_config(config_file_path):
     """Loads LNDg, Paths, and Boltz RPC configuration from ../config.ini."""
-    parent_dir = os.path.dirname(os.path.abspath(__file__))
-    config_file_path = os.path.join(parent_dir, "..", "config.ini")
     config = configparser.ConfigParser()
 
     if not os.path.exists(config_file_path):
@@ -172,7 +270,7 @@ def load_config():
             f"Error: Configuration file not found at {config_file_path}", Colors.FAIL
         )
         print_color(
-            "Please ensure `config.ini` exists in the parent directory and is correctly named.",
+            f"Please ensure the configuration file exists at the specified path: {config_file_path}",
             Colors.FAIL,
         )
         sys.exit(1)
@@ -196,6 +294,16 @@ def load_config():
         app_config["boltzd_admin_macaroon_path"] = config["paths"][
             "boltzd_admin_macaroon_path"
         ]
+
+        # LND connection details (optional, for construct_lncli_command)
+        if "lnd" in config:
+            app_config["lnd_rpcserver"] = config["lnd"].get("rpcserver")
+            app_config["lnd_tlscertpath"] = config["lnd"].get("tlscertpath")
+            app_config["lnd_macaroonpath"] = config["lnd"].get("macaroonpath")
+        else:  # Ensure keys exist even if section is missing, for consistent access later
+            app_config["lnd_rpcserver"] = None
+            app_config["lnd_tlscertpath"] = None
+            app_config["lnd_macaroonpath"] = None
 
     except KeyError as e:
         print_color(f"Error: Missing key {e} in config.ini.", Colors.FAIL)
@@ -221,6 +329,7 @@ def run_command(
     dry_run_output="DRY RUN COMMAND",
     expect_json=False,
     success_codes=None,
+    display_str_override=None,
 ):
     """
     Executes a system command.
@@ -228,11 +337,21 @@ def run_command(
     """
     if success_codes is None:
         success_codes = [0]
-    command_str = " ".join(command_parts)
-    print_color(f"Executing: {command_str}", Colors.OKCYAN)
+
+    # actual_command_str is always the full command, used for debug prints and dry run info
+    actual_command_str = " ".join(command_parts)
+
+    # string_to_print is what's shown on the "Executing:" line
+    # It defaults to the actual_command_str unless overridden
+    string_to_print = (
+        display_str_override if display_str_override is not None else actual_command_str
+    )
+
+    print_color(f"Executing: {string_to_print}", Colors.OKCYAN)
 
     if debug:
-        print_color(f"[DEBUG] {dry_run_output}: {command_str}", Colors.WARNING)
+        # The [DEBUG] {dry_run_output}: line should show the *actual* command
+        print_color(f"[DEBUG] {dry_run_output}: {actual_command_str}", Colors.WARNING)
         if expect_json:
             # Check for pscli lbtc-getaddress
             if "lbtc-getaddress" in command_parts and "pscli" in command_parts[0]:
@@ -270,18 +389,18 @@ def run_command(
                 )
             else:  # Default mock JSON if not specifically handled
                 print_color(
-                    f"[DEBUG] No specific mock for: {command_str}. Using default mock.",
+                    f"[DEBUG] No specific mock for: {actual_command_str}. Using default mock.",
                     Colors.WARNING,
                 )
                 return (
                     True,
                     {
                         "message": "Dry run success - default mock",
-                        "details": command_str,
+                        "details": actual_command_str,
                     },
                     "",
                 )
-        return True, f"Dry run: {command_str}", ""
+        return True, f"Dry run: {actual_command_str}", ""
 
     try:
         process = subprocess.Popen(
@@ -311,7 +430,7 @@ def run_command(
         print_color(error_msg, Colors.FAIL)
         return False, "", error_msg
     except subprocess.TimeoutExpired:
-        error_msg = f"Command timed out after {timeout} seconds: {command_str}"
+        error_msg = f"Command timed out after {timeout} seconds: {actual_command_str}"
         print_color(error_msg, Colors.FAIL)
         if process.poll() is None:
             process.kill()
@@ -319,7 +438,7 @@ def run_command(
             error_msg += f"\nKilled process. Stdout after kill: {stdout_after_kill.strip()}. Stderr after kill: {stderr_after_kill.strip()}"
         return False, "", error_msg
     except Exception as e:
-        error_msg = f"An unexpected error occurred while running command: {command_str}\nError: {e}"
+        error_msg = f"An unexpected error occurred while running command: {actual_command_str}\nError: {e}"
         print_color(error_msg, Colors.FAIL)
         return False, "", error_msg
 
@@ -350,14 +469,19 @@ def get_lbtc_address(pscli_path, debug):
 
 
 def get_swap_candidate_channels(
-    lndg_api_url, lndg_username, lndg_password, capacity_threshold, fee_limit_ppm, debug
+    lndg_api_url,
+    lndg_username,
+    lndg_password,
+    capacity_threshold,
+    local_fee_limit_ppm,
+    debug,
 ):
     """
     Retrieves and filters channel IDs from LNDg API.
     Returns a list of channel IDs.
     """
     print_color(
-        f"\nStep 2: Finding swap candidate channels (Local Bal > {capacity_threshold} sats, Fee <= {fee_limit_ppm} ppm)...",
+        f"\nStep 2: Finding swap candidate channels (Local Bal > {capacity_threshold} sats, Local Fee <= {local_fee_limit_ppm} ppm)...",
         Colors.HEADER,
     )
     api_url = lndg_api_url + "/api/channels?limit=5000&is_open=true&is_active=true"
@@ -398,7 +522,7 @@ def get_swap_candidate_channels(
                 alias = channel.get("alias", "N/A")
                 if (
                     local_balance > capacity_threshold
-                    and local_fee_rate <= fee_limit_ppm
+                    and local_fee_rate <= local_fee_limit_ppm
                     and chan_id
                 ):
                     candidate_channels.append(chan_id)
@@ -532,11 +656,10 @@ def create_boltz_swap(
 
 
 def pay_lightning_invoice(
-    lncli_path,
+    config,
+    args,
     invoice_str,
     candidate_chan_ids,
-    max_parts,
-    payment_timeout_str,
     debug,
 ):
     """
@@ -547,8 +670,11 @@ def pay_lightning_invoice(
         f"\nStep 4: Attempting to pay Lightning invoice: {invoice_str[:40]}...{invoice_str[-40:]}",
         Colors.HEADER,
     )
+    max_parts_display = (
+        args.max_parts if args.max_parts is not None else "lncli default"
+    )
     print_color(
-        f"Timeout per attempt: {payment_timeout_str}, Max Parts: {max_parts}",
+        f"Timeout per attempt: {args.payment_timeout}, Max Parts: {max_parts_display}",
         Colors.OKCYAN,
     )
 
@@ -557,101 +683,88 @@ def pay_lightning_invoice(
         return False
 
     timeout_seconds = 0
-    if payment_timeout_str.lower().endswith("s"):
-        timeout_seconds = int(payment_timeout_str[:-1])
-    elif payment_timeout_str.lower().endswith("m"):
-        timeout_seconds = int(payment_timeout_str[:-1]) * 60
-    elif payment_timeout_str.lower().endswith("h"):
-        timeout_seconds = int(payment_timeout_str[:-1]) * 3600
+    if args.payment_timeout.lower().endswith("s"):
+        timeout_seconds = int(args.payment_timeout[:-1])
+    elif args.payment_timeout.lower().endswith("m"):
+        timeout_seconds = int(args.payment_timeout[:-1]) * 60
+    elif args.payment_timeout.lower().endswith("h"):
+        timeout_seconds = int(args.payment_timeout[:-1]) * 3600
     else:
         try:
-            timeout_seconds = int(payment_timeout_str)
+            timeout_seconds = int(args.payment_timeout)
         except ValueError:
             print_color(
-                f"Invalid payment timeout '{payment_timeout_str}'. Defaulting to 600s.",
+                f"Invalid payment timeout '{args.payment_timeout}'. Defaulting to 600s.",
                 Colors.WARNING,
             )
             timeout_seconds = 600
 
     batch_size = 3
-    num_batches = (len(candidate_chan_ids) + batch_size - 1) // batch_size
+    num_payment_attempts = (
+        (len(candidate_chan_ids) + batch_size - 1) // batch_size
+        if candidate_chan_ids
+        else 0
+    )
+    if args.max_payment_attempts is not None:
+        num_payment_attempts = min(num_payment_attempts, args.max_payment_attempts)
 
+    payment_attempt_count = 0
     for i in range(0, len(candidate_chan_ids), batch_size):
+        if (
+            args.max_payment_attempts is not None
+            and payment_attempt_count >= args.max_payment_attempts
+        ):
+            print_color(
+                f"Reached max payment attempts ({args.max_payment_attempts}). Stopping.",
+                Colors.WARNING,
+            )
+            break
+        payment_attempt_count += 1
+
         current_batch_ids = candidate_chan_ids[i : i + batch_size]
         print_color(
-            f"\nAttempt {i//batch_size + 1}/{num_batches} with channels: {', '.join(current_batch_ids)}",
+            f"\nAttempt {payment_attempt_count}/{num_payment_attempts} with channels: {', '.join(current_batch_ids)}",
             Colors.OKBLUE,
         )
 
-        command = [
-            lncli_path,
-            "payinvoice",
-            "--force",
-            "--json",  # Ensure JSON output for parsing
-            # "--inflight_updates", # Removing for cleaner final JSON output
-            "--pay_req",
-            invoice_str,
-            "--fee_limit_percent",
-            "1",
-            "--timeout",
-            payment_timeout_str,
-            "--max_parts",
-            str(max_parts),
-        ]
-        for chan_id in current_batch_ids:
-            command.extend(["--outgoing_chan_id", chan_id])
+        # Use construct_lncli_command to build the command
+        # It now returns: (actual_command_list, display_command_string)
+        actual_command_list, display_command_str = construct_lncli_command(
+            config, args, invoice_str, current_batch_ids
+        )
 
         subprocess_actual_timeout = timeout_seconds + 60
 
-        # Ensure run_command is called with success_codes that include expected error codes for "already paid"
-        # However, for the *first* attempt, a non-zero exit code means failure.
-        # For subsequent attempts, "already paid" is an error but means prior success.
-        # The current loop structure relies on the *first* success returning True.
-
-        success_exit_codes = [0]  # Default: only exit code 0 is success for run_command
-        # If this is not the first attempt, "already paid" (exit code 1 typically for lncli)
-        # could be an indicator of prior success. But this makes run_command's success tricky.
-        # It's better to rely on parsing the content of the *first* successful attempt.
+        success_exit_codes = [0]
 
         command_success, output, error_stderr = run_command(
-            command,
+            actual_command_list,  # Pass the actual command list for execution
             timeout=subprocess_actual_timeout,
             debug=debug,
             expect_json=True,
             dry_run_output="lncli payinvoice command",
             success_codes=success_exit_codes,  # Only 0 is true success for the payment itself
+            display_str_override=display_command_str,  # Pass the string for display
         )
 
         if command_success:  # lncli exited with 0
-            if debug:  # Debug mock for payinvoice should simulate success
+            if debug:
                 print_color(
                     f"[DEBUG] Payment successful (simulated). Preimage: {output.get('payment_preimage', 'N/A')}",
                     Colors.OKGREEN,
                 )
-                return True  # Exit after first (mocked) successful batch
+                return True
 
             if isinstance(output, dict):
                 payment_error_field = output.get("payment_error")
                 payment_preimage = output.get("payment_preimage")
-                top_level_status = output.get(
-                    "status"
-                )  # e.g., "SUCCEEDED", "FAILED", "IN_FLIGHT"
-                failure_reason = output.get(
-                    "failure_reason"
-                )  # e.g., "FAILURE_REASON_NONE" on success
-
-                # Primary success indicators:
-                # 1. Valid payment_preimage is present.
-                # 2. Top-level status is "SUCCEEDED".
-                # 3. No payment_error field, or it's empty/null.
-                # 4. failure_reason is "FAILURE_REASON_NONE".
+                top_level_status = output.get("status")
+                failure_reason = output.get("failure_reason")
 
                 is_successful_payment = (
                     payment_preimage
                     and payment_preimage != ""
-                    and (
-                        top_level_status == "SUCCEEDED" or not top_level_status
-                    )  # SUCCEEDED is explicit, or no status field if older lncli
+                    and (top_level_status == "SUCCEEDED" or not top_level_status)
                     and (failure_reason == "FAILURE_REASON_NONE" or not failure_reason)
                     and (not payment_error_field or payment_error_field == "")
                 )
@@ -661,15 +774,12 @@ def pay_lightning_invoice(
                         f"Invoice payment successful! Preimage: {payment_preimage}",
                         Colors.OKGREEN,
                     )
-                    if (
-                        "payment_route" in output and output["payment_route"]
-                    ):  # Check if route is not None or empty
+                    if "payment_route" in output and output["payment_route"]:
                         print_color(
                             f"  Route details: {json.dumps(output['payment_route'], indent=2)}",
                             Colors.OKCYAN,
                         )
                     else:
-                        # Check htlcs array for the successful one if top-level route is missing
                         successful_htlc_route = None
                         if "htlcs" in output and isinstance(output["htlcs"], list):
                             for htlc in output["htlcs"]:
@@ -683,9 +793,8 @@ def pay_lightning_invoice(
                                 f"  Successful HTLC Route details: {json.dumps(successful_htlc_route, indent=2)}",
                                 Colors.OKCYAN,
                             )
-                    return True  # Crucial: exit function on first confirmed success
+                    return True
                 else:
-                    # Payment attempt seemed to succeed based on exit code 0, but content analysis says no.
                     print_color(
                         f"Payment attempt completed (exit 0) but content indicates failure or ambiguity.",
                         Colors.WARNING,
@@ -698,46 +807,56 @@ def pay_lightning_invoice(
                         f"  Full JSON output: {json.dumps(output, indent=2)}",
                         Colors.WARNING,
                     )
-                    # Continue to next batch as this attempt wasn't definitively successful by content
-            else:  # lncli exited 0 but output was not JSON
+            else:
                 print_color(
                     f"Payment attempt completed (exit 0) but output was not valid JSON: {output}",
                     Colors.WARNING,
                 )
-                # Continue to next batch
-
-        else:  # command_success is False, meaning lncli exited with non-zero code
+        else:
             print_color(f"Payment attempt command failed.", Colors.FAIL)
-            if error_stderr:
-                print_color(f"  Stderr: {error_stderr.strip()}", Colors.FAIL)
+            # Only print detailed stderr and stdout if verbose or debug
+            if args.verbose or args.debug:
+                if error_stderr:
+                    print_color(f"  Stderr: {error_stderr.strip()}", Colors.FAIL)
 
-            # Check if the error is "invoice is already paid"
-            # output from run_command is stdout in this case. error_stderr is stderr.
-            err_str_combined = str(error_stderr) + str(
-                output
-            )  # Check both stdout and stderr for the message
-            if "invoice is already paid" in err_str_combined.lower() or (
-                "code = AlreadyExists desc = invoice is already paid"
-                in err_str_combined
-            ):
-                print_color(
-                    "Invoice was already paid (likely by a previous attempt in this script run). Considering this a success.",
-                    Colors.OKGREEN,
-                )
-                return True  # Exit, considering it success because it's paid
+                # Check if the error is "invoice is already paid"
+                # output from run_command is stdout in this case. error_stderr is stderr.
+                err_str_combined = str(error_stderr) + str(
+                    output
+                )  # Check both stdout and stderr for the message
+                if "invoice is already paid" in err_str_combined.lower() or (
+                    "code = AlreadyExists desc = invoice is already paid"
+                    in err_str_combined
+                ):
+                    print_color(
+                        "Invoice was already paid (likely by a previous attempt in this script run). Considering this a success.",
+                        Colors.OKGREEN,
+                    )
+                    return True  # Exit, considering it success because it's paid
 
-            if isinstance(output, str) and output.strip():
-                print_color(f"  Stdout: {output.strip()}", Colors.FAIL)
-            elif isinstance(output, dict):
-                print_color(
-                    f"  Output (JSON): {json.dumps(output, indent=2)}", Colors.FAIL
-                )
+                if isinstance(output, str) and output.strip():
+                    print_color(f"  Stdout: {output.strip()}", Colors.FAIL)
+                elif isinstance(output, dict):
+                    print_color(
+                        f"  Output (JSON): {json.dumps(output, indent=2)}", Colors.FAIL
+                    )
+            else:  # Not verbose and not debug
+                # Check for "already paid" even if not verbose, as it's a success condition
+                err_str_combined = str(error_stderr) + str(output)
+                if "invoice is already paid" in err_str_combined.lower() or (
+                    "code = AlreadyExists desc = invoice is already paid"
+                    in err_str_combined
+                ):
+                    print_color(
+                        "Invoice was already paid. Considering this a success.",
+                        Colors.OKGREEN,
+                    )
+                    return True
+                # else, just the general failure message was printed. No need for more details here.
 
-        # If we reach here, the current batch was not definitively successful and we should try the next one
         if i + batch_size < len(candidate_chan_ids):
             print_color("Retrying with next batch in 5 seconds...", Colors.WARNING)
             time.sleep(5)
-        # No "else" needed here, if it's the last batch and failed, loop terminates and function returns False below
 
     print_color(
         "All payment attempts with available channel batches failed to confirm success.",
@@ -746,128 +865,396 @@ def pay_lightning_invoice(
     return False
 
 
+def construct_lncli_command(config, args, invoice, outgoing_chan_ids_batch):
+    """
+    Constructs the lncli payinvoice command.
+    Returns a tuple: (actual_command_list, display_command_string)
+    """
+    if args.debug:
+        print(
+            f"[DEBUG construct_lncli_command] Args received: amount={args.amount}, ppm={args.ppm}, timeout={args.payment_timeout}, max_parts={args.max_parts}, debug={args.debug}, verbose={args.verbose}"
+        )
+
+    lncli_path = config.get("lncli_path", "/usr/local/bin/lncli")
+
+    lnd_rpcserver = config.get("lnd_rpcserver") or "localhost:10009"
+    lnd_tlscertpath = config.get("lnd_tlscertpath") or os.path.expanduser(
+        "~/.lnd/tls.cert"
+    )
+    lnd_macaroonpath = config.get("lnd_macaroonpath") or os.path.expanduser(
+        "~/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
+    )
+
+    lnd_connection_params = [
+        "--rpcserver=" + lnd_rpcserver,
+        "--tlscertpath=" + os.path.expanduser(lnd_tlscertpath),
+        "--macaroonpath=" + os.path.expanduser(lnd_macaroonpath),
+    ]
+
+    core_command_params = [
+        "payinvoice",
+        "--json",
+        "--force",
+        "--cancelable",
+        f"--timeout={args.payment_timeout}",
+    ]
+
+    if args.ppm is not None:
+        fee_limit_sats = math.floor(args.amount * args.ppm / 1_000_000)
+        core_command_params.extend(["--fee_limit", str(fee_limit_sats)])
+        if args.debug:  # Print fee calculation only in debug, not just verbose
+            print(
+                f"[DEBUG construct_lncli_command] Setting lncli --fee_limit to {fee_limit_sats} sats (calculated from {args.ppm} PPM for {args.amount} sats amount)."
+            )
+    else:
+        core_command_params.extend(["--fee_limit", "0"])
+        if args.debug:
+            print(
+                "[DEBUG construct_lncli_command] Setting lncli --fee_limit to 0 sats (as --ppm was not provided)."
+            )
+
+    if args.max_parts is not None:
+        core_command_params.extend(["--max_parts", str(args.max_parts)])
+        if args.debug:
+            print(
+                f"[DEBUG construct_lncli_command] Setting lncli --max_parts to {args.max_parts}."
+            )
+    # If args.max_parts is None, lncli uses its default
+
+    outgoing_channel_params = []
+    for chan_id in outgoing_chan_ids_batch:
+        outgoing_channel_params.extend(["--outgoing_chan_id", str(chan_id)])
+
+    # Actual command for execution is always complete
+    actual_command_list = (
+        [lncli_path]
+        + lnd_connection_params
+        + core_command_params
+        + outgoing_channel_params
+        + [invoice]
+    )
+
+    # Determine the command string for display
+    if args.verbose or args.debug:  # Show full command if verbose or debug
+        display_command_string = " ".join(actual_command_list)
+    else:
+        # Abbreviated version for display: lncli_path + core_params + outgoing_params + invoice
+        abbreviated_parts = (
+            [lncli_path] + core_command_params + outgoing_channel_params + [invoice]
+        )
+        display_command_string = " ".join(abbreviated_parts)
+        # Optional: add a suffix like " [...LND params hidden]" if you want to be explicit
+        # display_command_string += " [...LND connection details hidden]"
+
+    # This debug print is for verifying the construction process itself.
+    # It shows the *actual* command that will be formed.
+    # The "Executing:" line printed by run_command will use the display_command_string.
+    if args.debug:
+        print(
+            f"[DEBUG construct_lncli_command] Actual command for execution: {' '.join(actual_command_list)}"
+        )
+        if (
+            not args.verbose
+        ):  # If not verbose, the display string is different, so show it for clarity
+            print(
+                f"[DEBUG construct_lncli_command] Display command for 'Executing:' line: {display_command_string}"
+            )
+
+    return actual_command_list, display_command_string
+
+
+def execute_command(
+    command_parts,
+    step_description,
+    debug_mode=False,
+    is_boltz_creation=False,
+    is_lncli_payment=False,
+    amount_sats=0,
+    timeout=None,
+):
+    """Executes a shell command and returns the output."""
+    command_str = " ".join(command_parts)
+    print_bold_step(f"Executing: {command_str}", is_subprocess=True)
+
+    if debug_mode:
+        # Simulate pscli lbtc-getaddress
+        if "pscli" in command_parts[0] and "lbtc-getaddress" in command_parts:
+            print(f"[DEBUG] L-BTC address command: {command_str}")
+            return {"address": "debug_lq_address_from_dry_run"}, None, 0
+
+        # Simulate boltzcli createreverseswap
+        elif "boltzcli" in command_parts[0] and "createreverseswap" in command_parts:
+            print(f"[DEBUG] Boltz `createreverseswap` command: {command_str}")
+            # Extract amount for a more realistic expected_onchain_amount
+            try:
+                swap_amount_arg_index = command_parts.index("L-BTC") + 1
+                swap_amount_val = int(command_parts[swap_amount_arg_index])
+                # Simulate a small fee taken by Boltz
+                simulated_boltz_fee = min(
+                    50, swap_amount_val // 200
+                )  # 0.5% or max 50 sats
+                expected_onchain = swap_amount_val - simulated_boltz_fee
+            except (ValueError, IndexError):
+                expected_onchain = (
+                    amount_sats - 50 if amount_sats > 50 else amount_sats // 2
+                )
+
+            return (
+                {
+                    "id": "debug_swap_id_reverse",
+                    "invoice": "lnbc100n1pj9z6jusp5cnp9j5f2x0m5z5z5z5z5z5z5z5z5z5z5z5z5z5z5z5z5z5z5z5zqdqqcqzysxqyz5vqsp5h3xkct7t8xsv9c8g6q0v5rk2h3psk32k0k7k0kj7nhsz3g0qqqqqysgqqqqqqlgqqqqqqgq9q9qyysgqhc9sqgmeyr7n6y240g5uqn9g786ftwpk87kr0lgz03f5ljh3djxsnx0wsyv3g6n74s630jtzs8ajv473rws7z88x2u7f8n5f7n2vkt9vq0p5hdxz",  # Generic short invoice
+                    "lockupAddress": "debug_boltz_lockup_address",
+                    "expectedAmount": expected_onchain,  # More realistic expected amount
+                    "timeoutBlockHeight": 123456,
+                },
+                None,
+                0,
+            )
+
+        # Simulate lncli payinvoice
+        elif (
+            is_lncli_payment
+        ):  # "lncli" in command_parts[0] and "payinvoice" in command_parts:
+            # Even in debug, we want to see the fully constructed command
+            print(f"[DEBUG] Intended lncli payinvoice command: {command_str}")
+            # Simulate success for lncli payment in debug mode
+            print(
+                f"[DEBUG] Payment successful (simulated). Preimage: debug_preimage_from_dry_run"
+            )
+            return (
+                {
+                    "payment_preimage": "debug_preimage_from_dry_run",
+                    "payment_hash": "debug_payment_hash",
+                    "status": "SUCCEEDED",  # Simulate LND's status field
+                    "htlcs": [{"status": "SUCCEEDED"}],  # Simulate LND's htlc status
+                },
+                None,
+                0,
+            )
+
+        # Simulate boltzcli swapinfo
+        elif "boltzcli" in command_parts[0] and "swapinfo" in command_parts:
+            print(f"[DEBUG] Boltz `swapinfo` command: {command_str}")
+            return (
+                {"status": "swap.success"},
+                None,
+                0,
+            )  # Simulate a successful swap status
+
+        else:
+            print(f"[DEBUG] Unhandled debug command: {command_str}")
+            return {"message": "Dry run success", "details": command_str}, None, 0
+
+    try:
+        process = subprocess.Popen(
+            command_parts, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        stdout, stderr = process.communicate(timeout=timeout)
+        return_code = process.returncode
+
+        if return_code == 0:
+            return stdout.strip(), None, 0
+        else:
+            error_msg = f"Command failed with exit code {return_code}.\nStderr: {stderr.strip()}\nStdout: {stdout.strip()}"
+            print_color(error_msg, Colors.FAIL)
+            return stdout.strip(), stderr.strip(), return_code
+
+    except FileNotFoundError:
+        error_msg = f"Error: Command not found: {command_parts[0]}. Please check the path in your config.ini."
+        print_color(error_msg, Colors.FAIL)
+        return "", error_msg, 1
+    except subprocess.TimeoutExpired:
+        error_msg = f"Command timed out after {timeout} seconds: {command_str}"
+        print_color(error_msg, Colors.FAIL)
+        if process.poll() is None:
+            process.kill()
+            stdout_after_kill, stderr_after_kill = process.communicate()
+            error_msg += f"\nKilled process. Stdout after kill: {stdout_after_kill.strip()}. Stderr after kill: {stderr_after_kill.strip()}"
+        return "", error_msg, 1
+    except Exception as e:
+        error_msg = f"An unexpected error occurred while running command: {command_str}\nError: {e}"
+        print_color(error_msg, Colors.FAIL)
+        return "", error_msg, 1
+
+
 def main():
     """Main execution flow."""
-    args = parse_arguments()
-    app_config = load_config()
+    args, parser = parse_arguments()
+    config = load_config(args.config)
 
-    print_color("--- Boltz LN to L-BTC Swap Initiator ---", Colors.HEADER, bold=True)
+    # Override args with config values if args are at their defaults
+    default_lndg_api = parser.get_default("lndg_api")
+    if args.lndg_api == default_lndg_api and "lndg_api_url" in config:
+        print(
+            f"[INFO] Overriding default LNDg API '{args.lndg_api}' with config value '{config['lndg_api_url']}'."
+        )
+        args.lndg_api = config["lndg_api_url"]
+
+    # Then print effective settings
+    print_color(
+        "\n--- Effective Settings After Config Override ---", Colors.HEADER, bold=True
+    )
+    print_color(f"LNDg API: {args.lndg_api}", Colors.OKCYAN)
+    print_color(f"Swap Amount (LN): {args.amount} sats", Colors.OKCYAN)
+    print_color(f"Min Local Balance (candidates): {args.capacity} sats", Colors.OKCYAN)
+    print_color(
+        f"Max Local Fee (candidates): {args.local_fee_limit} ppm", Colors.OKCYAN
+    )
+    # Print other relevant args if they can also be overridden by config
+
+    print_color("\n--- Initial Configuration & Paths ---", Colors.HEADER, bold=True)
     if args.debug:
         print_color(
             "DEBUG MODE ENABLED: No actual transactions.", Colors.WARNING, bold=True
         )
 
-    print_color(f"Swap Amount (LN): {args.amount} sats", Colors.OKCYAN)
-    print_color(f"Min Local Balance (candidates): {args.capacity} sats", Colors.OKCYAN)
-    print_color(f"Max Local Fee (candidates): {args.fee_limit} ppm", Colors.OKCYAN)
-    print_color(f"LNDg API: {app_config['lndg_api_url']}", Colors.OKCYAN)
     print_color(f"Paths (from config.ini):", Colors.OKCYAN)
-    print_color(f"  lncli: {app_config['lncli_path']}", Colors.OKCYAN)
-    print_color(f"  pscli: {app_config['pscli_path']}", Colors.OKCYAN)
-    print_color(f"  boltzcli: {app_config['boltzcli_path']}", Colors.OKCYAN)
+    print_color(f"  lncli: {config['lncli_path']}", Colors.OKCYAN)
+    print_color(f"  pscli: {config['pscli_path']}", Colors.OKCYAN)
+    print_color(f"  boltzcli: {config['boltzcli_path']}", Colors.OKCYAN)
+    print_color(f"  boltzd TLS Cert: {config['boltzd_tlscert_path']}", Colors.OKCYAN)
     print_color(
-        f"  boltzd TLS Cert: {app_config['boltzd_tlscert_path']}", Colors.OKCYAN
-    )
-    print_color(
-        f"  boltzd Admin Macaroon: {app_config['boltzd_admin_macaroon_path']}",
+        f"  boltzd Admin Macaroon: {config['boltzd_admin_macaroon_path']}",
         Colors.OKCYAN,
     )
 
     if args.description:
         print_color(f"Swap Description: {args.description}", Colors.OKCYAN)
 
-    lbtc_address = get_lbtc_address(app_config["pscli_path"], args.debug)
-    if not lbtc_address:
-        print_color("\nExiting: Failed to get L-BTC address.", Colors.FAIL, bold=True)
-        sys.exit(1)
-
-    candidate_channels = get_swap_candidate_channels(
-        app_config["lndg_api_url"],
-        app_config["lndg_username"],
-        app_config["lndg_password"],
-        args.capacity,
-        args.fee_limit,
-        args.debug,
-    )
-    if not candidate_channels:
-        print_color(
-            "\nExiting: No suitable swap candidate channels found.",
-            Colors.FAIL,
-            bold=True,
-        )
-        sys.exit(1)
-    print_color(
-        f"Total candidate channels for payment: {len(candidate_channels)}",
-        Colors.OKBLUE,
-    )
-
-    swap_id, lightning_invoice, boltz_response_dict = create_boltz_swap(
-        app_config["boltzcli_path"],
-        app_config["boltzd_tlscert_path"],
-        app_config["boltzd_admin_macaroon_path"],
-        args.amount,
-        lbtc_address,
-        args.description,
-        args.debug,
-    )
-    if not lightning_invoice:
-        print_color(
-            "\nExiting: Failed to create Boltz swap or get invoice.",
-            Colors.FAIL,
-            bold=True,
-        )
-        sys.exit(1)
-
-    payment_successful = pay_lightning_invoice(
-        app_config["lncli_path"],
-        lightning_invoice,
-        candidate_channels,
-        args.max_parts,
-        args.payment_timeout,
-        args.debug,
-    )
-
-    print_color("\n--- Swap Summary ---", Colors.HEADER, bold=True)
-    print_color(f"L-BTC Destination Address: {lbtc_address}", Colors.OKCYAN)
-    print_color(f"Boltz Swap ID: {swap_id if swap_id else 'N/A'}", Colors.OKCYAN)
-
-    if boltz_response_dict and isinstance(boltz_response_dict, dict):
-        b_expected_amount = boltz_response_dict.get("expectedAmount")
-        b_invoice_amount = boltz_response_dict.get("invoiceAmount")
-        b_lockup_addr = boltz_response_dict.get("lockupAddress")
-
-        if b_invoice_amount:
+    try:  # Start of try block for KeyboardInterrupt
+        lbtc_address = get_lbtc_address(config["pscli_path"], args.debug)
+        if not lbtc_address:
             print_color(
-                f"Boltz Stated LN Invoice Amount: {b_invoice_amount} sats",
-                Colors.OKCYAN,
+                "\nExiting: Failed to get L-BTC address.", Colors.FAIL, bold=True
             )
-        if b_expected_amount:
-            print_color(
-                f"Boltz Est. L-BTC Sent (onchain): {b_expected_amount} sats",
-                Colors.OKCYAN,
-            )
-        if b_lockup_addr:
-            print_color(f"Boltz L-BTC Lockup Address: {b_lockup_addr}", Colors.OKCYAN)
+            sys.exit(1)
 
-    if payment_successful:
-        print_color("Swap Initiated & LN Invoice Paid!", Colors.OKGREEN, bold=True)
-        print_color("Monitor your Liquid wallet for L-BTC.", Colors.OKGREEN)
-        if swap_id and swap_id != "unknown_swap_id":
-            print_color(
-                f"Check status: {app_config['boltzcli_path']} --tlscert {app_config['boltzd_tlscert_path']} --macaroon {app_config['boltzd_admin_macaroon_path']} swapinfo {swap_id}",
-                Colors.OKCYAN,
-            )
-    else:
-        print_color("Swap Failed: LN invoice not paid.", Colors.FAIL, bold=True)
-        print_color(
-            "No funds should have left LN wallet if all attempts failed.",
-            Colors.WARNING,
+        candidate_channels = get_swap_candidate_channels(
+            args.lndg_api,  # Use the potentially overridden args.lndg_api
+            config["lndg_username"],
+            config["lndg_password"],
+            args.capacity,
+            args.local_fee_limit,
+            args.debug,
         )
-        if swap_id and swap_id != "unknown_swap_id":
+        if not candidate_channels:
             print_color(
-                f"Check status: {app_config['boltzcli_path']} --tlscert {app_config['boltzd_tlscert_path']} --macaroon {app_config['boltzd_admin_macaroon_path']} swapinfo {swap_id}",
+                "\nExiting: No suitable swap candidate channels found.",
+                Colors.FAIL,
+                bold=True,
+            )
+            sys.exit(1)
+        print_color(
+            f"Total candidate channels for payment: {len(candidate_channels)}",
+            Colors.OKBLUE,
+        )
+
+        swap_id, lightning_invoice, boltz_response_dict = create_boltz_swap(
+            config["boltzcli_path"],
+            config["boltzd_tlscert_path"],
+            config["boltzd_admin_macaroon_path"],
+            args.amount,
+            lbtc_address,
+            args.description,
+            args.debug,
+        )
+        if not lightning_invoice:
+            print_color(
+                "\nExiting: Failed to create Boltz swap or get invoice.",
+                Colors.FAIL,
+                bold=True,
+            )
+            sys.exit(1)
+
+        payment_successful = pay_lightning_invoice(
+            config,
+            args,
+            lightning_invoice,
+            candidate_channels,
+            args.debug,
+        )
+
+        print_color("\n--- Swap Summary ---", Colors.HEADER, bold=True)
+        print_color(f"L-BTC Destination Address: {lbtc_address}", Colors.OKCYAN)
+        print_color(f"Boltz Swap ID: {swap_id if swap_id else 'N/A'}", Colors.OKCYAN)
+
+        if boltz_response_dict and isinstance(boltz_response_dict, dict):
+            b_expected_amount = boltz_response_dict.get("expectedAmount")
+            # Assuming invoiceAmount is the LN invoice amount Boltz expects to be paid
+            b_invoice_amount = None
+            if "invoice" in boltz_response_dict:
+                # Attempt to decode the invoice to get its amount (more robust)
+                # This is a placeholder for actual invoice decoding if needed,
+                # for now, we rely on what Boltz might provide directly.
+                # For simplicity, let's assume boltz_response_dict might have an "invoiceAmount" key
+                # or we could parse it from the invoice string if necessary.
+                b_invoice_amount = boltz_response_dict.get(
+                    "invoiceAmount"
+                )  # Check if Boltz provides this
+
+            b_lockup_addr = boltz_response_dict.get("lockupAddress")
+
+            if b_invoice_amount:  # This is the LN invoice amount
+                print_color(
+                    f"Boltz Expected LN Payment Amount: {b_invoice_amount} sats",  # Clarified label
+                    Colors.OKCYAN,
+                )
+            if b_expected_amount:  # This is what Boltz should send on-chain (L-BTC)
+                print_color(
+                    f"Boltz Est. L-BTC Sent (onchain): {b_expected_amount} sats",
+                    Colors.OKCYAN,
+                )
+            if b_lockup_addr:
+                print_color(
+                    f"Boltz L-BTC Lockup Address: {b_lockup_addr}", Colors.OKCYAN
+                )
+
+        if payment_successful:
+            print_color("Swap Initiated & LN Invoice Paid!", Colors.OKGREEN, bold=True)
+            print_color("Monitor your Liquid wallet for L-BTC.", Colors.OKGREEN)
+            if swap_id and swap_id != "unknown_swap_id":
+                print_color(
+                    f"Check status: {config['boltzcli_path']} --tlscert {config['boltzd_tlscert_path']} --macaroon {config['boltzd_admin_macaroon_path']} swapinfo {swap_id}",
+                    Colors.OKCYAN,
+                )
+        else:
+            print_color("Swap Failed: LN invoice not paid.", Colors.FAIL, bold=True)
+            print_color(
+                "No funds should have left LN wallet if all attempts failed.",
                 Colors.WARNING,
             )
+            if swap_id and swap_id != "unknown_swap_id":
+                print_color(
+                    f"Check status: {config['boltzcli_path']} --tlscert {config['boltzd_tlscert_path']} --macaroon {config['boltzd_admin_macaroon_path']} swapinfo {swap_id}",
+                    Colors.WARNING,
+                )
+        sys.exit(0 if payment_successful else 1)  # Exit with 0 on success, 1 on failure
+
+    except KeyboardInterrupt:
+        print_color(
+            "\n\nScript aborted by user (CTRL-C). Exiting.", Colors.WARNING, bold=True
+        )
+        # Attempt to provide Boltz swap ID if available, for manual checking
+        # Check if swap_id was defined before interruption
+        current_swap_id = locals().get("swap_id")
+        if current_swap_id and current_swap_id != "unknown_swap_id":
+            print_color(
+                f"If a Boltz swap was initiated, its ID might be: {current_swap_id}",
+                Colors.WARNING,
+            )
+            print_color(
+                f"You may need to check its status manually using boltzcli swapinfo {current_swap_id}",
+                Colors.WARNING,
+            )
+        sys.exit(130)  # Standard exit code for CTRL+C
+    except Exception as e:
+        print_color(f"\nAn unexpected error occurred: {e}", Colors.FAIL, bold=True)
+        import traceback
+
+        print_color(
+            traceback.format_exc(), Colors.FAIL
+        )  # Print full traceback for unexpected errors
+        sys.exit(2)  # General error exit code
 
 
 if __name__ == "__main__":
