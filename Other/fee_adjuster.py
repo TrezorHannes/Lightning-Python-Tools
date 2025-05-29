@@ -11,8 +11,6 @@ Configuration Settings (see fee_adjuster_config_docs.txt for details):
 - trend_sensitivity: Multiplier for the influence of Amboss fee trends on the adjustment.
 - fee_base: Statistical measure from Amboss used as the fee calculation base ("median", "mean", etc.).
 - groups: Node categories for applying differentiated strategies via group_adjustment_percentage.
-- max_outbound: (Optional) Maximum outbound liquidity percentage (0.0-1.0). Script only applies adjustments if channel's outbound liquidity is *below* this value.
-- min_outbound: (Optional) Minimum outbound liquidity percentage (0.0-1.0). Script only applies adjustments if channel's outbound liquidity is *above* this value.
 - fee_bands: (Optional) Dynamic fee adjustments based on local liquidity.
   - enabled: true/false.
   - discount: Negative percentage adjustment for high local balance (80-100%).
@@ -20,6 +18,7 @@ Configuration Settings (see fee_adjuster_config_docs.txt for details):
 - stuck_channel_adjustment: (Optional) Gradually reduces fees for channels without recent forwards.
   - enabled: true/false.
   - stuck_time_period: Number of days defining one 'stuck period' interval (e.g., 7).
+  - min_local_balance_for_stuck_discount: (Optional) If the peer's aggregate local balance ratio is below this threshold (e.g., 0.2 for 20%), the stuck discount will not be applied, even if the channel is otherwise considered stuck.
 
 Groups and group_adjustment_percentage:
 Allows tailored fee strategies for nodes in specific categories (e.g., "sink", "expensive").
@@ -32,7 +31,8 @@ This feature incrementally reduces fees for channels that haven't forwarded paym
 For each multiple of the `stuck_time_period` (in days) that a peer's channels have gone without an *outbound* forwarding, the fee band is moved down by one level (towards the maximum discount).
 The adjustment is capped at moving down 4 bands (reaching the maximum discount band).
 If an outbound forward is detected for any channel of the peer, the stuck adjustment is reset to 0 bands down.
-This adjustment is automatically skipped if the aggregate local liquidity for the peer is below 20%, preventing discounts on heavily imbalanced channels needing rebalancing. The script queries the LNDg API to find the timestamp of the last outbound forward for the peer.
+If `min_local_balance_for_stuck_discount` is set and the peer's aggregate local liquidity is below this threshold, this discount mechanism is skipped.
+The script queries the LNDg API to find the timestamp of the last outbound forward for the peer.
 
 Usage:
 - Configure nodes and their settings in `feeConfig.json`.
@@ -292,10 +292,11 @@ def get_last_peer_forwarding_timestamp(pubkey, days_to_check_back, channel_ids, 
 
 def calculate_stuck_channel_band_adjustment(
     fee_conditions,
-    channel_data,  # Used for liquidity check
+    outbound_ratio,  # Added: The current outbound ratio for the peer
     last_forward_timestamp,  # datetime of last outbound forward (or None)
     stuck_time_period,  # configured stuck period in days
     checked_window_days,  # New parameter: The number of days checked back by the API call
+    min_local_balance_for_stuck_discount,  # NEW: Minimum local balance to apply stuck discount
 ):
     """
     Calculate the number of bands to move down based on how long the peer
@@ -303,72 +304,52 @@ def calculate_stuck_channel_band_adjustment(
 
     Args:
         fee_conditions: Dictionary containing stuck channel settings.
-        channel_data: Data about the channel (used for liquidity check).
+        outbound_ratio: The aggregate outbound liquidity ratio for the peer (0.0-1.0).
         last_forward_timestamp: datetime object of the last outbound forward, or None.
         stuck_time_period: The configured stuck time period in days.
         checked_window_days: The number of days the API checked back for forwards.
+        min_local_balance_for_stuck_discount: Minimum local balance ratio to apply discount.
+
 
     Returns:
-        tuple: (bands_to_move_down: int, days_stuck: int)
+        tuple: (bands_to_move_down: int, days_stuck: int, skip_reason: str|None)
                bands_to_move_down is the calculated number of bands (0-4).
                days_stuck is the number of days since the last forward, or
                checked_window_days + 1 if no forward was found in the window.
+               skip_reason is a string if adjustment was skipped, else None.
     """
     stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
     if not stuck_settings.get("enabled", False):
-        # If disabled, days_stuck can be represented as 0 or None, let's use 0 for simplicity
-        return 0, 0
+        return 0, 0, "Stuck adjustment disabled in config"
 
-    # Skip stuck channel adjustment if local liquidity is too low (below 20%)
-    capacity = channel_data.get("capacity", 0)
-    local_balance = channel_data.get("local_balance", 0)
-    outbound_ratio = (local_balance / capacity) if capacity > 0 else 0
-
-    if outbound_ratio < 0.2:  # Less than 20% local liquidity
-        # If liquidity is low, calculate days stuck for logging/notes if timestamp is available,
-        # otherwise indicate it's beyond the checked window.
+    # NEW: Skip stuck channel discount if local liquidity is too low
+    if outbound_ratio < min_local_balance_for_stuck_discount:
+        days_stuck_for_low_liq = 0
         if last_forward_timestamp is None:
-            # No forward in the window, and low liquidity skips adjustment
-            days_stuck = checked_window_days + 1  # Indicate beyond the window
+            days_stuck_for_low_liq = checked_window_days + 1
         else:
-            # Forward found, but low liquidity skips adjustment
-            days_stuck = (datetime.now() - last_forward_timestamp).days
-
-        return 0, days_stuck  # Return 0 bands down if liquidity is low
+            days_stuck_for_low_liq = (datetime.now() - last_forward_timestamp).days
+        return (
+            0,
+            days_stuck_for_low_liq,
+            f"Low liquidity ({outbound_ratio*100:.1f}% < {min_local_balance_for_stuck_discount*100:.1f}%)",
+        )
 
     if last_forward_timestamp is None:
-        # No outbound forward found within the checked_window_days.
-        # Calculate bands based on the minimum possible stuck duration beyond the window,
-        # and represent days stuck as beyond the window.
-        days_stuck = checked_window_days + 1  # Indicate beyond the window
-
-        # Since no forward was found in the window, the channel is stuck for at least checked_window_days.
-        # Calculate how many stuck_time_period intervals fit into checked_window_days.
+        days_stuck = checked_window_days + 1
         calculated_bands_to_move_down = checked_window_days // stuck_time_period
-        # If checked_window_days is exactly a multiple, it means it's stuck for that many periods.
-        # If it's more, it's stuck for more periods. We add 1 to ensure we count the *start*
-        # of the interval just passed.
-        # Example: stuck_period=7, checked_window=12. days_stuck would be 13.
-        # calculated_bands_to_move_down = 12 // 7 = 1. This is correct for days 7-13.
-        # If checked_window=14, days_stuck would be 15. 14 // 7 = 2. Correct for days 14-20.
-        # This logic seems sound for calculating minimum bands down when timestamp is None.
-
     else:
-        # Outbound forward found within the checked_window_days.
         time_difference = datetime.now() - last_forward_timestamp
         days_stuck = time_difference.days
-
-        # Calculate bands to move down based on actual days stuck.
         calculated_bands_to_move_down = days_stuck // stuck_time_period
 
-    # Cap the total bands moved down at 4 (as Band 4 is the furthest premium band)
-    bands_to_move_down = min(calculated_bands_to_move_down, 4)  # Cap at 4 bands down
+    bands_to_move_down = min(calculated_bands_to_move_down, 4)
 
     logging.debug(
         f"Stuck calculation (within {checked_window_days}d window): days_stuck={days_stuck}, stuck_period={stuck_time_period}, calculated_bands={calculated_bands_to_move_down}, final_bands_to_move_down={bands_to_move_down}"
     )
 
-    return bands_to_move_down, days_stuck
+    return bands_to_move_down, days_stuck, None  # No skip reason if we got this far
 
 
 def calculate_fee_band_adjustment(
@@ -591,7 +572,7 @@ def update_channel_notes(
     new_fee_rate=None,
     stuck_bands_to_move_down=0,  # Renamed parameter
     days_stuck=None,  # New parameter: days since last forward
-    is_low_liquidity_for_stuck=False,  # New parameter: flag if low liquidity skipped
+    stuck_skip_reason=None,  # NEW: Reason why stuck adjustment might have been skipped
 ):
     """Update the channel notes in LNDg with fee adjuster information."""
     update_channel_notes_enabled = node_definitions.get("update_channel_notes", False)
@@ -650,18 +631,36 @@ def update_channel_notes(
     stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
     if stuck_settings.get("enabled", False):
         stuck_period = stuck_settings.get("stuck_time_period", 7)
-        stuck_notes_part = (
-            f"\nStuck adjust: {'✅' if stuck_bands_to_move_down > 0 else '❌'}"
-        )
+        min_stuck_balance_threshold = stuck_settings.get(
+            "min_local_balance_for_stuck_discount", 0.0
+        )  # Get the threshold for notes
+
+        stuck_notes_part = f"\nStuck adjust: "
+        if stuck_skip_reason:
+            stuck_notes_part += f"❌ ({stuck_skip_reason})"
+        elif stuck_bands_to_move_down > 0:
+            stuck_notes_part += f"✅"
+        else:  # Enabled, no skip reason, but 0 bands down (e.g. active or days_stuck < period)
+            stuck_notes_part += f"✔ (Active or <{stuck_period}d)"
+
         stuck_notes_part += f" | Period: {stuck_period}d"
-        if days_stuck is not None:
+        if (
+            days_stuck is not None
+        ):  # days_stuck will be populated even if skipped for low liquidity
             stuck_notes_part += f" | Stuck: {days_stuck}d"
-        if is_low_liquidity_for_stuck:
-            stuck_notes_part += " (Low Liq Skip)"
-        if stuck_bands_to_move_down > 0:
+
+        # Add threshold to notes if it's greater than 0 for clarity
+        if min_stuck_balance_threshold > 0:
+            stuck_notes_part += f" | MinLiq: {min_stuck_balance_threshold*100:.0f}%"
+
+        if (
+            stuck_bands_to_move_down > 0 and not stuck_skip_reason
+        ):  # Only show bands down if applied
             stuck_notes_part += f" | Bands Down: {stuck_bands_to_move_down}"
 
         notes += stuck_notes_part
+    else:
+        notes += "\nStuck adjust: Disabled"
 
     # Log the notes we're going to send
     logging.debug(f"Channel {chan_id} notes to update: {notes}")
@@ -731,7 +730,8 @@ def print_fee_adjustment(
     stuck_adj_enabled,
     stuck_period,
     peer_stuck_status,  # Now a detailed status string
-    is_low_liquidity_for_stuck,  # Flag indicating if low liquidity skipped adjustment
+    stuck_skip_reason,  # NEW: Reason for skipping stuck adjustment
+    min_local_balance_for_stuck_discount,  # NEW: The threshold used
     days_stuck,  # Days since last outbound forward
     # Amboss Data
     amboss_data,
@@ -813,18 +813,19 @@ def print_fee_adjustment(
     print(f"  Stuck Adjustment: {'Enabled' if stuck_adj_enabled else 'Disabled'}")
     if stuck_adj_enabled:
         print(f"    - Period: {stuck_period} days")
-        print(f"    - Days Stuck: {days_stuck} days")  # Print actual days stuck
-        print(f"    - Peer Status: {peer_stuck_status}")  # Print detailed status
-        if is_low_liquidity_for_stuck:
-            print(
-                f"    - Adjustment Skipped: Low Liquidity ({outbound_ratio*100:.1f}% < 20%)"
-            )
+        print(
+            f"    - Min Local Balance for Discount: {min_local_balance_for_stuck_discount*100:.1f}%"
+        )  # Show the threshold
+        print(f"    - Days Stuck: {days_stuck} days")
+        print(f"    - Peer Status: {peer_stuck_status}")
+        if stuck_skip_reason:  # Use the new skip_reason
+            print(f"    - Adjustment Skipped: {stuck_skip_reason}")
         elif stuck_adj_bands_applied > 0:
             print(f"    - Adjustment Applied: {stuck_adj_bands_applied} bands down")
         else:
-            # This case means stuck is enabled, not low liquidity, but 0 bands applied.
-            # This happens if days_stuck < stuck_period.
-            print(f"    - Adjustment Applied: 0 bands (Days stuck < Period)")
+            print(
+                f"    - Adjustment Applied: 0 bands (Peer active or days stuck < period)"
+            )
 
     # --- Amboss Table ---
     print("\n--- Amboss Peer Fee Data (Remote Perspective) ---")
@@ -918,6 +919,9 @@ def main():
             stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
             stuck_adj_enabled = stuck_settings.get("enabled", False)
             stuck_period = stuck_settings.get("stuck_time_period", 7)
+            min_local_balance_for_stuck_discount = stuck_settings.get(
+                "min_local_balance_for_stuck_discount", 0.0
+            )
 
             # Calculate the maximum relevant historical window for stuck checks
             # 4 is the maximum number of bands down, so we only need to check back 4 * stuck_time_period days
@@ -963,92 +967,73 @@ def main():
                     (total_local_balance / total_capacity) if total_capacity else 0
                 )
 
-                ## --- Liquidity Bounds Check ---
-                max_outbound = fee_conditions.get("max_outbound", 1.0)
-                min_outbound = fee_conditions.get("min_outbound", 0.0)
-
-                if not (check_ratio <= max_outbound and check_ratio >= min_outbound):
-                    alias_to_log = first_channel_data[
-                        "alias"
-                    ]  # Use first alias for logging consistency
-                    logging.info(
-                        f"Peer {pubkey} (Alias: {alias_to_log}, {num_channels} channels) skipped due to outbound liquidity conditions. "
-                        f"Ratio: {check_ratio:.2f}, Max: {max_outbound}, Min: {min_outbound}"
-                    )
-                    if terminal_output_enabled:
-                        print("-" * 80)
-                        print()
-                        print(
-                            f"\033[91mPeer {pubkey} (Alias: {alias_to_log}, {num_channels} channels) skipped due to outbound liquidity conditions.\033[0m"
-                        )
-                        print(
-                            f"\033[91mAggregate Ratio: {check_ratio:.2f}, Max: {max_outbound}, Min: {min_outbound}\033[0m"
-                        )
-                        print()
-                    continue  # Skip this entire peer
+                ## --- Liquidity Bounds Check (REMOVED) ---
+                # The max_outbound check has been removed.
+                # The script will now always proceed unless other skip conditions are met.
 
                 # --- Stuck Check & Adjustment Calculation ---
                 stuck_bands_to_move_down = 0
-                days_stuck = 0  # Initialize days stuck
-                last_forward_timestamp = None  # Initialize last forward timestamp
+                days_stuck = 0
+                last_forward_timestamp = None
+                stuck_skip_reason = None  # Initialize skip reason
 
-                is_low_liquidity_for_stuck = (
-                    check_ratio < 0.2
-                )  # Check liquidity for stuck skip
-
-                peer_stuck_status = "N/A (Disabled)"  # Default status for printing
+                peer_stuck_status = "N/A (Stuck Adj. Disabled)"
 
                 if stuck_adj_enabled:
                     peer_stuck_status = "Checking..."
-                    # Check within the dynamically calculated window
-                    # get_last_peer_forwarding_timestamp will log details when --debug is enabled
                     last_forward_timestamp = get_last_peer_forwarding_timestamp(
                         pubkey, stuck_check_window_days, channel_ids_list, config
                     )
 
-                    # Calculate the number of bands to move down based on the check result
-                    bands_calc_result = calculate_stuck_channel_band_adjustment(
-                        fee_conditions,
-                        first_channel_data,  # Pass channel_data for liquidity check inside func
-                        last_forward_timestamp,  # Use the timestamp from the check
-                        stuck_period,
-                        stuck_check_window_days,  # Pass the checked_window_days to the function
+                    bands_calc_result, days_stuck_calc, skip_reason_calc = (
+                        calculate_stuck_channel_band_adjustment(
+                            fee_conditions,
+                            check_ratio,  # Pass the aggregate outbound ratio
+                            last_forward_timestamp,
+                            stuck_period,
+                            stuck_check_window_days,
+                            min_local_balance_for_stuck_discount,  # Pass the new threshold
+                        )
                     )
-                    stuck_bands_to_move_down, days_stuck = (
-                        bands_calc_result  # Unpack the two values
-                    )
+                    stuck_bands_to_move_down = bands_calc_result
+                    days_stuck = days_stuck_calc
+                    stuck_skip_reason = skip_reason_calc
 
                     # Determine the final peer status string for printing/notes
-                    if last_forward_timestamp is not None:
-                        peer_stuck_status = "Active"
-                    elif is_low_liquidity_for_stuck:
-                        peer_stuck_status = "Stuck (Low Liquidity Skip)"
-                    else:
-                        # If stuck_adj_enabled, not low liquidity, and no timestamp found,
-                        # it's stuck beyond the check window. days_stuck is already set
-                        # to checked_window_days + 1 in calculate_stuck_channel_band_adjustment.
+                    if stuck_skip_reason:
+                        peer_stuck_status = f"Stuck Adj. Skipped ({stuck_skip_reason})"
+                    elif last_forward_timestamp is not None:
+                        peer_stuck_status = "Active (Recent Outbound Forward)"
+                    else:  # No skip reason, no timestamp -> stuck beyond window
                         peer_stuck_status = f"Stuck (>{stuck_check_window_days} days, {stuck_bands_to_move_down} bands down)"
 
-                # Add the debug print block here
-                if terminal_output_enabled and stuck_adj_enabled:
-                    print("-" * 80)  # Use separator like in main output
+                if (
+                    terminal_output_enabled and stuck_adj_enabled
+                ):  # Debug output for stuck check
+                    print("-" * 80)
                     print(f"--- Stuck Check Debug for Peer {pubkey[:10]}... ---")
                     print(f"  Configured stuck_time_period: {stuck_period} days")
+                    print(
+                        f"  Configured min_local_balance_for_stuck_discount: {min_local_balance_for_stuck_discount*100:.1f}%"
+                    )
                     print(f"  API Check Window: {stuck_check_window_days} days")
                     print(
                         f"  Last outbound forward timestamp found: {last_forward_timestamp if last_forward_timestamp else 'None'}"
                     )
+                    print(f"  Calculated days since last forward: {days_stuck}")
                     print(
-                        f"  Calculated days since last forward: {days_stuck}"
-                    )  # This will now show >window_size if stuck
-                    print(f"  Aggregate Outbound Ratio: {check_ratio*100:.1f}%")
-                    print(
-                        f"  Low liquidity skip check (ratio < 20%): {is_low_liquidity_for_stuck}"
+                        f"  Aggregate Outbound Ratio for Peer: {check_ratio*100:.1f}%"
                     )
-                    print(f"  Calculated stuck bands down: {stuck_bands_to_move_down}")
-                    print(f"  Final Peer Status determination: {peer_stuck_status}")
+                    if stuck_skip_reason:
+                        print(f"  Stuck Adjustment Skip Reason: {stuck_skip_reason}")
+                    print(
+                        f"  Calculated stuck bands down (after checks): {stuck_bands_to_move_down}"
+                    )
+                    print(
+                        f"  Final Peer Status determination for stuck logic: {peer_stuck_status}"
+                    )
                     print("--- End Stuck Check Debug ---")
-                    sys.stdout.flush()  # Ensure output is shown immediately
+                    sys.stdout.flush()
 
                 # --- Calculate Adjustments ---
                 # Call calculate_fee_band_adjustment with the determined stuck_bands_to_move_down
@@ -1114,7 +1099,7 @@ def main():
                                 final_rate,  # Pass the final calculated fee rate
                                 stuck_bands_to_move_down,  # Pass the calculated stuck bands applied
                                 days_stuck,  # Pass the calculated days stuck
-                                is_low_liquidity_for_stuck,  # Pass the low liquidity flag for notes
+                                stuck_skip_reason,  # Pass the skip reason to notes
                             )
                         except Exception as note_err:
                             logging.error(
@@ -1166,9 +1151,10 @@ def main():
                             # Stuck Context
                             stuck_adj_enabled=stuck_adj_enabled,
                             stuck_period=stuck_period,
-                            peer_stuck_status=peer_stuck_status,  # Pass the status string
-                            is_low_liquidity_for_stuck=is_low_liquidity_for_stuck,  # Pass low liquidity flag
-                            days_stuck=days_stuck,  # Pass days stuck
+                            peer_stuck_status=peer_stuck_status,
+                            stuck_skip_reason=stuck_skip_reason,  # Pass to print function
+                            min_local_balance_for_stuck_discount=min_local_balance_for_stuck_discount,  # Pass to print
+                            days_stuck=days_stuck,
                             # Amboss Data
                             amboss_data=all_amboss_data,
                         )
