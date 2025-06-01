@@ -672,6 +672,17 @@ def create_boltz_swap(
         return None, None, None
 
 
+# Constants for retry logic
+MAX_IN_TRANSITION_RETRIES = 4
+# Initial delay, will be doubled for same batch. If you send large payments, you may want to increase this.
+# Be careful with this, as it will increase the total time to pay the invoice.
+IN_TRANSITION_RETRY_INITIAL_DELAY_SECONDS = 30
+SUBPROCESS_TIMEOUT_BUFFER_SECONDS = (
+    30  # Buffer for subprocess.communicate over lncli's own timeout
+)
+# Delay between DIFFERENT batches is hardcoded further down as 30 seconds.
+
+
 def pay_lightning_invoice(
     config,
     args,
@@ -681,6 +692,7 @@ def pay_lightning_invoice(
 ):
     """
     Pays the Lightning invoice using lncli with retries on different channel batches.
+    Includes logic to retry the same batch with doubled script timeout if "payment is in transition" is detected.
     Returns True on success, False on failure.
     """
     print_color(
@@ -691,7 +703,7 @@ def pay_lightning_invoice(
         args.max_parts if args.max_parts is not None else "lncli default"
     )
     print_color(
-        f"Timeout per attempt: {args.payment_timeout}, Max Parts: {max_parts_display}",
+        f"Timeout per attempt (lncli --timeout): {args.payment_timeout}, Max Parts: {max_parts_display}",
         Colors.OKCYAN,
     )
 
@@ -699,167 +711,174 @@ def pay_lightning_invoice(
         print_color("No candidate channels for payment. Aborting.", Colors.FAIL)
         return False
 
-    timeout_seconds = 0
+    # Calculate base timeout_seconds for lncli's own execution
+    lncli_timeout_seconds = 0
     if args.payment_timeout.lower().endswith("s"):
-        timeout_seconds = int(args.payment_timeout[:-1])
+        lncli_timeout_seconds = int(args.payment_timeout[:-1])
     elif args.payment_timeout.lower().endswith("m"):
-        timeout_seconds = int(args.payment_timeout[:-1]) * 60
+        lncli_timeout_seconds = int(args.payment_timeout[:-1]) * 60
     elif args.payment_timeout.lower().endswith("h"):
-        timeout_seconds = int(args.payment_timeout[:-1]) * 3600
+        lncli_timeout_seconds = int(args.payment_timeout[:-1]) * 3600
     else:
         try:
-            timeout_seconds = int(args.payment_timeout)
+            lncli_timeout_seconds = int(args.payment_timeout)
         except ValueError:
             print_color(
-                f"Invalid payment timeout '{args.payment_timeout}'. Defaulting to 600s.",
+                f"Invalid payment timeout '{args.payment_timeout}'. Defaulting to 300s for lncli.",
                 Colors.WARNING,
             )
-            timeout_seconds = 600
+            lncli_timeout_seconds = 300  # Defaulting to 5 minutes for lncli itself
 
     batch_size = 3
-    num_payment_attempts = (
+    num_total_batches = (
         (len(candidate_chan_ids) + batch_size - 1) // batch_size
         if candidate_chan_ids
         else 0
     )
-    if args.max_payment_attempts is not None:
-        num_payment_attempts = min(num_payment_attempts, args.max_payment_attempts)
 
-    payment_attempt_count = 0
+    # Determine the number of batches to actually try based on max_payment_attempts
+    # This refers to the number of *different channel batches* to try.
+    num_batches_to_try = num_total_batches
+    if (
+        args.max_payment_attempts is not None
+    ):  # args.max_payment_attempts limits number of DIFFERENT batches
+        num_batches_to_try = min(num_total_batches, args.max_payment_attempts)
+
+    overall_payment_attempt_batch_count = 0  # Counts distinct batches tried
     for i in range(0, len(candidate_chan_ids), batch_size):
         if (
             args.max_payment_attempts is not None
-            and payment_attempt_count >= args.max_payment_attempts
+            and overall_payment_attempt_batch_count >= args.max_payment_attempts
         ):
             print_color(
-                f"Reached max payment attempts ({args.max_payment_attempts}). Stopping.",
+                f"Reached max payment batches ({args.max_payment_attempts}). Stopping.",
                 Colors.WARNING,
             )
             break
-        payment_attempt_count += 1
+        overall_payment_attempt_batch_count += 1
 
         current_batch_ids = candidate_chan_ids[i : i + batch_size]
         print_color(
-            f"\nAttempt {payment_attempt_count}/{num_payment_attempts} with channels: {', '.join(current_batch_ids)}",
+            f"\nAttempting Batch {overall_payment_attempt_batch_count}/{num_batches_to_try} with channels: {', '.join(current_batch_ids)}",
             Colors.OKBLUE,
         )
 
-        # Use construct_lncli_command to build the command
-        # It now returns: (actual_command_list, display_command_string)
-        actual_command_list, display_command_str = construct_lncli_command(
-            config, args, invoice_str, current_batch_ids
+        # Initial subprocess timeout for this batch (Python script's wait time for lncli to finish)
+        # This should be based on lncli's own timeout plus a buffer, and remains constant for this batch's attempts.
+        script_subprocess_timeout_for_this_batch = (
+            lncli_timeout_seconds + SUBPROCESS_TIMEOUT_BUFFER_SECONDS
+        )
+        in_transition_retry_count_for_this_batch = 0
+        current_in_transition_retry_delay_seconds = (
+            IN_TRANSITION_RETRY_INITIAL_DELAY_SECONDS
         )
 
-        subprocess_actual_timeout = timeout_seconds + 15
+        # Inner loop for "in transition" retries for the CURRENT batch
+        while True:
+            actual_command_list, display_command_str = construct_lncli_command(
+                config, args, invoice_str, current_batch_ids
+            )  # lncli's --timeout is set here based on args.payment_timeout
 
-        success_exit_codes = [0]
-
-        command_success, output, error_stderr = run_command(
-            actual_command_list,  # Pass the actual command list for execution
-            timeout=subprocess_actual_timeout,
-            debug=debug,
-            expect_json=True,
-            dry_run_output="lncli payinvoice command",
-            success_codes=success_exit_codes,  # Only 0 is true success for the payment itself
-            display_str_override=display_command_str,  # Pass the string for display
-        )
-
-        if command_success:  # lncli exited with 0
-            if debug:
+            if (
+                in_transition_retry_count_for_this_batch > 0
+            ):  # If this is a retry due to "in transition"
                 print_color(
-                    f"[DEBUG] Payment successful (simulated). Preimage: {output.get('payment_preimage', 'N/A')}",
-                    Colors.OKGREEN,
-                )
-                return True
-
-            if isinstance(output, dict):
-                payment_error_field = output.get("payment_error")
-                payment_preimage = output.get("payment_preimage")
-                top_level_status = output.get("status")
-                failure_reason = output.get("failure_reason")
-
-                is_successful_payment = (
-                    payment_preimage
-                    and payment_preimage != ""
-                    and (top_level_status == "SUCCEEDED" or not top_level_status)
-                    and (failure_reason == "FAILURE_REASON_NONE" or not failure_reason)
-                    and (not payment_error_field or payment_error_field == "")
+                    f"  Retrying (in transition attempt {in_transition_retry_count_for_this_batch}/{MAX_IN_TRANSITION_RETRIES}) "
+                    f"with script timeout {script_subprocess_timeout_for_this_batch}s.",
+                    Colors.OKCYAN,
                 )
 
-                if is_successful_payment:
+            command_success, output, error_stderr = run_command(
+                actual_command_list,
+                timeout=script_subprocess_timeout_for_this_batch,  # Use the fixed script timeout for this batch
+                debug=debug,
+                expect_json=True,
+                dry_run_output="lncli payinvoice command",
+                success_codes=[0],
+                display_str_override=display_command_str,
+            )
+
+            if command_success:  # lncli exited with 0
+                if debug:  # Debug mock for payinvoice should simulate success
                     print_color(
-                        f"Invoice payment successful! Preimage: {payment_preimage}",
+                        f"[DEBUG] Payment successful (simulated by lncli exit 0 in debug). Preimage: {output.get('payment_preimage', 'N/A')}",
                         Colors.OKGREEN,
                     )
-                    if "payment_route" in output and output["payment_route"]:
-                        print_color(
-                            f"  Route details: {json.dumps(output['payment_route'], indent=2)}",
-                            Colors.OKCYAN,
+                    return True
+
+                if isinstance(output, dict):
+                    payment_error_field = output.get("payment_error")
+                    payment_preimage = output.get("payment_preimage")
+                    top_level_status = output.get("status")
+                    failure_reason = output.get("failure_reason")
+
+                    is_successful_payment = (
+                        payment_preimage
+                        and payment_preimage != ""
+                        and (top_level_status == "SUCCEEDED" or not top_level_status)
+                        and (
+                            failure_reason == "FAILURE_REASON_NONE"
+                            or not failure_reason
                         )
-                    else:
-                        successful_htlc_route = None
-                        if "htlcs" in output and isinstance(output["htlcs"], list):
-                            for htlc in output["htlcs"]:
-                                if htlc.get("status") == "SUCCEEDED" and htlc.get(
-                                    "route"
-                                ):
-                                    successful_htlc_route = htlc.get("route")
-                                    break
-                        if successful_htlc_route:
+                        and (not payment_error_field or payment_error_field == "")
+                    )
+
+                    if is_successful_payment:
+                        print_color(
+                            f"Invoice payment successful! Preimage: {payment_preimage}",
+                            Colors.OKGREEN,
+                        )
+                        # (Existing logic to print route details)
+                        if "payment_route" in output and output["payment_route"]:
                             print_color(
-                                f"  Successful HTLC Route details: {json.dumps(successful_htlc_route, indent=2)}",
+                                f"  Route details: {json.dumps(output['payment_route'], indent=2)}",
                                 Colors.OKCYAN,
                             )
-                    return True
-                else:
+                        else:  # Check htlcs array
+                            successful_htlc_route = None
+                            if "htlcs" in output and isinstance(output["htlcs"], list):
+                                for htlc_item in output["htlcs"]:
+                                    if htlc_item.get(
+                                        "status"
+                                    ) == "SUCCEEDED" and htlc_item.get("route"):
+                                        successful_htlc_route = htlc_item.get("route")
+                                        break
+                            if successful_htlc_route:
+                                print_color(
+                                    f"  Successful HTLC Route details: {json.dumps(successful_htlc_route, indent=2)}",
+                                    Colors.OKCYAN,
+                                )
+                        return True  # Payment successful
+                    else:
+                        # lncli exited 0, but content analysis suggests not a clear success.
+                        print_color(
+                            f"Payment attempt for batch {overall_payment_attempt_batch_count} completed (lncli exit 0) but content indicates failure or ambiguity.",
+                            Colors.WARNING,
+                        )
+                        if args.verbose or args.debug:
+                            print_color(
+                                f"  Status: {top_level_status}, Preimage: {payment_preimage}, Error: {payment_error_field}, FailureReason: {failure_reason}",
+                                Colors.WARNING,
+                            )
+                            print_color(
+                                f"  Full JSON output: {json.dumps(output, indent=2)}",
+                                Colors.WARNING,
+                            )
+                        break  # from inner while loop (this batch failed based on content)
+                else:  # lncli exited 0 but output was not JSON
                     print_color(
-                        f"Payment attempt completed (exit 0) but content indicates failure or ambiguity.",
+                        f"Payment attempt for batch {overall_payment_attempt_batch_count} completed (lncli exit 0) but output was not valid JSON: {output}",
                         Colors.WARNING,
                     )
-                    print_color(
-                        f"  Status: {top_level_status}, Preimage: {payment_preimage}, Error: {payment_error_field}, FailureReason: {failure_reason}",
-                        Colors.WARNING,
-                    )
-                    print_color(
-                        f"  Full JSON output: {json.dumps(output, indent=2)}",
-                        Colors.WARNING,
-                    )
-            else:
-                print_color(
-                    f"Payment attempt completed (exit 0) but output was not valid JSON: {output}",
-                    Colors.WARNING,
-                )
-        else:
-            print_color(f"Payment attempt command failed.", Colors.FAIL)
-            # Only print detailed stderr and stdout if verbose or debug
-            if args.verbose or args.debug:
-                if error_stderr:
-                    print_color(f"  Stderr: {error_stderr.strip()}", Colors.FAIL)
+                    break  # from inner while loop (this batch failed based on output type)
 
-                # Check if the error is "invoice is already paid"
-                # output from run_command is stdout in this case. error_stderr is stderr.
+            # --- Command Failed (lncli exited non-zero) ---
+            else:
                 err_str_combined = str(error_stderr) + str(
                     output
-                )  # Check both stdout and stderr for the message
-                if "invoice is already paid" in err_str_combined.lower() or (
-                    "code = AlreadyExists desc = invoice is already paid"
-                    in err_str_combined
-                ):
-                    print_color(
-                        "Invoice was already paid (likely by a previous attempt in this script run). Considering this a success.",
-                        Colors.OKGREEN,
-                    )
-                    return True  # Exit, considering it success because it's paid
+                )  # output is stdout from run_command here
 
-                if isinstance(output, str) and output.strip():
-                    print_color(f"  Stdout: {output.strip()}", Colors.FAIL)
-                elif isinstance(output, dict):
-                    print_color(
-                        f"  Output (JSON): {json.dumps(output, indent=2)}", Colors.FAIL
-                    )
-            else:  # Not verbose and not debug
-                # Check for "already paid" even if not verbose, as it's a success condition
-                err_str_combined = str(error_stderr) + str(output)
+                # Check for "already paid" first, as this is a success condition
                 if "invoice is already paid" in err_str_combined.lower() or (
                     "code = AlreadyExists desc = invoice is already paid"
                     in err_str_combined
@@ -868,12 +887,86 @@ def pay_lightning_invoice(
                         "Invoice was already paid. Considering this a success.",
                         Colors.OKGREEN,
                     )
-                    return True
-                # else, just the general failure message was printed. No need for more details here.
+                    return True  # Payment successful (already paid)
 
-        if i + batch_size < len(candidate_chan_ids):
-            print_color("Retrying with next batch in 30 seconds...", Colors.WARNING)
+                # Check for "payment is in transition"
+                # Example from user log: "Stderr: [lncli] rpc error: code = AlreadyExists desc = payment is in transition"
+                # Example from LND: "rpc error: code = Unknown desc = payment is in transition"
+                is_in_transition = (
+                    "payment is in transition" in err_str_combined.lower()
+                )
+
+                if is_in_transition:
+                    in_transition_retry_count_for_this_batch += 1
+                    if (
+                        in_transition_retry_count_for_this_batch
+                        > MAX_IN_TRANSITION_RETRIES
+                    ):
+                        print_color(
+                            f"Max 'payment in transition' retries ({MAX_IN_TRANSITION_RETRIES}) reached for batch {overall_payment_attempt_batch_count}.",
+                            Colors.FAIL,
+                        )
+                        if args.verbose or args.debug:
+                            if error_stderr:
+                                print_color(
+                                    f"  Last Stderr: {error_stderr.strip()}",
+                                    Colors.FAIL,
+                                )
+                            # output from run_command is stdout here, which might be empty if lncli only used stderr
+                            if isinstance(output, str) and output.strip():
+                                print_color(
+                                    f"  Last Stdout: {output.strip()}", Colors.FAIL
+                                )
+                            elif isinstance(output, dict):
+                                print_color(
+                                    f"  Last Output (JSON from stdout): {json.dumps(output, indent=2)}",
+                                    Colors.FAIL,
+                                )
+                        break  # from inner while loop (exhausted "in transition" retries for this batch)
+
+                    print_color(
+                        f"'Payment in transition' detected for batch {overall_payment_attempt_batch_count}. "
+                        f"Retrying same batch (attempt {in_transition_retry_count_for_this_batch + 1}/{MAX_IN_TRANSITION_RETRIES+1} for this state). "
+                        f"Waiting {current_in_transition_retry_delay_seconds}s...",
+                        Colors.WARNING,
+                    )
+                    time.sleep(current_in_transition_retry_delay_seconds)
+                    current_in_transition_retry_delay_seconds *= (
+                        2  # Double the delay for the *next* in-transition retry
+                    )
+                    continue  # to the next iteration of the inner while loop (retry same batch)
+
+                # Other non-zero exit errors (not "already paid", not "in transition")
+                print_color(
+                    f"Payment attempt for batch {overall_payment_attempt_batch_count} failed (non-transitional error from lncli).",
+                    Colors.FAIL,
+                )
+                if args.verbose or args.debug:
+                    if error_stderr:
+                        print_color(f"  Stderr: {error_stderr.strip()}", Colors.FAIL)
+                    if isinstance(output, str) and output.strip():
+                        print_color(f"  Stdout: {output.strip()}", Colors.FAIL)
+                    elif isinstance(output, dict):
+                        print_color(
+                            f"  Output (JSON from stdout): {json.dumps(output, indent=2)}",
+                            Colors.FAIL,
+                        )
+                break  # from inner while loop (this batch failed)
+
+        # --- After inner while loop (this batch's attempts are done) ---
+        # If payment was successful inside the loop, we'd have returned True.
+        # So if we reach here, this batch {overall_payment_attempt_batch_count} didn't result in a confirmed payment.
+
+        # Check if there are more batches to try AND we haven't hit the overall max attempts
+        if i + batch_size < len(candidate_chan_ids) and (
+            args.max_payment_attempts is None
+            or overall_payment_attempt_batch_count < args.max_payment_attempts
+        ):
+            print_color(
+                f"Retrying with next batch in 30 seconds...", Colors.WARNING
+            )  # Using the existing 30s delay
             time.sleep(30)
+        # No "else" needed: if it's the last configured attempt or last batch, outer loop terminates.
 
     print_color(
         "All payment attempts with available channel batches failed to confirm success.",
