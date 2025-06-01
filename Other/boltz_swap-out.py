@@ -733,7 +733,7 @@ def pay_lightning_invoice(
             config, args, invoice_str, current_batch_ids
         )
 
-        subprocess_actual_timeout = timeout_seconds + 60
+        subprocess_actual_timeout = timeout_seconds + 15
 
         success_exit_codes = [0]
 
@@ -855,8 +855,8 @@ def pay_lightning_invoice(
                 # else, just the general failure message was printed. No need for more details here.
 
         if i + batch_size < len(candidate_chan_ids):
-            print_color("Retrying with next batch in 5 seconds...", Colors.WARNING)
-            time.sleep(5)
+            print_color("Retrying with next batch in 30 seconds...", Colors.WARNING)
+            time.sleep(30)
 
     print_color(
         "All payment attempts with available channel batches failed to confirm success.",
