@@ -46,10 +46,15 @@ Options:
   --debug                Enable debug mode: prints commands, no actual execution.
                          (Highly recommended for first runs).
   --verbose              Enable verbose output, showing full details of executed commands like LND connection parameters.
+  --custom-destination-address ADDRESS
+                         Manually specify the L-BTC destination address.
+                         If set, skips 'pscli' address generation.
+                         A confirmation prompt will appear unless --force is used.
+  --force, -f            Skip confirmation prompts (e.g., for custom destination address).
   -h, --help             Show this help message and exit.
 
 Workflow:
-1.  Fetches a new L-BTC address using `pscli`.
+1.  Fetches a new L-BTC address using `pscli` OR uses a custom-provided address.
 2.  Queries LNDg API to find suitable outgoing channels based on `--capacity`
     and `--local-fee-limit`.
 3.  Initiates a "reverse swap" (LN -> L-BTC) using `boltzcli createreverseswap`.
@@ -219,6 +224,18 @@ def parse_arguments():
         type=int,
         default=None,
         help="Maximum number of payment attempts with different channel batches (default: try all available candidates in batches of 3).",
+    )
+    parser.add_argument(
+        "--custom-destination-address",
+        type=str,
+        default=None,
+        help="Manually specify the L-BTC destination address. Skips 'pscli' generation. Prompts for confirmation unless --force is used.",
+    )
+    parser.add_argument(
+        "--force",
+        "-f",
+        action="store_true",
+        help="Skip confirmation prompts (e.g., for custom destination address).",
     )
 
     # Using parser.description which should be set from the constructor.
@@ -1122,10 +1139,85 @@ def main():
         print_color(f"Swap Description: {args.description}", Colors.OKCYAN)
 
     try:  # Start of try block for KeyboardInterrupt
-        lbtc_address = get_lbtc_address(config["pscli_path"], args.debug)
+        lbtc_address = None
+        if args.custom_destination_address:
+            lbtc_address = args.custom_destination_address
+            print_color(
+                f"\nUsing custom L-BTC destination address: {lbtc_address}",
+                Colors.WARNING,
+            )
+
+            if not args.force:
+                print_color(
+                    "\n--- PLEASE CONFIRM SWAP DETAILS ---", Colors.WARNING, bold=True
+                )
+                print_color(f"  Swap Amount: {args.amount} sats", Colors.WARNING)
+                print_color(
+                    f"  Destination L-BTC Address: ", Colors.WARNING, bold=False
+                )  # Keep it on one line for address
+                print_color(
+                    f"    {lbtc_address}", Colors.FAIL, bold=True
+                )  # Highlight address in FAIL color
+                print_color(
+                    f"  Payment Timeout: {args.payment_timeout}", Colors.WARNING
+                )
+                if args.ppm is not None:
+                    calculated_fee_sats = math.floor(args.amount * args.ppm / 1_000_000)
+                    print_color(
+                        f"  LN Fee Limit (PPM): {args.ppm} (approx. {calculated_fee_sats} sats)",
+                        Colors.WARNING,
+                    )
+                else:
+                    print_color(
+                        f"  LN Fee Limit (PPM): Not set (uses 0 sats for lncli --fee_limit)",
+                        Colors.WARNING,
+                    )
+
+                print_color(
+                    "\nWARNING: ENSURE THE L-BTC ADDRESS IS CORRECT!",
+                    Colors.FAIL,
+                    bold=True,
+                )
+                print_color(
+                    "If the address is incorrect, your funds may be IRRECOVERABLY LOST.",
+                    Colors.FAIL,
+                )
+                print_color("Double-check the address carefully.", Colors.FAIL)
+
+                confirm = (
+                    input(
+                        Colors.WARNING
+                        + Colors.BOLD
+                        + "Proceed with this address? (yes/no): "
+                        + Colors.ENDC
+                    )
+                    .strip()
+                    .lower()
+                )
+                if confirm != "yes":
+                    print_color(
+                        "\nSwap aborted by user. No action taken.",
+                        Colors.FAIL,
+                        bold=True,
+                    )
+                    sys.exit(1)
+                print_color(
+                    "Confirmation received. Proceeding with custom address.",
+                    Colors.OKGREEN,
+                )
+            else:
+                print_color(
+                    "Confirmation for custom address skipped due to --force flag.",
+                    Colors.OKBLUE,
+                )
+        else:
+            lbtc_address = get_lbtc_address(config["pscli_path"], args.debug)
+
         if not lbtc_address:
             print_color(
-                "\nExiting: Failed to get L-BTC address.", Colors.FAIL, bold=True
+                "\nExiting: L-BTC address not available or confirmed.",
+                Colors.FAIL,
+                bold=True,
             )
             sys.exit(1)
 
