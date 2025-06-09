@@ -82,6 +82,7 @@ import time
 import requests  # Added for LNDg API calls
 import math
 import re
+import signal
 
 
 # --- ANSI Color Codes ---
@@ -347,6 +348,7 @@ def run_command(
     expect_json=False,
     success_codes=None,
     display_str_override=None,
+    attempt_graceful_terminate_on_timeout=False,
 ):
     """
     Executes a system command.
@@ -449,10 +451,41 @@ def run_command(
     except subprocess.TimeoutExpired:
         error_msg = f"Command timed out after {timeout} seconds: {actual_command_str}"
         print_color(error_msg, Colors.FAIL)
-        if process.poll() is None:
-            process.kill()
-            stdout_after_kill, stderr_after_kill = process.communicate()
-            error_msg += f"\nKilled process. Stdout after kill: {stdout_after_kill.strip()}. Stderr after kill: {stderr_after_kill.strip()}"
+        if process.poll() is None:  # Check if process is still running
+            if attempt_graceful_terminate_on_timeout:
+                print_color(
+                    "  Attempting graceful termination (SIGINT)...", Colors.WARNING
+                )
+                process.send_signal(signal.SIGINT)
+                try:
+                    # Give lncli a bit more time to react to SIGINT and potentially
+                    # communicate cancellation to LND, especially with --cancelable
+                    process.wait(timeout=5)
+                    print_color(
+                        "  Process terminated gracefully after SIGINT.", Colors.OKCYAN
+                    )
+                except subprocess.TimeoutExpired:
+                    print_color(
+                        "  Process did not terminate via SIGINT within timeout, resorting to SIGKILL...",
+                        Colors.WARNING,
+                    )
+                    if process.poll() is None:  # Check again before SIGKILL
+                        process.kill()
+                        print_color("  Process terminated via SIGKILL.", Colors.WARNING)
+            else:
+                process.kill()  # Original SIGKILL behavior if not attempting graceful
+
+            # Get any final output after attempting to terminate/kill
+            try:
+                stdout_after_kill, stderr_after_kill = process.communicate(timeout=5)
+                error_msg += f"\nProcess terminated. Stdout after: {stdout_after_kill.strip()}. Stderr after: {stderr_after_kill.strip()}"
+            except subprocess.TimeoutExpired:
+                error_msg += "\nProcess terminated. Failed to get additional output after termination."
+            except Exception as e:
+                error_msg += (
+                    f"\nProcess terminated. Error getting additional output: {e}"
+                )
+
         return False, "", error_msg
     except Exception as e:
         error_msg = f"An unexpected error occurred while running command: {actual_command_str}\nError: {e}"
@@ -796,6 +829,7 @@ def pay_lightning_invoice(
                 dry_run_output="lncli payinvoice command",
                 success_codes=[0],
                 display_str_override=display_command_str,
+                attempt_graceful_terminate_on_timeout=True,
             )
 
             if command_success:  # lncli exited with 0
@@ -1071,120 +1105,6 @@ def construct_lncli_command(config, args, invoice, outgoing_chan_ids_batch):
             )
 
     return actual_command_list, display_command_string
-
-
-def execute_command(
-    command_parts,
-    step_description,
-    debug_mode=False,
-    is_boltz_creation=False,
-    is_lncli_payment=False,
-    amount_sats=0,
-    timeout=None,
-):
-    """Executes a shell command and returns the output."""
-    command_str = " ".join(command_parts)
-    print_bold_step(f"Executing: {command_str}", is_subprocess=True)
-
-    if debug_mode:
-        # Simulate pscli lbtc-getaddress
-        if "pscli" in command_parts[0] and "lbtc-getaddress" in command_parts:
-            print(f"[DEBUG] L-BTC address command: {command_str}")
-            return {"address": "debug_lq_address_from_dry_run"}, None, 0
-
-        # Simulate boltzcli createreverseswap
-        elif "boltzcli" in command_parts[0] and "createreverseswap" in command_parts:
-            print(f"[DEBUG] Boltz `createreverseswap` command: {command_str}")
-            # Extract amount for a more realistic expected_onchain_amount
-            try:
-                swap_amount_arg_index = command_parts.index("L-BTC") + 1
-                swap_amount_val = int(command_parts[swap_amount_arg_index])
-                # Simulate a small fee taken by Boltz
-                simulated_boltz_fee = min(
-                    50, swap_amount_val // 200
-                )  # 0.5% or max 50 sats
-                expected_onchain = swap_amount_val - simulated_boltz_fee
-            except (ValueError, IndexError):
-                expected_onchain = (
-                    amount_sats - 50 if amount_sats > 50 else amount_sats // 2
-                )
-
-            return (
-                {
-                    "id": "debug_swap_id_reverse",
-                    "invoice": "lnbc100n1pj9z6jusp5cnp9j5f2x0m5z5z5z5z5z5z5z5z5z5z5z5z5z5z5z5z5z5z5z5zqdqqcqzysxqyz5vqsp5h3xkct7t8xsv9c8g6q0v5rk2h3psk32k0k7k0kj7nhsz3g0qqqqqysgqqqqqqlgqqqqqqgq9q9qyysgqhc9sqgmeyr7n6y240g5uqn9g786ftwpk87kr0lgz03f5ljh3djxsnx0wsyv3g6n74s630jtzs8ajv473rws7z88x2u7f8n5f7n2vkt9vq0p5hdxz",  # Generic short invoice
-                    "lockupAddress": "debug_boltz_lockup_address",
-                    "expectedAmount": expected_onchain,  # More realistic expected amount
-                    "timeoutBlockHeight": 123456,
-                },
-                None,
-                0,
-            )
-
-        # Simulate lncli payinvoice
-        elif (
-            is_lncli_payment
-        ):  # "lncli" in command_parts[0] and "payinvoice" in command_parts:
-            # Even in debug, we want to see the fully constructed command
-            print(f"[DEBUG] Intended lncli payinvoice command: {command_str}")
-            # Simulate success for lncli payment in debug mode
-            print(
-                f"[DEBUG] Payment successful (simulated). Preimage: debug_preimage_from_dry_run"
-            )
-            return (
-                {
-                    "payment_preimage": "debug_preimage_from_dry_run",
-                    "payment_hash": "debug_payment_hash",
-                    "status": "SUCCEEDED",  # Simulate LND's status field
-                    "htlcs": [{"status": "SUCCEEDED"}],  # Simulate LND's htlc status
-                },
-                None,
-                0,
-            )
-
-        # Simulate boltzcli swapinfo
-        elif "boltzcli" in command_parts[0] and "swapinfo" in command_parts:
-            print(f"[DEBUG] Boltz `swapinfo` command: {command_str}")
-            return (
-                {"status": "swap.success"},
-                None,
-                0,
-            )  # Simulate a successful swap status
-
-        else:
-            print(f"[DEBUG] Unhandled debug command: {command_str}")
-            return {"message": "Dry run success", "details": command_str}, None, 0
-
-    try:
-        process = subprocess.Popen(
-            command_parts, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
-        stdout, stderr = process.communicate(timeout=timeout)
-        return_code = process.returncode
-
-        if return_code == 0:
-            return stdout.strip(), None, 0
-        else:
-            error_msg = f"Command failed with exit code {return_code}.\nStderr: {stderr.strip()}\nStdout: {stdout.strip()}"
-            print_color(error_msg, Colors.FAIL)
-            return stdout.strip(), stderr.strip(), return_code
-
-    except FileNotFoundError:
-        error_msg = f"Error: Command not found: {command_parts[0]}. Please check the path in your config.ini."
-        print_color(error_msg, Colors.FAIL)
-        return "", error_msg, 1
-    except subprocess.TimeoutExpired:
-        error_msg = f"Command timed out after {timeout} seconds: {command_str}"
-        print_color(error_msg, Colors.FAIL)
-        if process.poll() is None:
-            process.kill()
-            stdout_after_kill, stderr_after_kill = process.communicate()
-            error_msg += f"\nKilled process. Stdout after kill: {stdout_after_kill.strip()}. Stderr after kill: {stderr_after_kill.strip()}"
-        return "", error_msg, 1
-    except Exception as e:
-        error_msg = f"An unexpected error occurred while running command: {command_str}\nError: {e}"
-        print_color(error_msg, Colors.FAIL)
-        return "", error_msg, 1
 
 
 def main():
