@@ -10,6 +10,7 @@
             "trend_sensitivity": 0.5,
             "fee_base": "median",
             "fee_delta_threshold": 12,
+            "inbound_auto_fee_enabled": true,
             "fee_bands": {
                 "enabled": true,
                 "discount": -0.15,
@@ -27,6 +28,7 @@
             "trend_sensitivity": 0.6,
             "fee_base": "mean",
             "fee_delta_threshold": 25,
+            "inbound_auto_fee_enabled": false,
             "fee_bands": {
                 "enabled": true,
                 "discount": -0.10,
@@ -46,14 +48,16 @@
         },
         {
             "pubkey": "03cde60a6323f7122d5178255766e38114b4722ede08f7c9e0c5df9b912cc201d6",
-            "group": "expensive"
+            "group": "expensive",
+            "inbound_auto_fee_enabled": true
         },
-                {
+        {
             "pubkey": "someotherpubkey",
             "group": "expensive"
         },
         {
             "pubkey": "03someotherpubkey",
+            "inbound_auto_fee_enabled": false,
             "fee_conditions": {
                 "base_adjustment_percentage": 0.05,
                 "max_cap": 3000,
