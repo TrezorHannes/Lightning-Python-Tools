@@ -7,43 +7,56 @@ and local liquidity using data from the Amboss API and LNDg API.
 Configuration Settings (see fee_adjuster_config_docs.txt for details):
 - base_adjustment_percentage: Percentage adjustment applied to the selected fee base (median, mean, etc.).
 - group_adjustment_percentage: Additional adjustment based on node group membership.
-- max_cap: Maximum allowed fee rate (in ppm).
+- max_cap: Maximum allowed fee rate (in ppm) for outgoing fees.
 - trend_sensitivity: Multiplier for the influence of Amboss fee trends on the adjustment.
 - fee_base: Statistical measure from Amboss used as the fee calculation base ("median", "mean", etc.).
+- fee_delta_threshold: Minimum change (in ppm) required for either outgoing or inbound fees to trigger an API update to LNDg.
 - groups: Node categories for applying differentiated strategies via group_adjustment_percentage.
-- fee_bands: (Optional) Dynamic fee adjustments based on local liquidity.
+- fee_bands: (Optional) Dynamic fee adjustments based on local liquidity for outgoing fees.
   - enabled: true/false.
   - discount: Negative percentage adjustment for high local balance (80-100%).
   - premium: Positive percentage adjustment for low local balance (0-40%).
-- stuck_channel_adjustment: (Optional) Gradually reduces fees for channels without recent forwards.
+- stuck_channel_adjustment: (Optional) Gradually reduces outgoing fees for channels without recent forwards.
   - enabled: true/false.
   - stuck_time_period: Number of days defining one 'stuck period' interval (e.g., 7).
-  - min_local_balance_for_stuck_discount: (Optional) If the peer's aggregate local balance ratio is below this threshold (e.g., 0.2 for 20%), the stuck discount will not be applied, even if the channel is otherwise considered stuck.
+  - min_local_balance_for_stuck_discount: (Optional) If the peer's aggregate local balance ratio is below this threshold (e.g., 0.2 for 20%), the stuck discount will not be applied.
+- inbound_auto_fee_enabled: (Optional) Enables dynamic inbound fee adjustments. Can be set per-node or per-group. Defaults to false if not specified.
+  - If enabled, the script will attempt to set a negative inbound fee (a discount) to incentivize rebalancing towards your node.
+  - The discount is calculated based on the channel's `ar_max_cost` (auto-rebalancer max cost percentage, fetched from LNDg) and the current local liquidity band.
+  - Higher discounts are applied when your local liquidity is lower (bands 2, 3, and 4), scaled by the `ar_max_cost`. No discount is applied in bands 0 and 1 (high local liquidity).
+  - The `ar_max_cost` must be set in LNDg for the channel for inbound fees to be applied.
 
 Groups and group_adjustment_percentage:
 Allows tailored fee strategies for nodes in specific categories (e.g., "sink", "expensive").
+Settings like `inbound_auto_fee_enabled` can also be defined at the group level and will be inherited by nodes in that group unless overridden at the node level.
 
-Fee Bands:
-Adjusts fees based on local balance ratio, dividing liquidity into 5 bands (0-20%, 20-40%, 40-60%, 60-80%, 80-100%). A graduated adjustment is applied between the configured discount (high local balance) and premium (low local balance). The premium is capped at the 20-40% liquidity band to avoid excessively high fees on nearly drained channels.
+Fee Bands (Outgoing Fees):
+Adjusts outgoing fees based on local balance ratio, dividing liquidity into 5 bands (0-20%, 20-40%, 40-60%, 60-80%, 80-100%). A graduated adjustment is applied between the configured discount (high local balance) and premium (low local balance). The premium is capped at the 20-40% liquidity band to avoid excessively high fees on nearly drained channels.
 
-Stuck Channel Adjustment:
-This feature incrementally reduces fees for channels that haven't forwarded payments recently.
+Stuck Channel Adjustment (Outgoing Fees):
+This feature incrementally reduces outgoing fees for channels that haven't forwarded payments recently.
 For each multiple of the `stuck_time_period` (in days) that a peer's channels have gone without an *outbound* forwarding, the fee band is moved down by one level (towards the maximum discount).
-The adjustment is capped at moving down 4 bands (reaching the maximum discount band).
-If an outbound forward is detected for any channel of the peer, the stuck adjustment is reset to 0 bands down.
-If `min_local_balance_for_stuck_discount` is set and the peer's aggregate local liquidity is below this threshold, this discount mechanism is skipped.
-The script queries the LNDg API to find the timestamp of the last outbound forward for the peer.
+The adjustment is capped at moving down 4 bands. If an outbound forward is detected, the stuck adjustment is reset.
+If `min_local_balance_for_stuck_discount` is set and liquidity is below this, this discount mechanism is skipped.
+
+Inbound Auto Fee Adjustment:
+When enabled for a node/group and the channel has an `ar_max_cost` set in LNDg:
+- Bands 0 & 1 (80-100% & 60-80% local liquidity): No inbound discount.
+- Band 2 (40-60% local liquidity): Small inbound discount (e.g., 20% of `ar_max_cost` applied to current outgoing fee).
+- Band 3 (20-40% local liquidity): Medium inbound discount (e.g., 50% of `ar_max_cost` applied to current outgoing fee).
+- Band 4 (0-20% local liquidity): Large inbound discount (e.g., 80% of `ar_max_cost` applied to current outgoing fee).
+The script queries LNDg for channel details including `ar_max_cost` and current inbound/outbound fees.
 
 Usage:
-- Configure nodes and their settings in `feeConfig.json`.
-- Run the script to automatically adjust fees based on configured settings.
-- Requires a running LNDg instance for local channel details and fee updates.
+- Configure nodes, groups, and their settings in `feeConfig.json`.
+- Run the script to automatically adjust fees.
+- Requires a running LNDg instance.
 
 Command Line Arguments:
-- --debug: Enable detailed debug output, including stuck channel check results.
+- --debug: Enable detailed debug output. Disables LNDg and charge-lnd file updates.
 
 Charge-lnd Details:
-Configure charge-lnd to use the output file:
+Configure charge-lnd to use the output file for outgoing fees:
 ```ini
 # charge-lnd.config
 [🤖 FeeAdjuster Import]
@@ -477,6 +490,8 @@ def get_channels_to_modify(pubkey, config):
                     local_balance = result.get("local_balance", 0)
                     fees_updated = result.get("fees_updated", "")
                     auto_fees = result.get("auto_fees", False)
+                    ar_max_cost = result.get("ar_max_cost")
+                    local_inbound_fee_rate = result.get("local_inbound_fee_rate")
 
                     if is_open:
                         local_balance_ratio = (
@@ -495,6 +510,8 @@ def get_channels_to_modify(pubkey, config):
                             "fees_updated_datetime": fees_updated_datetime,
                             "local_fee_rate": local_fee_rate,
                             "auto_fees": auto_fees,
+                            "ar_max_cost": ar_max_cost,
+                            "local_inbound_fee_rate": local_inbound_fee_rate,
                         }
         return channels_to_modify
     except requests.exceptions.RequestException as e:
@@ -502,14 +519,51 @@ def get_channels_to_modify(pubkey, config):
         raise LNDGAPIError(f"Error fetching LNDg channels: {e}")
 
 
+def calculate_inbound_fee_discount_ppm(
+    calculated_final_outgoing_fee_ppm, initial_raw_band, ar_max_cost_percent
+):
+    """
+    Calculates the inbound fee discount in PPM.
+    Returns a negative PPM value for discount, or 0 if no discount.
+    """
+    if ar_max_cost_percent is None or ar_max_cost_percent == 0:
+        return 0
+
+    inbound_fee_discount_ppm = 0
+    ar_max_cost_fraction = ar_max_cost_percent / 100.0
+
+    if initial_raw_band == 2:  # Neutral Liquidity (40-60% local)
+        inbound_fee_discount_ppm = -round(
+            calculated_final_outgoing_fee_ppm * ar_max_cost_fraction * 0.20
+        )
+    elif initial_raw_band == 3:  # Low Local Liquidity (20-40% local)
+        inbound_fee_discount_ppm = -round(
+            calculated_final_outgoing_fee_ppm * ar_max_cost_fraction * 0.50
+        )
+    elif initial_raw_band == 4:  # Very Low Local Liquidity (0-20% local)
+        inbound_fee_discount_ppm = -round(
+            calculated_final_outgoing_fee_ppm * ar_max_cost_fraction * 0.80
+        )
+
+    # Ensure the effective fee (outgoing + inbound_discount) isn't negative
+    if calculated_final_outgoing_fee_ppm + inbound_fee_discount_ppm < 0:
+        inbound_fee_discount_ppm = (
+            -calculated_final_outgoing_fee_ppm
+        )  # Max possible discount to make effective fee 0
+
+    return inbound_fee_discount_ppm
+
+
 # Write to LNDg
-def update_lndg_fee(chan_id, new_fee_rate, channel_data, config):
+def update_lndg_fee(
+    chan_id, new_outgoing_fee_rate, new_inbound_fee_rate_ppm, channel_data, config
+):
     lndg_api_url = config["lndg"]["lndg_api_url"]
     username = config["credentials"]["lndg_username"]
     password = config["credentials"]["lndg_password"]
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # First, update auto_fees if needed
+    # First, update auto_fees if needed (for outgoing)
     if channel_data["auto_fees"]:
         auto_fees_url = f"{lndg_api_url}/api/channels/{chan_id}/"
         auto_fees_payload = {"chan_id": chan_id, "auto_fees": False}
@@ -518,43 +572,60 @@ def update_lndg_fee(chan_id, new_fee_rate, channel_data, config):
                 auto_fees_url, json=auto_fees_payload, auth=(username, password)
             )
             response.raise_for_status()
-            logging.info(f"{timestamp}: Disabled auto_fees for channel {chan_id}")
+            logging.info(
+                f"{timestamp}: Disabled auto_fees for channel {chan_id} (for outgoing)"
+            )
         except requests.exceptions.RequestException as e:
             logging.error(f"Error updating auto_fees for channel {chan_id}: {e}")
-            raise LNDGAPIError(f"Error updating auto_fees for channel {chan_id}: {e}")
+            # Continue to fee policy update even if this fails
 
-    # Then, update the fee rate
+    # Then, update the fee policy (outgoing and inbound)
     fee_update_url = f"{lndg_api_url}/api/chanpolicy/"
-    fee_payload = {"chan_id": chan_id, "fee_rate": new_fee_rate}
+    fee_payload = {
+        "chan_id": chan_id,
+        "fee_rate": new_outgoing_fee_rate,
+        "inbound_fee_rate": new_inbound_fee_rate_ppm,
+    }
+
     try:
         response = requests.post(
             fee_update_url, json=fee_payload, auth=(username, password)
         )
         response.raise_for_status()
         logging.info(
-            f"{timestamp}: API confirmed changing local fee to {new_fee_rate} for channel {chan_id}"
+            f"{timestamp}: API confirmed changing outgoing fee to {new_outgoing_fee_rate} ppm "
+            f"and inbound fee discount to {new_inbound_fee_rate_ppm} ppm for channel {chan_id}"
         )
     except requests.exceptions.RequestException as e:
-        logging.error(f"Error updating LNDg fee for channel {chan_id}: {e}")
-        raise LNDGAPIError(f"Error updating LNDg fee for channel {chan_id}: {e}")
+        logging.error(f"Error updating LNDg fee policy for channel {chan_id}: {e}")
+        raise LNDGAPIError(f"Error updating LNDg fee policy for channel {chan_id}: {e}")
 
 
 def write_charge_lnd_file(
-    file_path, pubkey, alias, new_fee_rate, is_aggregated
-):  # Added is_aggregated
+    file_path,
+    pubkey,
+    alias,
+    new_fee_rate,
+    is_aggregated,
+    # New parameters for inbound fees for charge-lnd
+    inbound_auto_fee_enabled_for_node,
+    calculated_inbound_ppm_for_charge_lnd,  # Pass the specific inbound PPM for this peer/aggregation
+):
     with open(file_path, "a") as f:
-        f.write(
-            f"[🤖 {alias}{' (Aggregated)' if is_aggregated else ''}]\n"
-        )  # Add note to alias comment
+        f.write(f"[🤖 {alias}{' (Aggregated)' if is_aggregated else ''}]\n")
         f.write(f"node.id = {pubkey}\n")
         f.write("strategy = static\n")
         f.write(f"fee_ppm = {new_fee_rate}\n")
-        f.write(
-            "min_htlc_msat = 1_000\n"
-        )  # Consider if these should be configurable per peer
-        f.write(
-            "max_htlc_msat_ratio = 0.9\n"
-        )  # Consider if these should be configurable per peer
+        # Add inbound fee details if the feature is enabled for this node
+        if inbound_auto_fee_enabled_for_node:
+            f.write(f"inbound_fee_ppm = {calculated_inbound_ppm_for_charge_lnd}\n")
+            f.write(
+                "inbound_base_fee_msat = 0\n"
+            )  # Defaulting inbound base to 0 for now
+        # Default base fees and HTLC settings, consider making these configurable
+        f.write("base_fee_msat = 1000\n")  # Default for outgoing, might need review
+        f.write("min_htlc_msat = 1_000\n")
+        f.write("max_htlc_msat_ratio = 0.9\n")
         f.write("\n")
 
 
@@ -563,16 +634,19 @@ def update_channel_notes(
     alias,
     group_name,
     fee_base,
-    fee_conditions,  # Keep fee_conditions to access stuck settings
+    fee_conditions,
     outbound_ratio,
-    initial_raw_band,  # Pass initial raw band for notes clarity
-    fee_band_factor,  # Pass the factor if needed for debug in notes (optional)
+    initial_raw_band,
+    fee_band_factor,
     config,
     node_definitions,
     new_fee_rate=None,
-    stuck_bands_to_move_down=0,  # Renamed parameter
-    days_stuck=None,  # New parameter: days since last forward
-    stuck_skip_reason=None,  # NEW: Reason why stuck adjustment might have been skipped
+    stuck_bands_to_move_down=0,
+    days_stuck=None,
+    stuck_skip_reason=None,
+    inbound_auto_fee_enabled=False,
+    calculated_inbound_ppm=0,
+    ar_max_cost=None,
 ):
     """Update the channel notes in LNDg with fee adjuster information."""
     update_channel_notes_enabled = node_definitions.get("update_channel_notes", False)
@@ -662,6 +736,16 @@ def update_channel_notes(
     else:
         notes += "\nStuck adjust: Disabled"
 
+    # Add inbound fee info
+    if inbound_auto_fee_enabled:
+        notes += f"\nInbound AF: ✅"
+        if calculated_inbound_ppm != 0:
+            notes += f" | Discount: {calculated_inbound_ppm} ppm (AR Max Cost: {ar_max_cost if ar_max_cost is not None else 'N/A'}%)"
+        else:
+            notes += f" | Discount: 0 ppm (No discount for band/AR cost)"
+    else:
+        notes += "\nInbound AF: Disabled"
+
     # Log the notes we're going to send
     logging.debug(f"Channel {chan_id} notes to update: {notes}")
 
@@ -735,6 +819,10 @@ def print_fee_adjustment(
     days_stuck,  # Days since last outbound forward
     # Amboss Data
     amboss_data,
+    # New Inbound Fee Parameters
+    inbound_auto_fee_enabled=False,
+    calculated_inbound_ppm=0,
+    ar_max_cost=None,
 ):
     print("-" * 80)
     print(f"Alias: {alias}{' (Aggregated)' if is_aggregated else ''}")
@@ -827,6 +915,23 @@ def print_fee_adjustment(
                 f"    - Adjustment Applied: 0 bands (Peer active or days stuck < period)"
             )
 
+    # --- Inbound Fee Auto Adjustment ---
+    print(f"\n--- Inbound Auto Fee Adjustment ---")
+    print(
+        f"  Inbound Auto Fee Global Setting: {'Enabled' if inbound_auto_fee_enabled else 'Disabled'}"
+    )
+    if inbound_auto_fee_enabled:
+        print(
+            f"    - Channel AR Max Cost Target: {ar_max_cost if ar_max_cost is not None else 'N/A'}%"
+        )
+        print(f"    - Calculated Inbound Fee Discount: {calculated_inbound_ppm} ppm")
+        if calculated_inbound_ppm != 0:
+            print(
+                f"    - Effective Rate (Outgoing + Inbound Discount): {final_rate + calculated_inbound_ppm} ppm"
+            )
+        else:
+            print(f"    - Effective Rate: Same as Outgoing ({final_rate} ppm)")
+
     # --- Amboss Table ---
     print("\n--- Amboss Peer Fee Data (Remote Perspective) ---")
     table = PrettyTable()
@@ -885,28 +990,49 @@ def main():
         for node in node_definitions["nodes"]:
             pubkey = node["pubkey"]
             group_name = node.get("group")
-            fee_conditions = None  # Initialize fee_conditions to None
-            base_adjustment_percentage = 0  # Initialize base_adjustment_percentage
+            fee_conditions = None
+            base_adjustment_percentage = 0
+
+            # Determine inbound_auto_fee_enabled for this node (node -> group -> default false)
+            inbound_auto_fee_enabled_for_node = node.get(
+                "inbound_auto_fee_enabled"
+            )  # Check node first
 
             if "fee_conditions" in node:
                 fee_conditions = node["fee_conditions"]
                 base_adjustment_percentage = fee_conditions.get(
                     "base_adjustment_percentage", 0
                 )
+                # Check fee_conditions for inbound_auto_fee if not directly on node
+                if inbound_auto_fee_enabled_for_node is None:
+                    inbound_auto_fee_enabled_for_node = fee_conditions.get(
+                        "inbound_auto_fee_enabled"
+                    )
 
-            # --- Group overrides/defaults ---
             group_adjustment_percentage = 0
             if group_name and group_name in groups:
                 group_fee_conditions = groups[group_name]
                 group_adjustment_percentage = group_fee_conditions.get(
                     "group_adjustment_percentage", 0
                 )
-                # If node has no specific conditions, use group's; otherwise, node conditions take precedence
-                if not fee_conditions:
+                if (
+                    not fee_conditions
+                ):  # If node has no specific conditions, use group's
                     fee_conditions = group_fee_conditions
-            elif not fee_conditions:  # Node has no group and no specific conditions
+
+                # If still not set, check group for inbound_auto_fee_enabled
+                if inbound_auto_fee_enabled_for_node is None:
+                    inbound_auto_fee_enabled_for_node = group_fee_conditions.get(
+                        "inbound_auto_fee_enabled"
+                    )
+
+            elif not fee_conditions:
                 logging.warning(f"No fee conditions for {pubkey}, skipping.")
                 continue
+
+            # Default to False if not found anywhere
+            if inbound_auto_fee_enabled_for_node is None:
+                inbound_auto_fee_enabled_for_node = False
 
             # --- Extract key parameters ---
             fee_base = fee_conditions.get("fee_base", "median")
@@ -1062,15 +1188,82 @@ def main():
                 rate_before_rounding = min(rate_after_fee_band, max_cap)
                 final_rate = round(rate_before_rounding)
 
+                # --- Inbound Fee Calculation (per peer, but uses channel's ar_max_cost if different) ---
+                # For aggregated peers, this assumes ar_max_cost would be similar or we'd use first channel's.
+                # The current loop is per-channel for updates, so this fits.
+
+                calculated_inbound_ppm_for_peer = 0
+
+                # Use the resolved inbound_auto_fee_enabled
+                if inbound_auto_fee_enabled_for_node:
+                    first_chan_ar_max_cost = first_channel_data.get("ar_max_cost")
+                    if first_chan_ar_max_cost is not None:
+                        calculated_inbound_ppm_for_peer = (
+                            calculate_inbound_fee_discount_ppm(
+                                final_rate, initial_raw_band, first_chan_ar_max_cost
+                            )
+                        )
+
                 # --- Apply Updates & Notes ---
                 updated_any_channel = False
                 # Loop through channels to apply updates and notes
                 for chan_id, channel_data in channels_to_modify.items():
-                    # Apply update if delta is sufficient
-                    fee_delta = abs(final_rate - channel_data["local_fee_rate"])
-                    if lndg_fee_update_enabled and fee_delta > fee_delta_threshold:
+                    # Calculate final_rate (outgoing) - this is already done for the peer
+                    # Calculate inbound PPM specifically for this channel
+                    current_chan_calculated_inbound_ppm = 0
+                    chan_ar_max_cost = channel_data.get("ar_max_cost")
+
+                    # Use the resolved inbound_auto_fee_enabled
+                    if (
+                        inbound_auto_fee_enabled_for_node
+                        and chan_ar_max_cost is not None
+                    ):
+                        current_chan_calculated_inbound_ppm = (
+                            calculate_inbound_fee_discount_ppm(
+                                final_rate, initial_raw_band, chan_ar_max_cost
+                            )
+                        )
+
+                    # Determine if an update to LNDg is needed based on deltas
+                    should_update_lndg_for_this_channel = False
+
+                    # Outbound fee check
+                    current_outbound_fee_on_channel = channel_data["local_fee_rate"]
+                    outbound_fee_delta = abs(
+                        final_rate - current_outbound_fee_on_channel
+                    )
+                    if outbound_fee_delta > fee_delta_threshold:
+                        should_update_lndg_for_this_channel = True
+
+                    # Inbound fee check (only if not already decided by outbound change and feature is enabled)
+                    if (
+                        not should_update_lndg_for_this_channel
+                        and inbound_auto_fee_enabled_for_node
+                    ):
+                        current_inbound_fee_on_channel = channel_data.get(
+                            "local_inbound_fee_rate", 0
+                        )
+                        if (
+                            current_inbound_fee_on_channel is None
+                        ):  # Handle None from API
+                            current_inbound_fee_on_channel = 0
+
+                        inbound_fee_delta = abs(
+                            current_chan_calculated_inbound_ppm
+                            - current_inbound_fee_on_channel
+                        )
+                        if inbound_fee_delta > fee_delta_threshold:
+                            should_update_lndg_for_this_channel = True
+
+                    if lndg_fee_update_enabled and should_update_lndg_for_this_channel:
                         try:
-                            update_lndg_fee(chan_id, final_rate, channel_data, config)
+                            update_lndg_fee(
+                                chan_id,
+                                final_rate,
+                                current_chan_calculated_inbound_ppm,
+                                channel_data,
+                                config,
+                            )
                             updated_any_channel = True
                         except LNDGAPIError as api_err:
                             logging.error(
@@ -1100,6 +1293,9 @@ def main():
                                 stuck_bands_to_move_down,  # Pass the calculated stuck bands applied
                                 days_stuck,  # Pass the calculated days stuck
                                 stuck_skip_reason,  # Pass the skip reason to notes
+                                inbound_auto_fee_enabled=inbound_auto_fee_enabled_for_node,  # Pass resolved value
+                                calculated_inbound_ppm=current_chan_calculated_inbound_ppm,
+                                ar_max_cost=chan_ar_max_cost,
                             )
                         except Exception as note_err:
                             logging.error(
@@ -1157,6 +1353,9 @@ def main():
                             days_stuck=days_stuck,
                             # Amboss Data
                             amboss_data=all_amboss_data,
+                            inbound_auto_fee_enabled=inbound_auto_fee_enabled_for_node,  # Pass resolved value
+                            calculated_inbound_ppm=calculated_inbound_ppm_for_peer,
+                            ar_max_cost=first_channel_data.get("ar_max_cost"),
                         )
                         sys.stdout.flush()  # Ensure output is shown immediately
 
@@ -1169,12 +1368,16 @@ def main():
                     charge_lnd_file_path = os.path.join(
                         config["paths"]["charge_lnd_path"], "fee_adjuster.txt"
                     )
+                    # Pass the inbound fee details to write_charge_lnd_file
+                    # calculated_inbound_ppm_for_peer is the peer-level summary calculated earlier
                     write_charge_lnd_file(
                         charge_lnd_file_path,
                         pubkey,
-                        first_channel_data["alias"],  # Use first alias
-                        final_rate,
-                        num_channels > 1,  # Flag if aggregated
+                        first_channel_data["alias"],
+                        final_rate,  # This is the outgoing fee rate
+                        num_channels > 1,
+                        inbound_auto_fee_enabled_for_node,  # Pass the resolved enable status
+                        calculated_inbound_ppm_for_peer,  # Pass the peer-level calculated inbound ppm
                     )
 
             except (AmbossAPIError, LNDGAPIError) as e:
