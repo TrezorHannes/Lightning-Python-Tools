@@ -805,6 +805,36 @@ def pay_lightning_invoice(
         f"Timeout per attempt (lncli --timeout): {args.payment_timeout}, Max Parts: {max_parts_display}",
         Colors.OKCYAN,
     )
+    if args.lncli_cltv_limit > 0:
+        print_color(
+            f"Overall CLTV Limit for payments/queries: {args.lncli_cltv_limit} blocks",
+            Colors.OKCYAN,
+        )
+
+    # Decode the invoice first to get necessary parameters for queryroutes
+    decoded_invoice = decode_payreq(config, args, invoice_str)
+    if not decoded_invoice:
+        print_color(
+            "Failed to decode Boltz invoice, cannot proceed with payment.", Colors.FAIL
+        )
+        return False  # Return False directly from pay_lightning_invoice
+
+    invoice_destination_pubkey = decoded_invoice.get("destination")
+    # Amount from decoded invoice should ideally be used for queryroutes,
+    # but args.amount is the primary driver for the swap.
+    invoice_amount_sats = args.amount  # Use the script's target swap amount
+
+    if not invoice_destination_pubkey:
+        print_color(
+            "Decoded invoice does not contain a destination pubkey. Cannot query routes.",
+            Colors.FAIL,
+        )
+        return False  # Return False directly
+
+    print_color(
+        f"Invoice destination for QueryRoutes: {invoice_destination_pubkey}",
+        Colors.OKCYAN,
+    )
 
     if not candidate_channels_info:
         print_color("No candidate channels for payment. Aborting.", Colors.FAIL)
@@ -990,13 +1020,11 @@ def pay_lightning_invoice(
                     + [
                         "queryroutes",
                         "--dest",
-                        invoice_str,
+                        invoice_destination_pubkey,
                         "--amt",
-                        str(args.amount),
+                        str(invoice_amount_sats),
                         "--outgoing_chan_id",
                         str(chan_id_to_try),
-                        "--timeout",
-                        args.queryroutes_timeout,  # lncli's internal timeout for queryroutes
                     ]
                 )
                 if args.ppm is not None:
@@ -1654,14 +1682,6 @@ def main():
                 bold=True,
             )
             sys.exit(1)
-
-        decoded_invoice = decode_payreq(config, args, lightning_invoice)
-        if not decoded_invoice:
-            print_color(
-                "Failed to decode Boltz invoice, cannot proceed with payment.",
-                Colors.FAIL,
-            )
-            return False
 
         payment_successful = pay_lightning_invoice(
             config,
