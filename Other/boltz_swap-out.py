@@ -923,8 +923,6 @@ def pay_lightning_invoice(
     )
 
     # --- Now attempt payment using these channels ---
-    # If your lncli supports specifying amounts per channel, you could use that here.
-    # Otherwise, just use the IDs and let LND split.
     outgoing_chan_ids = [ch["id"] for ch in selected_channels]
     actual_command_list, display_command_str = construct_lncli_command(
         config, args, invoice_str, outgoing_chan_ids
@@ -948,401 +946,110 @@ def pay_lightning_invoice(
             )
             lncli_timeout_seconds = 300  # Defaulting to 5 minutes for lncli itself
 
-    # This should be based on lncli's own timeout plus a buffer, and remains constant for this batch's attempts.
-    # This script_subprocess_timeout_for_this_batch is for the payinvoice command itself.
     payinvoice_script_subprocess_timeout = (
         lncli_timeout_seconds + SUBPROCESS_TIMEOUT_BUFFER_SECONDS
     )
-    # Timeout for queryroutes subprocess will be derived from args.queryroutes_timeout
-
-    overall_payment_attempt_batch_count = 0  # Counts distinct batches tried
-
-    for batch_idx, current_batch_info_list in enumerate(selected_channels):
-        if (
-            args.max_payment_attempts is not None
-            and overall_payment_attempt_batch_count >= args.max_payment_attempts
-        ):
-            print_color(
-                f"Reached max payment batches to try ({args.max_payment_attempts}). Stopping.",
-                Colors.WARNING,
-            )
-            break
-        overall_payment_attempt_batch_count += 1
-
-        current_batch_ids = [ch["id"] for ch in current_batch_info_list]
-        current_batch_liquidity_sum = sum(
-            ch["amount"] for ch in current_batch_info_list
-        )
-
-        aliases_in_batch = [ch["alias"] for ch in current_batch_info_list]
-        if len(aliases_in_batch) > 5:  # Keep printout manageable
-            aliases_str = (
-                ", ".join(aliases_in_batch[:3])
-                + f"... ({len(aliases_in_batch) - 3} more)"
-            )
-        else:
-            aliases_str = ", ".join(aliases_in_batch)
-
-        print_color(
-            f"\nAttempting Batch {overall_payment_attempt_batch_count}/{len(selected_channels)} (Total Liquidity: {current_batch_liquidity_sum} sats)",
-            Colors.OKBLUE,
-        )
-        print_color(
-            f"  Channels in this batch ({len(current_batch_ids)}): {aliases_str}",
-            Colors.OKCYAN,
-        )
-        if args.verbose or args.debug:
-            print_color(f"  Channel IDs: {', '.join(current_batch_ids)}", Colors.OKCYAN)
-
-        # Inner loop for "in transition" retries for the CURRENT batch
-        while True:
-            # --- QueryRoutes for each channel in the batch BEFORE trying to pay ---
-            # This 'while True' loop is for payinvoice retries (e.g. "in transition")
-            # The queryroutes logic will be tried for each channel *within* this batch attempt.
-
-            payment_attempted_for_this_batch_iteration = False
-            successful_payinvoice_for_this_batch = False
-
-            for (
-                channel_info
-            ) in (
-                current_batch_info_list
-            ):  # Iterate through channels in the current batch
-                chan_id_to_try = channel_info["id"]
-                chan_alias_to_try = channel_info["alias"]
-                print_color(
-                    f"  Attempting QueryRoutes for channel: {chan_alias_to_try} ({chan_id_to_try})",
-                    Colors.OKCYAN,
-                )
-
-                lncli_path = config.get("lncli_path", "/usr/local/bin/lncli")
-                lnd_connection_params = [
-                    "--rpcserver=" + (config.get("lnd_rpcserver") or "localhost:10009"),
-                    "--tlscertpath="
-                    + os.path.expanduser(
-                        config.get("lnd_tlscertpath") or "~/.lnd/tls.cert"
-                    ),
-                    "--macaroonpath="
-                    + os.path.expanduser(
-                        config.get("lnd_macaroonpath")
-                        or "~/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
-                    ),
-                ]
-
-                query_command_parts = (
-                    [lncli_path]
-                    + lnd_connection_params
-                    + [
-                        "queryroutes",
-                        "--dest",
-                        invoice_destination_pubkey,
-                        "--amt",
-                        str(invoice_amount_sats),
-                        "--outgoing_chan_id",
-                        str(chan_id_to_try),
-                    ]
-                )
-                if args.ppm is not None:
-                    fee_limit_sats = math.floor(args.amount * args.ppm / 1_000_000)
-                    query_command_parts.extend(["--fee_limit", str(fee_limit_sats)])
-                else:  # Default to 0 fee_limit if --ppm not specified
-                    query_command_parts.extend(["--fee_limit", "0"])
-
-                if args.lncli_cltv_limit > 0:
-                    query_command_parts.extend(
-                        ["--cltv_limit", str(args.lncli_cltv_limit)]
-                    )
-
-                # Calculate subprocess timeout for queryroutes
-                queryroutes_subprocess_timeout_seconds = 30  # Default
-                try:
-                    if args.queryroutes_timeout.lower().endswith("s"):
-                        queryroutes_subprocess_timeout_seconds = int(
-                            args.queryroutes_timeout[:-1]
-                        )
-                    elif args.queryroutes_timeout.lower().endswith("m"):
-                        queryroutes_subprocess_timeout_seconds = (
-                            int(args.queryroutes_timeout[:-1]) * 60
-                        )
-                    queryroutes_subprocess_timeout_seconds += (
-                        10  # Buffer for subprocess
-                    )
-                except ValueError:
-                    print_color(
-                        f"Warning: Invalid --queryroutes-timeout format '{args.queryroutes_timeout}'. Using default for subprocess.",
-                        Colors.WARNING,
-                    )
-
-                qr_success, qr_output, qr_error = run_command(
-                    query_command_parts,
-                    timeout=queryroutes_subprocess_timeout_seconds,
-                    debug=args.debug,
-                    expect_json=True,
-                    dry_run_output=f"lncli queryroutes via {chan_id_to_try}",
-                )
-
-                if (
-                    args.debug and qr_success
-                ):  # Simulate successful queryroutes in debug
-                    # Explicitly prepare mock data components
-                    mock_total_fees_msat = "100"
-                    # Simplify mock_total_time_lock to avoid Pylance issue with decoded_invoice in this specific block
-                    # Use a plausible fixed value for the mock.
-                    # The runtime logic for non-debug paths is unaffected.
-                    mock_total_time_lock = (
-                        70  # Example: Plausible fixed total_time_lock for mock
-                    )
-
-                    mock_qr_data = {
-                        "routes": [
-                            {
-                                "total_fees_msat": mock_total_fees_msat,
-                                "total_time_lock": mock_total_time_lock,
-                                "hops": [
-                                    {
-                                        "chan_id": chan_id_to_try,
-                                        "pub_key": "mock_next_hop_pubkey",
-                                    }
-                                ],
-                            }
-                        ],
-                        "success_prob": 0.9,
-                    }
-                    print_color(
-                        f"[DEBUG] Simulated queryroutes success for {chan_id_to_try}: {mock_qr_data}",
-                        Colors.OKGREEN,
-                    )
-                    qr_output = mock_qr_data  # ensure qr_output is the mock data
-                    # Fall through to payinvoice attempt in debug
-
-                if (
-                    qr_success
-                    and isinstance(qr_output, dict)
-                    and qr_output.get("routes")
-                    and len(qr_output["routes"]) > 0
-                ):
-                    print_color(
-                        f"  QueryRoutes successful for channel {chan_alias_to_try} ({chan_id_to_try}). Found {len(qr_output['routes'])} route(s).",
-                        Colors.OKGREEN,
-                    )
-                    if args.verbose:
-                        print_color(
-                            f"    Route details: {json.dumps(qr_output['routes'][0], indent=2)}",
-                            Colors.OKCYAN,
-                        )
-
-                    # --- Attempt lncli payinvoice using this specific channel ---
-                    # We use only the chan_id that QueryRoutes succeeded for this specific attempt.
-                    # The `construct_lncli_command` will build the command for this single channel.
-                    # We reset the "in_transition_retry_count_for_this_batch" as this is a new pay attempt
-                    # for potentially a different channel within the batch, after a successful query.
-
-                    # Reset retry count for this specific payinvoice attempt
-                    in_transition_retry_count_for_this_pay_attempt = 0
-                    current_in_transition_retry_delay_seconds_for_pay = (
-                        IN_TRANSITION_RETRY_INITIAL_DELAY_SECONDS
-                    )
-
-                    while (
-                        True
-                    ):  # Inner loop for payinvoice retries for *this specific channel*
-                        payment_attempted_for_this_batch_iteration = (
-                            True  # Mark that we tried to pay
-                        )
-                        actual_command_list, display_command_str = (
-                            construct_lncli_command(
-                                config,
-                                args,
-                                invoice_str,
-                                [
-                                    chan_id_to_try
-                                ],  # Pass only the successfully queried channel
-                            )
-                        )
-
-                        if in_transition_retry_count_for_this_pay_attempt > 0:
-                            print_color(
-                                f"    Retrying payinvoice via {chan_alias_to_try} (in transition attempt {in_transition_retry_count_for_this_pay_attempt}/{MAX_IN_TRANSITION_RETRIES}) ",
-                                Colors.OKCYAN,
-                            )
-                        else:
-                            print_color(
-                                f"    Attempting payinvoice via channel: {chan_alias_to_try} ({chan_id_to_try})",
-                                Colors.OKBLUE,
-                            )
-
-                        command_success, output, error_stderr = run_command(
-                            actual_command_list,
-                            timeout=payinvoice_script_subprocess_timeout,
-                            debug=args.debug,
-                            expect_json=True,
-                            dry_run_output=f"lncli payinvoice via {chan_id_to_try}",
-                            success_codes=[0],
-                            display_str_override=display_command_str,
-                            attempt_graceful_terminate_on_timeout=True,
-                        )
-
-                        if command_success:
-                            if args.debug:
-                                print_color(
-                                    f"[DEBUG] Payinvoice via {chan_id_to_try} successful (simulated).",
-                                    Colors.OKGREEN,
-                                )
-                                return True  # Overall success
-
-                            if isinstance(output, dict):
-                                payment_error_field = output.get("payment_error")
-                                payment_preimage = output.get("payment_preimage")
-                                top_level_status = output.get("status")
-                                failure_reason = output.get("failure_reason")
-                                is_successful_payment = (
-                                    payment_preimage
-                                    and payment_preimage != ""
-                                    and (
-                                        top_level_status == "SUCCEEDED"
-                                        or not top_level_status
-                                    )
-                                    and (
-                                        failure_reason == "FAILURE_REASON_NONE"
-                                        or not failure_reason
-                                    )
-                                    and (
-                                        not payment_error_field
-                                        or payment_error_field == ""
-                                    )
-                                )
-                                if is_successful_payment:
-                                    print_color(
-                                        f"Invoice payment successful via channel {chan_alias_to_try}! Preimage: {payment_preimage}",
-                                        Colors.OKGREEN,
-                                    )
-                                    # (Existing logic to print route details)
-                                    return True  # Overall payment success
-                                else:
-                                    print_color(
-                                        f"    Payinvoice via {chan_alias_to_try} completed (exit 0) but content indicates failure.",
-                                        Colors.WARNING,
-                                    )
-                                    if args.verbose:
-                                        print_color(
-                                            f"      JSON: {json.dumps(output, indent=2)}",
-                                            Colors.WARNING,
-                                        )
-                                    break  # Break from this payinvoice attempt's retry loop, try next channel in batch
-                            else:  # lncli exited 0 but output was not JSON
-                                print_color(
-                                    f"    Payinvoice via {chan_alias_to_try} completed (exit 0) but output not JSON.",
-                                    Colors.WARNING,
-                                )
-                                break  # Break from this payinvoice attempt's retry loop
-                        else:  # payinvoice command failed (non-zero exit)
-                            err_str_combined = str(error_stderr) + str(output)
-                            if "invoice is already paid" in err_str_combined.lower():
-                                print_color(
-                                    "Invoice was already paid. Success.", Colors.OKGREEN
-                                )
-                                return True  # Overall success
-
-                            is_in_transition = (
-                                "payment is in transition" in err_str_combined.lower()
-                            )
-                            if is_in_transition:
-                                in_transition_retry_count_for_this_pay_attempt += 1
-                                if (
-                                    in_transition_retry_count_for_this_pay_attempt
-                                    > MAX_IN_TRANSITION_RETRIES
-                                ):
-                                    print_color(
-                                        f"    Max 'in transition' retries for payinvoice via {chan_alias_to_try} reached.",
-                                        Colors.FAIL,
-                                    )
-                                    break  # Break from this payinvoice attempt's retry loop
-                                print_color(
-                                    f"    'Payment in transition' for payinvoice via {chan_alias_to_try}. Retrying (attempt {in_transition_retry_count_for_this_pay_attempt +1}). Waiting {current_in_transition_retry_delay_seconds_for_pay}s...",
-                                    Colors.WARNING,
-                                )
-                                time.sleep(
-                                    current_in_transition_retry_delay_seconds_for_pay
-                                )
-                                current_in_transition_retry_delay_seconds_for_pay *= 2
-                                continue  # Retry payinvoice for this channel
-                            else:  # Non-transitional error for payinvoice
-                                print_color(
-                                    f"    Payinvoice via {chan_alias_to_try} failed (non-transitional).",
-                                    Colors.FAIL,
-                                )
-                                if args.verbose:
-                                    if error_stderr:
-                                        print_color(
-                                            f"      Stderr: {error_stderr.strip()}",
-                                            Colors.FAIL,
-                                        )
-                                    if isinstance(output, str) and output.strip():
-                                        print_color(
-                                            f"      Stdout: {output.strip()}",
-                                            Colors.FAIL,
-                                        )
-                                break  # Break from this payinvoice attempt's retry loop, try next channel in batch
-                    # End of while True for this channel's payinvoice retries
-                    # If we broke out of the payinvoice retry loop for this channel without returning True, it means this channel ultimately failed.
-                    # The outer for loop will then try the next channel in the batch with queryroutes.
-
-                else:  # QueryRoutes failed for this channel_id
-                    print_color(
-                        f"  QueryRoutes failed for channel {chan_alias_to_try} ({chan_id_to_try}).",
-                        Colors.WARNING,
-                    )
-                    if args.verbose or args.debug:
-                        if qr_error:
-                            print_color(
-                                f"    Stderr: {qr_error.strip()}", Colors.WARNING
-                            )
-                        if isinstance(qr_output, str) and qr_output.strip():
-                            print_color(
-                                f"    Stdout: {qr_output.strip()}", Colors.WARNING
-                            )
-                        elif isinstance(qr_output, dict):
-                            print_color(
-                                f"    Full Response: {json.dumps(qr_output, indent=2)}",
-                                Colors.WARNING,
-                            )
-                    # Continue to the next channel in the batch for QueryRoutes
-
-            # --- End of for loop iterating through channels in current_batch_info_list ---
-            # If we've looped through all channels in this batch and haven't returned True (overall success),
-            # then this batch attempt is considered failed.
-
-            if (
-                successful_payinvoice_for_this_batch
-            ):  # This flag would be set if any payinvoice in the batch loop succeeded
-                return True  # Should have been caught earlier, but as a safeguard
-
-            # If no payment was even attempted (e.g. all queryroutes failed for this batch)
-            # or all attempted payments in this batch failed.
-            print_color(
-                f"All channels in Batch {overall_payment_attempt_batch_count} failed QueryRoutes or subsequent PayInvoice.",
-                Colors.FAIL,
-            )
-            break  # Break from the outer while True (which was for "in_transition_retry_count_for_this_batch")
-            # because we've exhausted all channels in this batch.
-
-        # --- After inner while loop (this batch's attempts are done) ---
-        # If payment was successful inside the loop, we'd have returned True.
-        # So if we reach here, this batch {overall_payment_attempt_batch_count} didn't result in a confirmed payment.
-
-        # Check if there are more batches to try AND we haven't hit the overall max attempts
-        if batch_idx + 1 < len(selected_channels) and (
-            args.max_payment_attempts is None
-            or overall_payment_attempt_batch_count < args.max_payment_attempts
-        ):
-            print_color(
-                f"Retrying with next batch in 30 seconds...", Colors.WARNING
-            )  # Using the existing 30s delay
-            time.sleep(30)
-        # No "else" needed: if it's the last configured attempt or last batch, outer loop terminates.
 
     print_color(
-        "All payment attempts with available channel batches failed to confirm success.",
+        f"\nAttempting payment with {len(outgoing_chan_ids)} channels: {', '.join(outgoing_chan_ids)}",
+        Colors.OKBLUE,
+    )
+
+    command_success, output, error_stderr = run_command(
+        actual_command_list,
+        timeout=payinvoice_script_subprocess_timeout,
+        debug=args.debug,
+        expect_json=True,
+        dry_run_output="lncli payinvoice with selected channels",
+        success_codes=[0],
+        display_str_override=display_command_str,
+        attempt_graceful_terminate_on_timeout=True,
+    )
+
+    if command_success:
+        if args.debug:
+            print_color(
+                f"[DEBUG] Payinvoice successful (simulated).",
+                Colors.OKGREEN,
+            )
+            return True  # Overall success
+
+        if isinstance(output, dict):
+            payment_error_field = output.get("payment_error")
+            payment_preimage = output.get("payment_preimage")
+            top_level_status = output.get("status")
+            failure_reason = output.get("failure_reason")
+            is_successful_payment = (
+                payment_preimage
+                and payment_preimage != ""
+                and (
+                    top_level_status == "SUCCEEDED"
+                    or not top_level_status
+                )
+                and (
+                    failure_reason == "FAILURE_REASON_NONE"
+                    or not failure_reason
+                )
+                and (
+                    not payment_error_field
+                    or payment_error_field == ""
+                )
+            )
+            if is_successful_payment:
+                print_color(
+                    f"Invoice payment successful! Preimage: {payment_preimage}",
+                    Colors.OKGREEN,
+                )
+                return True  # Overall payment success
+            else:
+                print_color(
+                    f"Payinvoice completed (exit 0) but content indicates failure.",
+                    Colors.WARNING,
+                )
+                if args.verbose:
+                    print_color(
+                        f"      JSON: {json.dumps(output, indent=2)}",
+                        Colors.WARNING,
+                    )
+        else:  # lncli exited 0 but output was not JSON
+            print_color(
+                f"Payinvoice completed (exit 0) but output not JSON.",
+                Colors.WARNING,
+            )
+    else:  # payinvoice command failed (non-zero exit)
+        err_str_combined = str(error_stderr) + str(output)
+        if "invoice is already paid" in err_str_combined.lower():
+            print_color(
+                "Invoice was already paid. Success.", Colors.OKGREEN
+            )
+            return True  # Overall success
+
+        is_in_transition = (
+            "payment is in transition" in err_str_combined.lower()
+        )
+        if is_in_transition:
+            print_color(
+                f"'Payment is in transition' detected. Please retry after some time.",
+                Colors.WARNING,
+            )
+        else:
+            print_color(
+                f"Payinvoice failed (non-transitional).",
+                Colors.FAIL,
+            )
+            if args.verbose:
+                if error_stderr:
+                    print_color(
+                        f"      Stderr: {error_stderr.strip()}",
+                        Colors.FAIL,
+                    )
+                if isinstance(output, str) and output.strip():
+                    print_color(
+                        f"      Stdout: {output.strip()}",
+                        Colors.FAIL,
+                    )
+    print_color(
+        "All payment attempts with available channels failed to confirm success.",
         Colors.FAIL,
     )
     return False
