@@ -841,79 +841,94 @@ def pay_lightning_invoice(
         return False
 
     swap_amount_sats = args.amount
-    # Target liquidity for each batch: 1.5x the swap amount
-    target_batch_liquidity = swap_amount_sats * 1.5
+    min_chunk = max(1, swap_amount_sats // max(1, len(candidate_channels_info)))
+    target_liquidity = int(swap_amount_sats * 1.10)  # 110%
 
-    # --- New Batch Formation Logic ---
-    all_formed_batches_info = (
-        []
-    )  # Stores lists of channel_info dicts, each list is a batch
-    channel_idx_tracker = 0
-    while channel_idx_tracker < len(candidate_channels_info):
-        current_batch_channel_list = []
-        current_batch_cumulative_liquidity = 0
+    # --- New: Probing and dynamic batch building ---
+    selected_channels = []
+    accumulated = 0
 
-        # Greedily build a batch until target liquidity is met or channels run out
-        temp_idx = channel_idx_tracker
-        while temp_idx < len(candidate_channels_info):
-            channel = candidate_channels_info[temp_idx]
-            current_batch_channel_list.append(channel)
-            current_batch_cumulative_liquidity += channel["balance"]
-            temp_idx += 1
-            if current_batch_cumulative_liquidity >= target_batch_liquidity:
-                break  # Batch has enough liquidity
+    for channel in candidate_channels_info:
+        chan_id = channel["id"]
+        max_liquidity = channel["balance"]
+        probe_amounts = [max_liquidity, max_liquidity // 2, max_liquidity // 4]
+        for amt in probe_amounts:
+            if amt < min_chunk:
+                continue
+            # Probe with queryroutes
+            lncli_path = config.get("lncli_path", "/usr/local/bin/lncli")
+            lnd_connection_params = [
+                "--rpcserver=" + (config.get("lnd_rpcserver") or "localhost:10009"),
+                "--tlscertpath=" + os.path.expanduser(config.get("lnd_tlscertpath") or "~/.lnd/tls.cert"),
+                "--macaroonpath=" + os.path.expanduser(config.get("lnd_macaroonpath") or "~/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"),
+            ]
+            query_command_parts = [
+                lncli_path, *lnd_connection_params,
+                "queryroutes",
+                "--dest", decoded_invoice["destination"],
+                "--amt", str(amt),
+                "--outgoing_chan_id", str(chan_id),
+            ]
+            if args.ppm is not None:
+                fee_limit_sats = math.floor(args.amount * args.ppm / 1_000_000)
+                query_command_parts.extend(["--fee_limit", str(fee_limit_sats)])
+            else:
+                query_command_parts.extend(["--fee_limit", "0"])
+            if args.lncli_cltv_limit > 0:
+                query_command_parts.extend(["--cltv_limit", str(args.lncli_cltv_limit)])
 
-        if current_batch_channel_list:  # If any channels were added to this batch
-            all_formed_batches_info.append(current_batch_channel_list)
-        channel_idx_tracker = temp_idx  # Update main tracker to where this batch ended
+            queryroutes_subprocess_timeout_seconds = 30
+            try:
+                if args.queryroutes_timeout.lower().endswith("s"):
+                    queryroutes_subprocess_timeout_seconds = int(args.queryroutes_timeout[:-1])
+                elif args.queryroutes_timeout.lower().endswith("m"):
+                    queryroutes_subprocess_timeout_seconds = int(args.queryroutes_timeout[:-1]) * 60
+                queryroutes_subprocess_timeout_seconds += 10
+            except ValueError:
+                pass
 
-    # Handle "Avoid Small Last Batch" rule:
-    # If there's more than one batch, and the last batch's total liquidity is less than the swap amount,
-    # merge it into the second-to-last batch.
-    if len(all_formed_batches_info) > 1:
-        last_batch_list = all_formed_batches_info[-1]
-        liquidity_of_last_batch = sum(ch["balance"] for ch in last_batch_list)
-        if liquidity_of_last_batch < swap_amount_sats:
-            print_color(
-                f"Last formed batch has {liquidity_of_last_batch} sats, less than swap amount {swap_amount_sats}. Merging into previous batch.",
-                Colors.WARNING,
+            qr_success, qr_output, qr_error = run_command(
+                query_command_parts,
+                timeout=queryroutes_subprocess_timeout_seconds,
+                debug=args.debug,
+                expect_json=True,
+                dry_run_output=f"lncli queryroutes via {chan_id} for {amt} sats",
             )
-            all_formed_batches_info[-2].extend(
-                last_batch_list
-            )  # Add channels from last to second-last
-            all_formed_batches_info.pop()  # Remove the (now merged) last batch
+            if qr_success and isinstance(qr_output, dict) and qr_output.get("routes"):
+                print_color(
+                    f"  Channel {channel['alias']} ({chan_id}) can likely send {amt} sats.",
+                    Colors.OKGREEN,
+                )
+                selected_channels.append({"id": chan_id, "amount": amt, "alias": channel["alias"]})
+                accumulated += amt
+                break  # Stop probing this channel, move to next
+            else:
+                print_color(
+                    f"  Channel {channel['alias']} ({chan_id}) failed to probe {amt} sats.",
+                    Colors.WARNING,
+                )
+        if accumulated >= target_liquidity:
+            break
 
-    # Final list of batches to attempt, each element is a list of channel_info dicts
-    final_payment_batches_info = [
-        batch for batch in all_formed_batches_info if batch
-    ]  # Filter out any empty batches
-
-    if not final_payment_batches_info:
-        total_candidate_liquidity = sum(ch["balance"] for ch in candidate_channels_info)
+    if accumulated < swap_amount_sats:
         print_color(
-            "Could not form any viable payment batches with the available candidate channels.",
+            f"Could not find enough liquidity for the swap. Needed: {swap_amount_sats}, found: {accumulated}.",
             Colors.FAIL,
         )
-        print_color(
-            f"  Swap amount: {swap_amount_sats} sats. Target batch liquidity: {target_batch_liquidity} sats.",
-            Colors.FAIL,
-        )
-        print_color(
-            f"  Total liquidity from {len(candidate_channels_info)} candidates: {total_candidate_liquidity} sats.",
-            Colors.FAIL,
-        )
-        if candidate_channels_info:
-            print_color(
-                f"  Largest candidate channel has {candidate_channels_info[0]['balance']} sats.",
-                Colors.FAIL,
-            )
         return False
 
     print_color(
-        f"Formed {len(final_payment_batches_info)} payment batches with target liquidity ~{target_batch_liquidity} sats each (or remaining).",
+        f"Selected {len(selected_channels)} channels for payment, total liquidity: {accumulated} sats.",
         Colors.OKCYAN,
     )
-    # --- End New Batch Formation Logic ---
+
+    # --- Now attempt payment using these channels ---
+    # If your lncli supports specifying amounts per channel, you could use that here.
+    # Otherwise, just use the IDs and let LND split.
+    outgoing_chan_ids = [ch["id"] for ch in selected_channels]
+    actual_command_list, display_command_str = construct_lncli_command(
+        config, args, invoice_str, outgoing_chan_ids
+    )
 
     # Calculate base timeout_seconds for lncli's own execution
     lncli_timeout_seconds = 0
@@ -942,7 +957,7 @@ def pay_lightning_invoice(
 
     overall_payment_attempt_batch_count = 0  # Counts distinct batches tried
 
-    for batch_idx, current_batch_info_list in enumerate(final_payment_batches_info):
+    for batch_idx, current_batch_info_list in enumerate(selected_channels):
         if (
             args.max_payment_attempts is not None
             and overall_payment_attempt_batch_count >= args.max_payment_attempts
@@ -956,7 +971,7 @@ def pay_lightning_invoice(
 
         current_batch_ids = [ch["id"] for ch in current_batch_info_list]
         current_batch_liquidity_sum = sum(
-            ch["balance"] for ch in current_batch_info_list
+            ch["amount"] for ch in current_batch_info_list
         )
 
         aliases_in_batch = [ch["alias"] for ch in current_batch_info_list]
@@ -969,7 +984,7 @@ def pay_lightning_invoice(
             aliases_str = ", ".join(aliases_in_batch)
 
         print_color(
-            f"\nAttempting Batch {overall_payment_attempt_batch_count}/{len(final_payment_batches_info)} (Total Liquidity: {current_batch_liquidity_sum} sats)",
+            f"\nAttempting Batch {overall_payment_attempt_batch_count}/{len(selected_channels)} (Total Liquidity: {current_batch_liquidity_sum} sats)",
             Colors.OKBLUE,
         )
         print_color(
@@ -1316,7 +1331,7 @@ def pay_lightning_invoice(
         # So if we reach here, this batch {overall_payment_attempt_batch_count} didn't result in a confirmed payment.
 
         # Check if there are more batches to try AND we haven't hit the overall max attempts
-        if batch_idx + 1 < len(final_payment_batches_info) and (
+        if batch_idx + 1 < len(selected_channels) and (
             args.max_payment_attempts is None
             or overall_payment_attempt_batch_count < args.max_payment_attempts
         ):
