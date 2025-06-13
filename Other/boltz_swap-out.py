@@ -848,20 +848,25 @@ def pay_lightning_invoice(
     selected_channels = []
     accumulated = 0
     used_channel_ids = set()
-    channel_idx = 0
+    channel_idx = 0 # Tracks progress through candidate_channels_info for enrichment
 
-    while accumulated < target_liquidity and channel_idx < len(candidate_channels_info):
-        channel = candidate_channels_info[channel_idx]
+    # Initial batch selection
+    print_color("Building initial payment batch by probing channels...", Colors.OKBLUE)
+    initial_selection_channel_idx = 0 # Use a separate index for initial selection
+    while accumulated < target_liquidity and initial_selection_channel_idx < len(candidate_channels_info):
+        channel = candidate_channels_info[initial_selection_channel_idx]
         chan_id = channel["id"]
         if chan_id in used_channel_ids:
-            channel_idx += 1
+            initial_selection_channel_idx += 1
             continue
+        
         max_liquidity = channel["balance"]
         probe_amounts = [max_liquidity, max_liquidity // 2, max_liquidity // 4]
+        probed_initial_channel_successfully = False
         for amt in probe_amounts:
             if amt < min_chunk:
                 continue
-            # Probe with queryroutes
+            
             lncli_path = config.get("lncli_path", "/usr/local/bin/lncli")
             lnd_connection_params = [
                 "--rpcserver=" + (config.get("lnd_rpcserver") or "localhost:10009"),
@@ -889,7 +894,7 @@ def pay_lightning_invoice(
                     queryroutes_subprocess_timeout_seconds = int(args.queryroutes_timeout[:-1])
                 elif args.queryroutes_timeout.lower().endswith("m"):
                     queryroutes_subprocess_timeout_seconds = int(args.queryroutes_timeout[:-1]) * 60
-                queryroutes_subprocess_timeout_seconds += 10
+                queryroutes_subprocess_timeout_seconds += 10 # Buffer
             except ValueError:
                 pass
 
@@ -898,40 +903,45 @@ def pay_lightning_invoice(
                 timeout=queryroutes_subprocess_timeout_seconds,
                 debug=args.debug,
                 expect_json=True,
-                dry_run_output=f"lncli queryroutes via {chan_id} for {amt} sats",
+                dry_run_output=f"lncli queryroutes (initial) via {channel['alias']}({chan_id}) for {amt} sats",
             )
             if qr_success and isinstance(qr_output, dict) and qr_output.get("routes"):
                 print_color(
-                    f"  Channel {channel['alias']} ({chan_id}) can likely send {amt} sats.",
+                    f"  Channel {channel['alias']} ({chan_id}) can likely send {amt} sats (initial selection).",
                     Colors.OKGREEN,
                 )
                 selected_channels.append({"id": chan_id, "amount": amt, "alias": channel["alias"]})
                 accumulated += amt
                 used_channel_ids.add(chan_id)
-                break  # Stop probing this channel, move to next
+                probed_initial_channel_successfully = True
+                break 
             else:
                 print_color(
-                    f"  Channel {channel['alias']} ({chan_id}) failed to probe {amt} sats.",
+                    f"  Initial probe failed for channel {channel['alias']} ({chan_id}) for {amt} sats.",
                     Colors.WARNING,
                 )
-        channel_idx += 1
+        initial_selection_channel_idx += 1
+    
+    channel_idx = initial_selection_channel_idx # Set main channel_idx to where initial selection left off
 
     if accumulated < swap_amount_sats:
         print_color(
-            f"Could not find enough liquidity for the swap. Needed: {swap_amount_sats}, found: {accumulated}.",
+            f"Could not find enough liquidity ({accumulated} sats) for the swap (needed: {swap_amount_sats} sats) during initial selection.",
             Colors.FAIL,
         )
         return False
 
     print_color(
-        f"Selected {len(selected_channels)} channels for payment, total liquidity: {accumulated} sats.",
+        f"Initial batch: {len(selected_channels)} channels, total probed liquidity: {accumulated} sats.",
         Colors.OKCYAN,
     )
 
-    # --- Payment attempt loop with enrichment ---
-    # Try payment, and if it fails, continue probing and adding more channels (if any left)
-    payment_attempted_channels = set()
+    # --- Payment attempt loop ---
     while True:
+        if not selected_channels: # Should not happen if initial selection was successful
+            print_color("No channels selected for payment. Aborting.", Colors.FAIL)
+            return False
+
         outgoing_chan_ids = [ch["id"] for ch in selected_channels]
         actual_command_list, display_command_str = construct_lncli_command(
             config, args, invoice_str, outgoing_chan_ids
@@ -959,7 +969,7 @@ def pay_lightning_invoice(
         )
 
         print_color(
-            f"\nAttempting payment with {len(outgoing_chan_ids)} channels: {', '.join(outgoing_chan_ids)}",
+            f"\nAttempting payment with {len(outgoing_chan_ids)} channels (total liquidity {accumulated} sats): {', '.join(outgoing_chan_ids)}",
             Colors.OKBLUE,
         )
 
@@ -976,10 +986,7 @@ def pay_lightning_invoice(
 
         if command_success:
             if args.debug:
-                print_color(
-                    f"[DEBUG] Payinvoice successful (simulated).",
-                    Colors.OKGREEN,
-                )
+                print_color(f"[DEBUG] Payinvoice successful (simulated).", Colors.OKGREEN)
                 return True
 
             if isinstance(output, dict):
@@ -988,142 +995,160 @@ def pay_lightning_invoice(
                 top_level_status = output.get("status")
                 failure_reason = output.get("failure_reason")
                 is_successful_payment = (
-                    payment_preimage
-                    and payment_preimage != ""
-                    and (
-                        top_level_status == "SUCCEEDED"
-                        or not top_level_status
-                    )
-                    and (
-                        failure_reason == "FAILURE_REASON_NONE"
-                        or not failure_reason
-                    )
-                    and (
-                        not payment_error_field
-                        or payment_error_field == ""
-                    )
+                    payment_preimage and payment_preimage != "" and
+                    (top_level_status == "SUCCEEDED" or not top_level_status) and
+                    (failure_reason == "FAILURE_REASON_NONE" or not failure_reason) and
+                    (not payment_error_field or payment_error_field == "")
                 )
                 if is_successful_payment:
-                    print_color(
-                        f"Invoice payment successful! Preimage: {payment_preimage}",
-                        Colors.OKGREEN,
-                    )
+                    print_color(f"Invoice payment successful! Preimage: {payment_preimage}", Colors.OKGREEN)
                     return True
                 else:
-                    print_color(
-                        f"Payinvoice completed (exit 0) but content indicates failure.",
-                        Colors.WARNING,
-                    )
+                    print_color(f"Payinvoice completed (exit 0) but content indicates failure.", Colors.WARNING)
                     if args.verbose:
-                        print_color(
-                            f"      JSON: {json.dumps(output, indent=2)}",
-                            Colors.WARNING,
-                        )
-            else:
-                print_color(
-                    f"Payinvoice completed (exit 0) but output not JSON.",
-                    Colors.WARNING,
-                )
-        else:
-            err_str_combined = str(error_stderr) + str(output)
+                        print_color(f"      JSON: {json.dumps(output, indent=2)}", Colors.WARNING)
+                    # This case will fall through to the failure handling logic below,
+                    # treating it as a non-transitional failure since command_success was true but content bad.
+                    # To force it into failure path:
+                    command_success = False # Override to trigger failure logic
+                    error_stderr = "lncli exit 0 but content indicates payment failure"
+                    if isinstance(output, dict) and output.get("payment_error"):
+                        error_stderr = output.get("payment_error")
+
+            else: # lncli exit 0 but output not JSON
+                print_color(f"Payinvoice completed (exit 0) but output not JSON. Treating as failure.", Colors.WARNING)
+                command_success = False # Override to trigger failure logic
+                error_stderr = "lncli exit 0 but output not JSON"
+        
+        # This block is entered if command_success is False (either initially or overridden)
+        if not command_success:
+            err_str_combined = str(error_stderr) + str(output if isinstance(output, str) else json.dumps(output or {}))
             if "invoice is already paid" in err_str_combined.lower():
-                print_color(
-                    "Invoice was already paid. Success.", Colors.OKGREEN
-                )
+                print_color("Invoice was already paid. Success.", Colors.OKGREEN)
                 return True
 
-            is_in_transition = (
-                "payment is in transition" in err_str_combined.lower()
-            )
-            if is_in_transition:
-                print_color(
-                    f"'Payment is in transition' detected. Please retry after some time.",
-                    Colors.WARNING,
-                )
-                # Try to enrich the batch with more channels if available
-                if channel_idx < len(candidate_channels_info):
-                    print_color(
-                        f"Payment failed. Probing more channels to enrich the batch and retry...",
-                        Colors.WARNING,
-                    )
-                    # Always try to add the next available channel(s), even if already above target_liquidity
-                    while channel_idx < len(candidate_channels_info):
-                        channel = candidate_channels_info[channel_idx]
-                        chan_id = channel["id"]
-                        if chan_id in used_channel_ids:
-                            channel_idx += 1
-                            continue
-                        max_liquidity = channel["balance"]
-                        probe_amounts = [max_liquidity, max_liquidity // 2, max_liquidity // 4]
-                        for amt in probe_amounts:
-                            if amt < min_chunk:
-                                continue
-                            # Probe with queryroutes (same as above)
-                            lncli_path = config.get("lncli_path", "/usr/local/bin/lncli")
-                            lnd_connection_params = [
-                                "--rpcserver=" + (config.get("lnd_rpcserver") or "localhost:10009"),
-                                "--tlscertpath=" + os.path.expanduser(config.get("lnd_tlscertpath") or "~/.lnd/tls.cert"),
-                                "--macaroonpath=" + os.path.expanduser(config.get("lnd_macaroonpath") or "~/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"),
-                            ]
-                            query_command_parts = [
-                                lncli_path, *lnd_connection_params,
-                                "queryroutes",
-                                "--dest", decoded_invoice["destination"],
-                                "--amt", str(amt),
-                                "--outgoing_chan_id", str(chan_id),
-                            ]
-                            if args.ppm is not None:
-                                fee_limit_sats = math.floor(args.amount * args.ppm / 1_000_000)
-                                query_command_parts.extend(["--fee_limit", str(fee_limit_sats)])
-                            else:
-                                query_command_parts.extend(["--fee_limit", "0"])
-                            if args.lncli_cltv_limit > 0:
-                                query_command_parts.extend(["--cltv_limit", str(args.lncli_cltv_limit)])
+            is_in_transition = "payment is in transition" in err_str_combined.lower()
+            
+            count_selected_channels_before_enrich = len(selected_channels)
+            new_channels_added_by_enrichment = False
 
-                            queryroutes_subprocess_timeout_seconds = 30
-                            try:
-                                if args.queryroutes_timeout.lower().endswith("s"):
-                                    queryroutes_subprocess_timeout_seconds = int(args.queryroutes_timeout[:-1])
-                                elif args.queryroutes_timeout.lower().endswith("m"):
-                                    queryroutes_subprocess_timeout_seconds = int(args.queryroutes_timeout[:-1]) * 60
-                                queryroutes_subprocess_timeout_seconds += 10
-                            except ValueError:
-                                pass
+            # --- Attempt Enrichment (Probing Logic) ---
+            if channel_idx < len(candidate_channels_info):
+                enrich_attempt_message = ""
+                if is_in_transition:
+                    enrich_attempt_message = f"Attempting to enrich batch due to 'in transition' (current batch size: {len(selected_channels)})..."
+                else:
+                    enrich_attempt_message = f"Attempting to enrich batch after non-transitional failure (current batch size: {len(selected_channels)})..."
+                print_color(enrich_attempt_message, Colors.OKBLUE)
+                
+                # Store channel_idx to see if it advances (meaning we tried to probe)
+                initial_channel_idx_for_this_enrich_pass = channel_idx 
 
-                            qr_success, qr_output, qr_error = run_command(
-                                query_command_parts,
-                                timeout=queryroutes_subprocess_timeout_seconds,
-                                debug=args.debug,
-                                expect_json=True,
-                                dry_run_output=f"lncli queryroutes via {chan_id} for {amt} sats",
-                            )
-                            if qr_success and isinstance(qr_output, dict) and qr_output.get("routes"):
-                                print_color(
-                                    f"  Channel {channel['alias']} ({chan_id}) can likely send {amt} sats.",
-                                    Colors.OKGREEN,
-                                )
-                                selected_channels.append({"id": chan_id, "amount": amt, "alias": channel["alias"]})
-                                accumulated += amt
-                                used_channel_ids.add(chan_id)
-                                break  # Stop probing this channel, move to next
-                            else:
-                                print_color(
-                                    f"  Channel {channel['alias']} ({chan_id}) failed to probe {amt} sats.",
-                                    Colors.WARNING,
-                                )
+                while channel_idx < len(candidate_channels_info):
+                    channel = candidate_channels_info[channel_idx]
+                    chan_id = channel["id"]
+                    
+                    if chan_id in used_channel_ids:
                         channel_idx += 1
-                    # After enriching, the while True loop will retry payment with the new batch
-                    continue
+                        continue
 
-            print_color(
-                "All payment attempts with available channels failed to confirm success.",
-                Colors.FAIL,
-            )
-            break
-    print_color(
-        "All payment attempts with available channels failed to confirm success.",
-        Colors.FAIL,
-    )
+                    max_liquidity = channel["balance"]
+                    probe_amounts_for_enrich = [max_liquidity, max_liquidity // 2, max_liquidity // 4]
+                    probed_this_channel_successfully_for_enrich = False
+
+                    for amt in probe_amounts_for_enrich:
+                        if amt < min_chunk:
+                            continue
+                        
+                        lncli_path = config.get("lncli_path", "/usr/local/bin/lncli")
+                        lnd_connection_params = [
+                            "--rpcserver=" + (config.get("lnd_rpcserver") or "localhost:10009"),
+                            "--tlscertpath=" + os.path.expanduser(config.get("lnd_tlscertpath") or "~/.lnd/tls.cert"),
+                            "--macaroonpath=" + os.path.expanduser(config.get("lnd_macaroonpath") or "~/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"),
+                        ]
+                        query_command_parts = [
+                            lncli_path, *lnd_connection_params, "queryroutes",
+                            "--dest", decoded_invoice["destination"],
+                            "--amt", str(amt),
+                            "--outgoing_chan_id", str(chan_id),
+                        ]
+                        if args.ppm is not None:
+                            fee_limit_sats = math.floor(args.amount * args.ppm / 1_000_000)
+                            query_command_parts.extend(["--fee_limit", str(fee_limit_sats)])
+                        else:
+                            query_command_parts.extend(["--fee_limit", "0"])
+                        if args.lncli_cltv_limit > 0:
+                            query_command_parts.extend(["--cltv_limit", str(args.lncli_cltv_limit)])
+
+                        queryroutes_subprocess_timeout_seconds = 30
+                        try:
+                            if args.queryroutes_timeout.lower().endswith("s"):
+                                queryroutes_subprocess_timeout_seconds = int(args.queryroutes_timeout[:-1])
+                            elif args.queryroutes_timeout.lower().endswith("m"):
+                                queryroutes_subprocess_timeout_seconds = int(args.queryroutes_timeout[:-1]) * 60
+                            queryroutes_subprocess_timeout_seconds += 10 # Buffer
+                        except ValueError: pass
+
+                        qr_success, qr_output, qr_error = run_command(
+                            query_command_parts,
+                            timeout=queryroutes_subprocess_timeout_seconds,
+                            debug=args.debug, expect_json=True,
+                            dry_run_output=f"lncli queryroutes (enrich) via {channel['alias']}({chan_id}) for {amt} sats",
+                        )
+                        if qr_success and isinstance(qr_output, dict) and qr_output.get("routes"):
+                            print_color(
+                                f"  Successfully probed and adding {channel['alias']} ({chan_id}) with {amt} sats to current batch.", Colors.OKGREEN,
+                            )
+                            selected_channels.append({"id": chan_id, "amount": amt, "alias": channel["alias"]})
+                            accumulated += amt
+                            used_channel_ids.add(chan_id)
+                            probed_this_channel_successfully_for_enrich = True
+                            break 
+                        else:
+                            print_color(
+                                f"  Enrichment probe failed for {channel['alias']} ({chan_id}) for {amt} sats.", Colors.WARNING,
+                            )
+                    channel_idx += 1 
+                    # if probed_this_channel_successfully_for_enrich:
+                    # Potentially break here to try payment with just one added channel, or let it gather all possible.
+                    # Current logic gathers all possible new ones before next payment attempt.
+                
+                if len(selected_channels) > count_selected_channels_before_enrich:
+                    new_channels_added_by_enrichment = True
+            # --- End Attempt Enrichment ---
+
+            # --- Decision Logic ---
+            if is_in_transition:
+                print_color(f"'Payment is in transition' detected with current batch.", Colors.WARNING)
+                if new_channels_added_by_enrichment:
+                    print_color("Batch was enriched. Retrying payment.", Colors.OKCYAN)
+                    time.sleep(IN_TRANSITION_RETRY_INITIAL_DELAY_SECONDS // 2) 
+                else:
+                    print_color("Batch not enriched. Retrying same batch for 'in transition' after delay.", Colors.WARNING)
+                    time.sleep(IN_TRANSITION_RETRY_INITIAL_DELAY_SECONDS)
+                # TODO: Consider adding a specific retry counter for "in_transition" on an *unchanged* batch.
+                continue 
+            else: # Non-transitional failure
+                print_color(f"Payinvoice failed (non-transitional). Original error: {error_stderr}", Colors.WARNING)
+                if args.verbose or args.debug:
+                    # Stderr was part of error_stderr. Output might be JSON or string.
+                    if isinstance(output, str):
+                        print_color(f"      Stdout (from failed command): {output.strip()}", Colors.WARNING)
+                    elif output: # If dict or other non-None
+                         print_color(f"      Output (from failed command): {json.dumps(output, indent=2)}", Colors.WARNING)
+
+
+                if new_channels_added_by_enrichment:
+                    print_color("Batch was enriched after non-transitional failure. Retrying payment.", Colors.OKCYAN)
+                    time.sleep(2) 
+                    continue
+                else:
+                    print_color("Batch not enriched after non-transitional failure. This payment path is exhausted for the current set of channels.", Colors.FAIL)
+                    break # Exit the `while True` payment loop
+            # --- End Decision Logic ---
+    
+    # This is reached if the `while True` loop is broken (e.g., non-transitional failure without successful enrichment)
+    print_color("All payment attempts with available channels failed to confirm success.", Colors.FAIL)
     return False
 
 
