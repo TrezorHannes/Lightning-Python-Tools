@@ -845,7 +845,7 @@ def pay_lightning_invoice(
         print_color(f"\n--- Building New Payment Batch (starting from overall candidate index {channel_idx}) ---", Colors.OKBLUE)
 
         # --- Build/Rebuild a primary batch ---
-        initial_batch_building_channel_idx = channel_idx # Use local copy for this batch build
+        initial_batch_building_channel_idx = channel_idx 
         temp_newly_selected_channels_for_this_batch = []
 
         while initial_batch_building_channel_idx < len(candidate_channels_info) and \
@@ -855,7 +855,7 @@ def pay_lightning_invoice(
             channel_candidate = candidate_channels_info[initial_batch_building_channel_idx]
             chan_id_candidate = channel_candidate["id"]
 
-            if chan_id_candidate in used_channel_ids: # Should ideally not happen if channel_idx is managed well
+            if chan_id_candidate in used_channel_ids: 
                 initial_batch_building_channel_idx += 1
                 continue
 
@@ -864,9 +864,11 @@ def pay_lightning_invoice(
             probe_amounts = [initial_probe_sats, max(1, initial_probe_sats // 2), max(1, initial_probe_sats // 4)]
             
             probed_successfully_for_initial_batch = False
+            channel_permanently_skipped_no_path = False
+
             for amt in probe_amounts:
                 if amt < min_chunk: continue
-                # (Construct and run queryroutes command as before)
+                
                 lncli_path = config.get("lncli_path", "/usr/local/bin/lncli")
                 lnd_connection_params = [
                     "--rpcserver=" + (config.get("lnd_rpcserver") or "localhost:10009"),
@@ -891,7 +893,7 @@ def pay_lightning_invoice(
                     query_timeout_val +=10
                 except ValueError: pass
 
-                qr_success, qr_output, _ = run_command(
+                qr_success, qr_output, qr_error_detail = run_command(
                     query_command_parts, timeout=query_timeout_val, debug=args.debug, expect_json=True,
                     dry_run_output=f"lncli queryroutes (batch build) via {channel_candidate['alias']}({chan_id_candidate}) for {amt} sats"
                 )
@@ -899,16 +901,28 @@ def pay_lightning_invoice(
                     print_color(f"  Added to batch: {channel_candidate['alias']} ({chan_id_candidate}) with {amt} sats.", Colors.OKGREEN)
                     temp_newly_selected_channels_for_this_batch.append({"id": chan_id_candidate, "amount": amt, "alias": channel_candidate["alias"]})
                     current_batch_accumulated_liquidity += amt
-                    used_channel_ids.add(chan_id_candidate) # Mark as used globally
+                    # used_channel_ids.add(chan_id_candidate) # Add to used_channel_ids ONLY when successfully probed and added
                     probed_successfully_for_initial_batch = True
                     break 
+                elif not qr_success and "unable to find a path to destination" in str(qr_error_detail).lower():
+                    print_color(f"  Channel {channel_candidate['alias']} ({chan_id_candidate}) permanently skipped: no path to destination.", Colors.FAIL)
+                    used_channel_ids.add(chan_id_candidate) # Mark globally unusable due to no path
+                    channel_permanently_skipped_no_path = True
+                    break # Stop probing this channel for any amount
             
-            initial_batch_building_channel_idx += 1 # Move to next candidate for this batch build pass
-            if probed_successfully_for_initial_batch and len(temp_newly_selected_channels_for_this_batch) >= MAX_CHANNELS_IN_BATCH:
-                break # Batch is full for initial build
+            if probed_successfully_for_initial_batch:
+                 used_channel_ids.add(chan_id_candidate) # Now mark as used because it's in a batch
+
+            initial_batch_building_channel_idx += 1 
+            if (probed_successfully_for_initial_batch and len(temp_newly_selected_channels_for_this_batch) >= MAX_CHANNELS_IN_BATCH) or \
+               channel_permanently_skipped_no_path and not probed_successfully_for_initial_batch: # If skipped, effectively done with this slot
+                # if channel_permanently_skipped_no_path, we just move to next candidate_channel_info index
+                # if batch is full, then break
+                if len(temp_newly_selected_channels_for_this_batch) >= MAX_CHANNELS_IN_BATCH:
+                    break
 
         selected_channels.extend(temp_newly_selected_channels_for_this_batch)
-        channel_idx = initial_batch_building_channel_idx # Update global channel_idx to where this batch build left off
+        channel_idx = initial_batch_building_channel_idx 
 
         if not selected_channels:
             print_color("No more candidate channels available to form any payment batch.", Colors.FAIL)
@@ -996,7 +1010,7 @@ def pay_lightning_invoice(
                 if len(selected_channels) < MAX_CHANNELS_IN_BATCH and channel_idx < len(candidate_channels_info):
                     print_color(f"Attempting to enrich current batch (size {len(selected_channels)}, max {MAX_CHANNELS_IN_BATCH})...", Colors.OKBLUE)
                     
-                    enrich_loop_idx = channel_idx # Use current global channel_idx to start enrichment
+                    enrich_loop_idx = channel_idx 
                     channels_actually_added_this_enrich = 0
 
                     while enrich_loop_idx < len(candidate_channels_info) and \
@@ -1006,7 +1020,7 @@ def pay_lightning_invoice(
                         channel_to_enrich = candidate_channels_info[enrich_loop_idx]
                         chan_id_to_enrich = channel_to_enrich["id"]
 
-                        if chan_id_to_enrich in used_channel_ids: # Already part of some batch or failed probe
+                        if chan_id_to_enrich in used_channel_ids: 
                             enrich_loop_idx += 1
                             continue
                         
@@ -1015,9 +1029,11 @@ def pay_lightning_invoice(
                         enrich_probe_amts = [probe_sats_enrich, max(1, probe_sats_enrich//2), max(1, probe_sats_enrich//4)]
 
                         probed_enrich_successfully = False
+                        channel_permanently_skipped_no_path_enrich = False
+
                         for amt_enrich in enrich_probe_amts:
                             if amt_enrich < min_chunk: continue
-                            # (Construct and run queryroutes command for enrichment)
+                            
                             lncli_path = config.get("lncli_path", "/usr/local/bin/lncli")
                             lnd_connection_params = [
                                 "--rpcserver=" + (config.get("lnd_rpcserver") or "localhost:10009"),
@@ -1036,13 +1052,13 @@ def pay_lightning_invoice(
                             if args.lncli_cltv_limit > 0: qr_cmd_enrich.extend(["--cltv_limit", str(args.lncli_cltv_limit)])
                 
                             qr_timeout_val_enrich = 30
-                            try: # Use queryroutes_timeout for enrichment probes too
+                            try: 
                                 if args.queryroutes_timeout.lower().endswith("s"): qr_timeout_val_enrich = int(args.queryroutes_timeout[:-1])
                                 elif args.queryroutes_timeout.lower().endswith("m"): qr_timeout_val_enrich = int(args.queryroutes_timeout[:-1]) * 60
                                 qr_timeout_val_enrich +=10
                             except ValueError: pass
 
-                            qr_succ_enrich, qr_out_enrich, _ = run_command(
+                            qr_succ_enrich, qr_out_enrich, qr_err_detail_enrich = run_command(
                                 qr_cmd_enrich, timeout=qr_timeout_val_enrich, debug=args.debug, expect_json=True,
                                 dry_run_output=f"lncli queryroutes (enrich) via {channel_to_enrich['alias']}({chan_id_to_enrich}) for {amt_enrich} sats"
                             )
@@ -1050,16 +1066,28 @@ def pay_lightning_invoice(
                                 print_color(f"  Enriched batch with: {channel_to_enrich['alias']} ({chan_id_to_enrich}) for {amt_enrich} sats.", Colors.OKGREEN)
                                 selected_channels.append({"id": chan_id_to_enrich, "amount": amt_enrich, "alias": channel_to_enrich["alias"]})
                                 current_batch_accumulated_liquidity += amt_enrich
-                                used_channel_ids.add(chan_id_to_enrich) # Mark globally used
+                                # used_channel_ids.add(chan_id_to_enrich) # Add to used_channel_ids only when successfully added
                                 channels_actually_added_this_enrich +=1
                                 probed_enrich_successfully = True
-                                break # Found a working amount for this enrichment candidate
+                                break 
+                            elif not qr_succ_enrich and "unable to find a path to destination" in str(qr_err_detail_enrich).lower():
+                                print_color(f"  Channel {channel_to_enrich['alias']} ({chan_id_to_enrich}) permanently skipped during enrichment: no path.", Colors.FAIL)
+                                used_channel_ids.add(chan_id_to_enrich) # Mark globally unusable
+                                channel_permanently_skipped_no_path_enrich = True
+                                break # Stop probing this channel for enrichment
                         
-                        enrich_loop_idx += 1 # Move to next candidate in candidate_channels_info
+                        if probed_enrich_successfully:
+                            used_channel_ids.add(chan_id_to_enrich) # Now mark as used because it's in the enriched batch
+
+                        enrich_loop_idx += 1 
                         if probed_enrich_successfully and channels_actually_added_this_enrich >= ENRICHMENT_ADD_LIMIT:
-                            break # Reached enrichment add limit for this pass
-                    
-                    channel_idx = enrich_loop_idx # Update global channel_idx
+                            break 
+                        if channel_permanently_skipped_no_path_enrich and not probed_enrich_successfully:
+                            # if skipped, effectively done with this candidate for enrichment pass
+                            # The outer enrich_loop_idx will increment and try next candidate.
+                            pass
+
+                    channel_idx = enrich_loop_idx 
                     newly_added_channels_in_enrich_pass = channels_actually_added_this_enrich
                 
                 # --- Decision Logic after failure and enrichment attempt ---
