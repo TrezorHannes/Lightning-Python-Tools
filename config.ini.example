@@ -45,6 +45,8 @@ full_path_bos = /usr/bin/bos
 BCK_SOURCE_PATH = /home/elements/.elements/liquidv1/wallets
 BCK_DEST_PATH = /mnt/backup/liquid
 path_command = /usr/local/bin/
+# Desired logging level for scripts. Options: DEBUG, INFO, WARNING, ERROR, CRITICAL
+log_level = INFO
 
 [urls]
 mempool_tx = https://mempool.space/tx/
@@ -70,18 +72,6 @@ connect_retry_delay_seconds = 60
 max_connect_retries = 30
 # Polling interval in minutes to check for new orders
 polling_interval_minutes = 10
-
-[webhook]
-# Enable webhook based processing instead of polling. Set to true or false.
-enabled = false
-# Host for the webhook listener to bind to
-listener_host = 0.0.0.0
-# Port for the webhook listener
-listener_port = 5001
-# Secret provided by Amboss for webhook verification
-amboss_secret = your_amboss_webhook_secret_here
-# URL path for the webhook listener (e.g., /magma_webhook)
-url_path = /magma_webhook
 
 ## LNBits Pocket Money Settings
 [LNBits]
