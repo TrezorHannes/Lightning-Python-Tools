@@ -60,12 +60,15 @@ Create a systemd service file to manage the script.
     ```ini
     [Unit]
     Description=Magma Channel Auto-Sale Service
-    After=network.target LND.service # Add other dependencies if LND runs as a service
+    # Add other dependencies if LND runs as a service
+    After=network.target LND.service
 
     [Service]
     Type=simple
-    User=your_username # Replace with the user that should run the script
-    Group=your_groupname # Replace with the group for the user
+    # Replace with the user that should run the script
+    User=your_username
+    # Replace with the group for the user
+    Group=your_groupname
 
     # Set the working directory to the root of your Lightning-Python-Tools project
     # This ensures relative paths like config.ini and logs/ work correctly,
