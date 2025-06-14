@@ -1382,7 +1382,7 @@ def execute_bot_behavior():
     logging.info(f"Magma bot behavior cycle completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 
-@bot.message_handler(commands=["runnow", "channelopen"]) 
+@bot.message_handler(commands=["processmagmaorders"])
 def handle_run_command(message):
     logging.info(f"'{message.text}' command received. Executing bot behavior now.")
     send_telegram_notification(f"🚀 Manual trigger '{message.text}' received. Starting Magma processing cycle...", parse_mode="Markdown")
