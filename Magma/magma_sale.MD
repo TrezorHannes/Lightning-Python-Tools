@@ -1,21 +1,48 @@
 # Running Magma Auto-Sale Script with systemd
 
-This document outlines how to run the `magma_sale_process.py` script as a persistent background service using `systemd` on a Linux system. This ensures the script automatically starts on boot and restarts if it encounters issues.
+This document outlines how to run the `magma_sale_process.py` script as a persistent background service using `systemd` on a Linux system. This ensures the script automatically starts on boot and restarts if it encounters issues, utilizing a Python virtual environment for dependency management.
 
 ## Prerequisites
 
-1.  **Python 3:** Ensure Python 3 and `pip` are installed on your system.
-2.  **Required Python Packages:** Install the necessary packages:
+1.  **Python 3 & virtualenv:** Ensure Python 3 and the `virtualenv` package are installed on your system.
     ```bash
+    sudo apt update
+    sudo apt install python3 python3-pip virtualenv
+    ```
+2.  **Project Setup:**
+    *   Clone or download the `Lightning-Python-Tools` repository if you haven't already.
+        ```bash
+        # Example:
+        # git clone https://github.com/TrezorHannes/Lightning-Python-Tools.git
+        # cd Lightning-Python-Tools
+        ```
+    *   Navigate to the root of the `Lightning-Python-Tools` directory.
+
+3.  **Create and Activate Virtual Environment:**
+    It's highly recommended to use a Python virtual environment.
+    ```bash
+    # In the Lightning-Python-Tools directory
+    virtualenv -p python3 .venv
+    source .venv/bin/activate
+    ```
+    Your shell prompt should change to indicate the virtual environment is active (e.g., `(.venv) your-user@host:...$`).
+
+4.  **Install Required Python Packages:**
+    With the virtual environment active, install the necessary packages:
+    ```bash
+    # Ensure your virtual environment is active
     pip install pyTelegramBotAPI requests schedule
     ```
-3.  **Script Location:** Place the `Magma/` directory (containing `magma_sale_process.py`) in a suitable location on your server, for example, `/opt/lightning-tools/Magma/`.
-4.  **Configuration File:**
-    *   Copy `config.ini.example` to `config.ini`.
-    *   Place `config.ini` in the directory **parent** to the `Magma` directory (e.g., `/opt/lightning-tools/config.ini` if the script is in `/opt/lightning-tools/Magma/`).
+    (Note: If there's a `requirements.txt` specific to Magma or the broader project that includes these, you might use `pip install -r requirements.txt` instead).
+
+5.  **Script Location:** The `magma_sale_process.py` script is expected to be in the `Magma/` subdirectory (e.g., `/opt/lightning-tools/Magma/magma_sale_process.py`).
+
+6.  **Configuration File:**
+    *   Copy `config.ini.example` to `config.ini` in the root of the `Lightning-Python-Tools` directory (e.g. `/opt/lightning-tools/config.ini`).
     *   Fill in all required details in `config.ini` (API tokens, Telegram bot info, LND/BOS paths, etc.).
-5.  **LND & BOS (Optional):** Ensure `lncli` (and `bos` if used) are accessible, either in the system's PATH or by providing the full path in `config.ini`.
-6.  **Log Directory:** The script will attempt to create a `logs` directory in its parent directory (e.g., `/opt/lightning-tools/logs/`). Ensure the user running the script has write permissions there.
+
+7.  **LND & BOS (Optional):** Ensure `lncli` (and `bos` if used) are accessible, either in the system's PATH or by providing the full path in `config.ini`.
+8.  **Log Directory:** The script will attempt to create a `logs` directory in its parent directory (e.g., `/opt/lightning-tools/logs/`). Ensure the user running the script has write permissions there.
 
 ## systemd Service File
 
@@ -28,7 +55,7 @@ Create a systemd service file to manage the script.
     ```
 
 2.  **Paste the following content:**
-    Adjust `User`, `Group`, `WorkingDirectory`, and `ExecStart` paths according to your setup.
+    Adjust `User`, `Group`, `WorkingDirectory`, and `ExecStart` paths according to your setup. The `ExecStart` path **must** point to the Python interpreter inside your virtual environment.
 
     ```ini
     [Unit]
@@ -40,14 +67,15 @@ Create a systemd service file to manage the script.
     User=your_username # Replace with the user that should run the script
     Group=your_groupname # Replace with the group for the user
 
-    # Set the working directory to the parent of the Magma script directory
-    # This ensures relative paths like ../config.ini and ../logs/ work correctly.
-    # Example: if script is /opt/lightning-tools/Magma/magma_sale_process.py
-    # then WorkingDirectory should be /opt/lightning-tools/
+    # Set the working directory to the root of your Lightning-Python-Tools project
+    # This ensures relative paths like config.ini and logs/ work correctly,
+    # and that Magma/magma_sale_process.py can be found.
+    # Example: if your project is at /opt/lightning-tools/
     WorkingDirectory=/opt/lightning-tools/
 
-    # Path to your Python interpreter and the script
-    ExecStart=/usr/bin/python3 /opt/lightning-tools/Magma/magma_sale_process.py
+    # Path to the Python interpreter IN YOUR VIRTUAL ENVIRONMENT and the script
+    # Example: /opt/lightning-tools/.venv/bin/python3 /opt/lightning-tools/Magma/magma_sale_process.py
+    ExecStart=/opt/lightning-tools/.venv/bin/python3 /opt/lightning-tools/Magma/magma_sale_process.py
 
     Restart=always
     RestartSec=10
@@ -61,8 +89,8 @@ Create a systemd service file to manage the script.
 
     **Notes on the service file:**
     *   `User` and `Group`: It's recommended to run services under a dedicated non-root user.
-    *   `WorkingDirectory`: Crucial for the script to find `config.ini` and the `logs` directory. If your script is at `/home/admin/tools/Lightning-Python-Tools/Magma/magma_sale_process.py`, then `WorkingDirectory` should be `/home/admin/tools/Lightning-Python-Tools/`.
-    *   `ExecStart`: Ensure the path to `python3` and your script is correct.
+    *   `WorkingDirectory`: Crucial for the script to find `config.ini` (in this directory) and the `logs` directory (also in this directory), and the script itself in the `Magma/` subdirectory. If your project is at `/home/admin/tools/Lightning-Python-Tools/`, then `WorkingDirectory` should be `/home/admin/tools/Lightning-Python-Tools/`.
+    *   `ExecStart`: **Critically important.** This must be the absolute path to the `python3` executable *within your `.venv` directory*, followed by the absolute path to `Magma/magma_sale_process.py`.
     *   `After=network.target LND.service`: If your LND node runs as a systemd service (e.g., `LND.service`), adding it here ensures Magma starts after LND. Adjust service name if needed.
     *   `Restart=always`: Ensures the script restarts automatically.
     *   `StandardOutput=journal` and `StandardError=journal`: Directs script output to the systemd journal.
@@ -112,4 +140,4 @@ Create a systemd service file to manage the script.
     sudo systemctl restart magma-sale.service
     ```
 
-This setup provides a robust way to run your Magma auto-sale script. Remember to adjust paths and usernames in the example service file to match your specific environment.
+This setup provides a robust way to run your Magma auto-sale script using best practices for Python environments. Remember to adjust paths and usernames in the example service file to match your specific environment.
