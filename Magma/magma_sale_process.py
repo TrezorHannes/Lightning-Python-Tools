@@ -160,6 +160,7 @@ USER_CONFIRMATION_TIMEOUT_SECONDS = 300  # 5 minutes for user to respond to new 
 # --- State for pending user confirmations ---
 # Structure: {order_id: {"message_id": int, "timestamp": float, "details": dict}}
 pending_user_confirmations = {}
+processed_banned_offer_ids = set()
 
 
 def send_telegram_notification(text, level="info", **kwargs):
@@ -808,34 +809,71 @@ def get_orders_awaiting_channel_open(): # Renamed from check_channel
 
 
 def get_offers_awaiting_seller_approval(): # Renamed from check_offers
+    global processed_banned_offer_ids
     logging.info("Checking for Magma offers awaiting seller approval (WAITING_FOR_SELLER_APPROVAL)...")
     payload = {"query": GET_USER_MARKET_OFFER_ORDERS_QUERY}
 
     data = _execute_amboss_graphql_request(payload, "GetOffersAwaitingSellerApproval")
 
     if not data:
-        return None # Error already logged by helper
-        
+        return None
+
     market_data = data.get("getUser", {}).get("market", {})
     offer_orders_list = market_data.get("offer_orders", {}).get("list", [])
 
     for offer in offer_orders_list:
-        logging.debug(f"Offer ID: {offer.get('id')}, Status: {offer.get('status')}")
+        offer_id = offer.get("id")
+        current_status = offer.get("status")
         destination_pubkey = offer.get('account') or offer.get("endpoints", {}).get("destination")
 
+        logging.debug(f"Offer ID: {offer_id}, Status: {current_status}, Buyer Pubkey: {destination_pubkey}")
+
+        # Primary filter: Only consider offers genuinely awaiting seller approval
+        if current_status != "WAITING_FOR_SELLER_APPROVAL":
+            logging.debug(f"Offer {offer_id} has status '{current_status}', not 'WAITING_FOR_SELLER_APPROVAL'. Skipping.")
+            # If it was a previously auto-rejected banned offer, we might want to ensure it's removed from our temporary set
+            # if Amboss now confirms its non-pending status. This prevents the set from growing indefinitely if Amboss updates.
+            if offer_id in processed_banned_offer_ids and current_status in ["SELLER_REJECTED", "CANCELLED", "EXPIRED", "ERROR", "COMPLETED"]:
+                logging.info(f"Offer {offer_id} (previously auto-rejected) now has terminal status '{current_status}'. Removing from processed_banned_offer_ids.")
+                processed_banned_offer_ids.discard(offer_id)
+            continue
+
+        # At this point, offer.status is "WAITING_FOR_SELLER_APPROVAL"
+
         if destination_pubkey in BANNED_PUBKEYS:
-            logging.info(
-                f"Offer {offer.get('id')} from banned pubkey {destination_pubkey}. Auto-rejecting."
-            )
-            reject_order(offer.get("id")) # Consider if this should be handled by caller
-            send_telegram_notification(f"🗑️ Auto-rejected offer `{offer.get('id')}` from banned pubkey: `{destination_pubkey}`.", level="warning", parse_mode="Markdown")
-            continue # Skip to next offer
+            if offer_id not in processed_banned_offer_ids:
+                logging.info(
+                    f"Offer {offer_id} (status: {current_status}) from banned pubkey {destination_pubkey}. Attempting auto-rejection."
+                )
+                reject_response = reject_order(offer_id)
 
-        if offer.get("status") == "WAITING_FOR_SELLER_APPROVAL":
-            logging.info(f"Found valid, unbanned offer awaiting approval: {offer['id']}")
-            return offer # Return the first valid, unbanned offer
+                if reject_response and not reject_response.get("errors") and reject_response.get("data", {}).get("sellerRejectOrder"):
+                    send_telegram_notification(
+                        f"🗑️ Auto-rejected offer `{offer_id}` (was WAITING_FOR_SELLER_APPROVAL) from banned pubkey: `{destination_pubkey}`.",
+                        level="warning", parse_mode="Markdown"
+                    )
+                    processed_banned_offer_ids.add(offer_id)
+                    logging.info(f"Added {offer_id} to processed_banned_offer_ids after successful auto-rejection.")
+                elif reject_response and reject_response.get("errors"):
+                    logging.error(
+                        f"Failed to auto-reject offer {offer_id} from banned pubkey {destination_pubkey}. "
+                        f"Amboss errors: {reject_response.get('errors')}"
+                    )
+                else:
+                    logging.warning(
+                        f"Auto-rejection of offer {offer_id} from banned pubkey {destination_pubkey} "
+                        f"did not confirm success or failed. Response: {reject_response}. Will retry processing next cycle."
+                    )
+            else:
+                logging.debug(f"Offer {offer_id} from banned pubkey {destination_pubkey} was already processed for auto-rejection in this session (still WAITING_FOR_SELLER_APPROVAL). Skipping.")
+            continue # This offer (from banned pubkey, now handled or previously handled) should not be returned for manual approval
 
-    logging.info("No unbanned offers found with status 'WAITING_FOR_SELLER_APPROVAL'.")
+        # If we reach here, the offer is "WAITING_FOR_SELLER_APPROVAL" and NOT from a banned pubkey.
+        # This is a candidate for manual user approval.
+        logging.info(f"Found valid, unbanned offer awaiting approval: {offer_id}")
+        return offer # Return the first such offer
+
+    logging.info("No unbanned offers found currently in 'WAITING_FOR_SELLER_APPROVAL' status.")
     return None
 
 
