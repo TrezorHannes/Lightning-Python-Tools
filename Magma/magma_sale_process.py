@@ -1,5 +1,48 @@
-# This is a local fork of https://github.com/jvxis/nr-tools
-# enter the necessary settings in config.ini file in the parent dir
+# Magma Channel Auto-Sale Script (Lightning Network)
+#
+# Purpose:
+# This script automates the process of selling Lightning Network channels via Amboss Magma.
+# It monitors for new channel sale offers, manages approvals (with optional manual Telegram confirmation),
+# generates invoices, monitors for buyer payments, and then attempts to open the Lightning channel
+# using LND's `lncli`. It provides notifications via Telegram for various stages and errors.
+#
+# Key Features:
+# - Reads configuration from `config.ini` in the parent directory.
+# - Periodically checks Amboss for new channel sale offers.
+# - (Optional) Prompts for manual approval/rejection of new offers via Telegram within a time window.
+# - Automatically approves offers if no manual response is received within the timeout.
+# - Handles invoice generation via `lncli addinvoice`.
+# - Accepts orders on Amboss and monitors for buyer invoice payment.
+# - Initiates channel opening via `lncli openchannel` once an order is paid.
+# - Attempts to connect to the buyer's node before opening a channel.
+# - Confirms channel opening (channel point) back to Amboss.
+# - Provides detailed logging to a rotating log file (`logs/magma-sale-process.log`).
+# - Sends Telegram notifications for important events, successes, and errors.
+# - Uses a critical error flag file (`logs/magma_sale_process-critical-error.flag`) to halt
+#   operations if a systemic or unrecoverable error occurs, requiring manual intervention.
+# - Supports a list of banned pubkeys to automatically reject offers from.
+# - (Optional) Attempts to record income via BOS `send` command after successful channel open.
+#
+# How to Run:
+# 1. Ensure Python 3 is installed.
+# 2. Install required Python packages: `pip install pyTelegramBotAPI requests schedule`
+# 3. Copy `config.ini.example` to `config.ini` in the script's parent directory and fill in
+#    all necessary details (API tokens, Telegram bot info, LND/BOS paths, etc.).
+# 4. Make the script executable: `chmod +x magma_sale_process.py`
+# 5. Run the script directly: `python /path/to/Magma/magma_sale_process.py`
+#
+#    The script is designed to run as a long-running daemon/service. It uses the `schedule`
+#    library internally to perform periodic checks based on `POLLING_INTERVAL_MINUTES`
+#    in `config.ini`. It does not use or require an external cron job or a `--cron` argument.
+#    For production, it's recommended to run it under a process manager like `systemd` to
+#    ensure it restarts on failure and runs continuously.
+#
+# Dependencies:
+# - LND (`lncli` accessible in the system's PATH or via full path in `config.ini`)
+# - (Optional) BOS (`bos` accessible via full path in `config.ini` for income confirmation)
+# - `requests` library
+# - `pyTelegramBotAPI` library
+# - `schedule` library
 
 # Import Lybraries
 import requests
@@ -74,6 +117,37 @@ logging.getLogger("telebot").setLevel(logging.WARNING)
 CRITICAL_ERROR_FILE_PATH = os.path.join(parent_dir, "..", "logs", "magma_sale_process-critical-error.flag") # Reverted
 
 
+# --- GraphQL Query for Offer Orders ---
+# Fetches all fields typically needed when processing or listing offer orders.
+OFFER_ORDER_FIELDS_QUERY_PART = """
+    list {
+      id
+      size
+      status
+      account # Expected to be the buyer's pubkey
+      seller_invoice_amount
+      endpoints { # Contains 'destination' which is also buyer's pubkey
+        destination
+      }
+    }
+"""
+
+GET_USER_MARKET_OFFER_ORDERS_QUERY = f"""
+    query GetUserMarketOfferOrders {{
+      getUser {{
+        market {{
+          offer_orders {{
+            {OFFER_ORDER_FIELDS_QUERY_PART}
+          }}
+        }}
+      }}
+    }}
+"""
+# Note: get_order_details_from_amboss uses a slightly different query name "ListUserMarketOfferOrdersForDetails"
+# but the structure is the same. We can align this. For now, the payload in get_order_details_from_amboss
+# will be updated to use GET_USER_MARKET_OFFER_ORDERS_QUERY.
+
+
 # Code
 bot = telebot.TeleBot(TOKEN)
 logging.info("Amboss Channel Open Bot Started")
@@ -81,59 +155,142 @@ logging.info("Amboss Channel Open Bot Started")
 # --- Constants for active order polling ---
 ACTIVE_ORDER_POLL_INTERVAL_SECONDS = 30  # Check every 30 seconds
 ACTIVE_ORDER_POLL_DURATION_MINUTES = 15   # Poll for a total of 15 minutes
+USER_CONFIRMATION_TIMEOUT_SECONDS = 300  # 5 minutes for user to respond to new offer
+
+# --- State for pending user confirmations ---
+# Structure: {order_id: {"message_id": int, "timestamp": float, "details": dict}}
+pending_user_confirmations = {}
 
 
-def send_telegram_notification(text, level="info"):
-    """Sends a message to Telegram and logs it."""
+def send_telegram_notification(text, level="info", **kwargs):
+    """Sends a message to Telegram and logs it. Allows passing kwargs to send_message."""
+    log_message = f"Telegram NOTIFICATION: {text}"
+    if 'reply_markup' in kwargs:
+        log_message += " (with inline keyboard)"
+
     if level == "error":
-        logging.error(f"Telegram NOTIFICATION: {text}")
+        logging.error(log_message)
     elif level == "warning":
-        logging.warning(f"Telegram NOTIFICATION: {text}")
+        logging.warning(log_message)
     else:
-        logging.info(f"Telegram NOTIFICATION: {text}")
+        logging.info(log_message)
     try:
-        bot.send_message(CHAT_ID, text=text)
+        # Ensure Markdown is used if not specified and message contains typical Markdown chars
+        if 'parse_mode' not in kwargs and any(c in text for c in ['`', '*', '_']):
+            kwargs['parse_mode'] = 'Markdown'
+        return bot.send_message(CHAT_ID, text=text, **kwargs) # Return the message object
     except Exception as e:
         logging.error(f"Failed to send Telegram message: {e}")
+        return None
 
-def get_order_details_from_amboss(order_id):
-    """Fetches specific order details from Amboss."""
-    # This function would ideally use a more specific GraphQL query to get one order
-    # For now, it reuses check_channel and filters by ID.
-    # TODO: Implement a GraphQL query for a single order by ID for efficiency.
-    logging.info(f"Fetching details for order ID: {order_id}")
+def _execute_amboss_graphql_request(payload: dict, operation_name: str ="AmbossGraphQL"):
+    """
+    Executes a GraphQL request to the Amboss API.
+    Handles common request logic, headers, timeouts, and basic error handling.
+    Args:
+        payload (dict): The GraphQL payload (e.g., {"query": "...", "variables": {...}}).
+        operation_name (str): A descriptive name for the operation for logging.
+    Returns:
+        dict or None: The JSON response data part if successful, else None.
+    """
     url = "https://api.amboss.space/graphql"
     headers = {
         "content-type": "application/json",
         "Authorization": f"Bearer {AMBOSS_TOKEN}",
     }
-    # Query to fetch a specific order by ID (conceptual)
-    # This specific query might need adjustment based on available Amboss API fields for a single order.
-    # For now, we'll fetch all and filter, which is inefficient but works with current `check_channel` like logic.
-    payload = {
-        "query": "query ListUserMarketOfferOrders {\n  getUser {\n    market {\n      offer_orders {\n        list {\n          id\n          size\n          status\n          account\n          seller_invoice_amount\n          endpoints {\n            destination\n          }\n        }\n      }\n    }\n  }\n}"
-    }
+    logging.debug(f"Executing {operation_name} with payload: {json.dumps(payload, indent=2 if logging.getLogger().getEffectiveLevel() == logging.DEBUG else None)}") # Pretty print payload if debug
+
     try:
-        response = requests.post(url, json=payload, headers=headers)
-        response.raise_for_status()
-        data = response.json().get("data", {})
-        market = data.get("getUser", {}).get("market", {})
-        offer_orders = market.get("offer_orders", {}).get("list", [])
+        response = requests.post(url, json=payload, headers=headers, timeout=20) # Standard timeout
+        response.raise_for_status()  # Raises HTTPError for bad responses (4xx or 5xx)
         
-        for offer in offer_orders:
-            if offer.get("id") == order_id:
-                logging.info(f"Found details for order {order_id}: {offer}")
-                return offer
-        logging.warning(f"Order ID {order_id} not found in Amboss query.")
+        response_json = response.json()
+        
+        if response_json.get("errors"):
+            logging.error(f"GraphQL errors during {operation_name}: {response_json.get('errors')}")
+            # Do not create CRITICAL_ERROR_FILE_PATH here for query errors, let caller decide.
+            # Example: if confirm_channel_point_to_amboss gets a specific Amboss error, it might create it.
+            return None # Indicate GraphQL level error
+            
+        return response_json.get("data") # Return only the 'data' part
+
+    except requests.exceptions.Timeout:
+        logging.error(f"Timeout during {operation_name} to Amboss.")
         return None
     except requests.exceptions.RequestException as e:
-        logging.error(f"Error fetching order {order_id} from Amboss: {e}")
+        logging.error(f"API request error during {operation_name} to Amboss: {e}")
         return None
+    except json.JSONDecodeError as e:
+        logging.error(f"Failed to decode JSON response during {operation_name} from Amboss: {e}")
+        return None
+    except Exception as e:
+        logging.exception(f"Unexpected error during _execute_amboss_graphql_request for {operation_name}:")
+        return None
+
+def get_order_details_from_amboss(order_id):
+    """
+    Fetches specific order details from Amboss by its ID.
+    This involves fetching the user's list of market offer orders and filtering by ID.
+    """
+    logging.info(f"Fetching details for order ID: {order_id} from Amboss...")
+    payload = {"query": GET_USER_MARKET_OFFER_ORDERS_QUERY}
+    
+    data = _execute_amboss_graphql_request(payload, f"GetOrderDetails-{order_id}")
+
+    if not data:
+        return None # Error already logged by helper
+
+    market_data = data.get("getUser", {}).get("market", {})
+    offer_orders_list = market_data.get("offer_orders", {}).get("list", [])
+    
+    for offer in offer_orders_list:
+        if offer.get("id") == order_id:
+            logging.info(f"Successfully found details for order {order_id}: {offer}")
+            return offer
+    
+    logging.warning(f"Order ID {order_id} not found in your Amboss market orders list.")
+    return None
+
+
+def get_node_alias(pubkey: str) -> str:
+    """Fetches the alias for a given node pubkey using the getNode query."""
+    if not pubkey:
+        return "N/A"
+    
+    logging.info(f"Fetching alias for pubkey: {pubkey}")
+    payload = {
+        "query": """
+            query GetSingleNodeAlias($pubkey: String!) {
+              getNode(pubkey: $pubkey) {
+                alias
+              }
+            }
+        """,
+        "variables": {"pubkey": pubkey}
+    }
+    
+    data = _execute_amboss_graphql_request(payload, f"GetNodeAlias-{pubkey[:10]}")
+
+    if not data:
+        return "ErrorFetchingAlias" # Error already logged by helper
+
+    node_data = data.get("getNode")
+    if node_data:
+        alias = node_data.get("alias")
+        if alias is None or alias == "": # Handle empty alias string from Amboss as "N/A"
+            logging.info(f"Alias for {pubkey} is empty or null, returning 'N/A'.")
+            return "N/A"
+        logging.info(f"Alias for {pubkey}: {alias}")
+        return alias
+    else:
+        logging.warning(f"No node data returned for {pubkey} in getNode query.")
+        return "AliasNotFound"
 
 
 def execute_lncli_addinvoice(amt, memo, expiry):
     # Command to be executed
     command = f"lncli addinvoice " f"--memo '{memo}' --amt {amt} --expiry {expiry}"
+    logging.info(f"Executing command: {command}")
 
     try:
         # Execute the command and capture the output
@@ -141,106 +298,175 @@ def execute_lncli_addinvoice(amt, memo, expiry):
             command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         output, error = result.communicate()
-        output = output.decode("utf-8")
-        error = error.decode("utf-8")
+        output_decoded = output.decode("utf-8").strip()
+        error_decoded = error.decode("utf-8").strip()
 
         # Log the command output and error
-        logging.debug(f"Command Output: {output}")
-        logging.error(f"Command Error: {error}")
+        logging.debug(f"lncli addinvoice stdout: {output_decoded}")
+        if error_decoded:
+            logging.error(f"lncli addinvoice stderr: {error_decoded}")
 
         # Try to parse the JSON output
         try:
-            output_json = json.loads(output)
-            # Extract the required values
+            output_json = json.loads(output_decoded)
             r_hash = output_json.get("r_hash", "")
             payment_request = output_json.get("payment_request", "")
+            if not r_hash or not payment_request: # Check if essential fields are missing
+                err_msg = f"Missing r_hash or payment_request in lncli addinvoice output. stdout: {output_decoded}"
+                if error_decoded:
+                     err_msg += f" stderr: {error_decoded}"
+                logging.error(err_msg)
+                return f"Error: {err_msg}", None
             return r_hash, payment_request
 
         except json.JSONDecodeError as json_error:
             # If not a valid JSON response, handle accordingly
-            logging.exception(f"Error decoding JSON: {json_error}")
-            return f"Error decoding JSON: {json_error}", None
+            log_msg = f"Error decoding JSON from lncli addinvoice: {json_error}. stdout: {output_decoded}"
+            if error_decoded:
+                log_msg += f" stderr: {error_decoded}"
+            logging.exception(log_msg)
+            return f"Error decoding JSON: {json_error}. stderr: {error_decoded if error_decoded else 'N/A'}", None
 
     except subprocess.CalledProcessError as e:
-        # Handle any errors that occur during command execution
-        logging.exception(f"Error executing command: {e}")
-        return f"Error executing command: {e}", None
+        # This exception is less likely with Popen but good to keep
+        logging.exception(f"Error executing lncli addinvoice command: {e}")
+        return f"Error executing command: {e}. stderr: {e.stderr.decode('utf-8').strip() if e.stderr else 'N/A'}", None
+    except Exception as e: # Catch other potential errors
+        logging.exception(f"Unexpected error in execute_lncli_addinvoice: {e}")
+        return f"Unexpected error: {e}", None
 
 
 def accept_order(order_id, payment_request):
+    """Accepts an order on Amboss."""
+    logging.info(f"Accepting order {order_id} on Amboss with payment request: {payment_request[:30]}...")
+    payload = {
+        "query": """
+            mutation AcceptOrder($sellerAcceptOrderId: String!, $request: String!) {
+              sellerAcceptOrder(id: $sellerAcceptOrderId, request: $request)
+            }
+        """,
+        "variables": {"sellerAcceptOrderId": order_id, "request": payment_request}
+    }
+    # This is a mutation, so we expect the full response, not just 'data' part directly from helper
+    # because the success/failure is often indicated by the presence of 'sellerAcceptOrder' field itself
+    # or specific errors.
     url = "https://api.amboss.space/graphql"
     headers = {
         "content-type": "application/json",
         "Authorization": f"Bearer {AMBOSS_TOKEN}",
     }
-    query = """
-        mutation AcceptOrder($sellerAcceptOrderId: String!, $request: String!) {
-          sellerAcceptOrder(id: $sellerAcceptOrderId, request: $request)
-        }
-    """
-    variables = {"sellerAcceptOrderId": order_id, "request": payment_request}
-
-    response = requests.post(
-        url, json={"query": query, "variables": variables}, headers=headers
-    )
-    return response.json()
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=30) # Longer timeout for mutations
+        response.raise_for_status()
+        response_json = response.json()
+        logging.info(f"Amboss sellerAcceptOrder response for {order_id}: {response_json}")
+        return response_json # Return the full JSON response for the caller to interpret
+    except requests.exceptions.Timeout:
+        logging.error(f"Timeout while accepting Amboss order {order_id}.")
+        return {"errors": [{"message": "Timeout during Amboss API call"}]}
+    except requests.exceptions.RequestException as e:
+        logging.error(f"API request error accepting Amboss order {order_id}: {e}")
+        return {"errors": [{"message": f"RequestException: {e}"}]}
+    except json.JSONDecodeError as e:
+        logging.error(f"Failed to decode JSON response when accepting Amboss order {order_id}: {e}")
+        return {"errors": [{"message": f"JSONDecodeError: {e}"}]}
+    except Exception as e:
+        logging.exception(f"Unexpected error in accept_order for {order_id}:")
+        return {"errors": [{"message": f"Unexpected error: {e}"}]}
 
 
 def reject_order(order_id):
+    """Rejects an order on Amboss."""
+    logging.info(f"Rejecting order {order_id} on Amboss...")
+    payload = {
+        "query": """
+            mutation SellerRejectOrder($sellerRejectOrderId: String!) {
+              sellerRejectOrder(id: $sellerRejectOrderId)
+            }
+        """,
+        "variables": {"sellerRejectOrderId": order_id}
+    }
+    # Similar to accept_order, mutations might need specific handling of the full response
     url = "https://api.amboss.space/graphql"
     headers = {
         "content-type": "application/json",
         "Authorization": f"Bearer {AMBOSS_TOKEN}",
     }
-    query = """
-        mutation SellerRejectOrder($sellerRejectOrderId: String!) {
-          sellerRejectOrder(id: $sellerRejectOrderId)
-        }
-    """
-    variables = {"sellerRejectOrderId": order_id}
-
-    response = requests.post(
-        url, json={"query": query, "variables": variables}, headers=headers
-    )
-    logging.info(f"Order {order_id} rejected. Response: {response.json()}")
-    return response.json()
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        response.raise_for_status()
+        response_json = response.json()
+        logging.info(f"Amboss sellerRejectOrder response for {order_id}: {response_json}")
+        return response_json
+    except requests.exceptions.Timeout:
+        logging.error(f"Timeout while rejecting Amboss order {order_id}.")
+        return {"errors": [{"message": "Timeout during Amboss API call"}]}
+    except requests.exceptions.RequestException as e:
+        logging.error(f"API request error rejecting Amboss order {order_id}: {e}")
+        return {"errors": [{"message": f"RequestException: {e}"}]}
+    except json.JSONDecodeError as e:
+        logging.error(f"Failed to decode JSON response when rejecting Amboss order {order_id}: {e}")
+        return {"errors": [{"message": f"JSONDecodeError: {e}"}]}
+    except Exception as e:
+        logging.exception(f"Unexpected error in reject_order for {order_id}:")
+        return {"errors": [{"message": f"Unexpected error: {e}"}]}
 
 
 def confirm_channel_point_to_amboss(order_id, transaction):
+    """Confirms the channel point (funding transaction) to Amboss."""
+    logging.info(f"Confirming channel point {transaction} to Amboss for order {order_id}...")
+    payload = {
+        "query": """
+            mutation ConfirmChannelPoint($sellerAddTransactionId: String!, $transaction: String!) {
+              sellerAddTransaction(id: $sellerAddTransactionId, transaction: $transaction)
+            }
+        """,
+        "variables": {"sellerAddTransactionId": order_id, "transaction": transaction},
+    }
+    # This is a critical mutation. The full response is needed.
     url = "https://api.amboss.space/graphql"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {AMBOSS_TOKEN}",
     }
-
-    graphql_query = f"mutation Mutation($sellerAddTransactionId: String!, $transaction: String!) {{\n  sellerAddTransaction(id: $sellerAddTransactionId, transaction: $transaction)\n}}"
-
-    data = {
-        "query": graphql_query,
-        "variables": {"sellerAddTransactionId": order_id, "transaction": transaction},
-    }
-
     try:
-        response = requests.post(url, headers=headers, json=data)
-        response.raise_for_status()  # Raise an HTTPError for bad responses (4xx or 5xx)
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        response_json = response.json()
+        logging.info(f"Amboss sellerAddTransaction response for {order_id}: {response_json}")
 
-        json_response = response.json()
-
-        if "errors" in json_response:
-            # Handle error in the JSON response and log it
-            error_message = json_response["errors"][0]["message"]
-            log_content = f"Error in confirm_channel_point_to_amboss:\nOrder ID: {order_id}\nTransaction: {transaction}\nError Message: {error_message}\n"
-
-            with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file: # Append to critical error file
-                log_file.write(log_content)
-
-            return log_content
+        if "errors" in response_json:
+            error_message = response_json["errors"][0].get("message", "Unknown Amboss API error")
+            log_content = (
+                f"Amboss API error in confirm_channel_point_to_amboss for order ID {order_id}, TX: {transaction}.\n"
+                f"Error: {error_message}\n"
+                "This is a critical failure from Amboss. Halting bot to prevent further issues."
+            )
+            logging.critical(log_content)
+            # This is a case where Amboss itself failed a critical step.
+            # We will create the critical error flag here as it might indicate a broader Amboss issue
+            # or a problem with our API key / permissions for mutations.
+            with open(CRITICAL_ERROR_FILE_PATH, "a") as err_file:
+                err_file.write(f"{datetime.now()}: {log_content}\n")
+            send_telegram_notification(f"🔥 CRITICAL: Failed to confirm channel to Amboss for order `{order_id}` due to API error: `{error_message}`. Bot halted. Manual check required.", level="error", parse_mode="Markdown")
+            # Return the error structure for the caller
+            return response_json 
         else:
-            return json_response
-
+            return response_json # Success
+            
+    except requests.exceptions.Timeout:
+        logging.error(f"Timeout while confirming channel point to Amboss for order {order_id}.")
+        # Do not create critical flag for a simple timeout on one order confirmation.
+        return {"errors": [{"message": "Timeout during Amboss API call"}]}
     except requests.exceptions.RequestException as e:
-        logging.exception(f"Error making the request: {e}")
-        return None
+        logging.error(f"API request error confirming channel point to Amboss for order {order_id}: {e}")
+        return {"errors": [{"message": f"RequestException: {e}"}]}
+    except json.JSONDecodeError as e:
+        logging.error(f"Failed to decode JSON response confirming channel point to Amboss for order {order_id}: {e}")
+        return {"errors": [{"message": f"JSONDecodeError: {e}"}]}
+    except Exception as e:
+        logging.exception(f"Unexpected error in confirm_channel_point_to_amboss for {order_id}:")
+        return {"errors": [{"message": f"Unexpected error: {e}"}]}
 
 
 def get_channel_point(hash_to_find):
@@ -249,15 +475,27 @@ def get_channel_point(hash_to_find):
 
         try:
             logging.info(f"Command: {command}")
-            result = subprocess.run(command, capture_output=True, text=True, check=True)
+            # Ensure subprocess.run captures stderr for logging
+            result = subprocess.run(command, capture_output=True, text=True, check=False) # check=False to inspect result
+            
+            if result.stderr:
+                logging.warning(f"lncli pendingchannels stderr: {result.stderr.strip()}")
+            if result.returncode != 0:
+                logging.error(f"lncli pendingchannels failed with return code {result.returncode}")
+                return None
+            
             output = result.stdout
-
-            # Parse JSON result
             result_json = json.loads(output)
             return result_json
 
-        except subprocess.CalledProcessError as e:
-            logging.exception(f"Error executing the command: {e}")
+        except subprocess.CalledProcessError as e: # Less likely with check=False
+            logging.exception(f"Error executing lncli pendingchannels: {e}")
+            return None
+        except json.JSONDecodeError as e:
+            logging.exception(f"Error decoding JSON from lncli pendingchannels: {e}")
+            return None
+        except Exception as e:
+            logging.exception(f"Unexpected error in execute_lightning_command for pendingchannels: {e}")
             return None
 
     result = execute_lightning_command()
@@ -282,19 +520,22 @@ def execute_lnd_command(
     command = (
         f"lncli openchannel "
         f"--node_key {node_pub_key} --sat_per_vbyte={fee_per_vbyte} "
-        f"{formatted_outpoints} --local_amt={input_amount} --fee_rate_ppm {fee_rate_ppm}"
+        f"{formatted_outpoints if formatted_outpoints else ''} --local_amt={input_amount} --fee_rate_ppm {fee_rate_ppm}" # Ensure formatted_outpoints is not None
     )
     logging.info(f"Executing command: {command}")
+    std_err_output = "N/A" # Initialize stderr output
 
     try:
         # Run the command and capture both stdout and stderr
         result = subprocess.run(
             command, shell=True, check=False, capture_output=True, text=True
         )
+        std_err_output = result.stderr.strip() if result.stderr else "N/A"
 
         # Log both stdout and stderr regardless of the result
-        logging.info(f"Command Output: {result.stdout}")
-        logging.error(f"Command Error: {result.stderr}")
+        logging.info(f"Command Output: {result.stdout.strip() if result.stdout else 'N/A'}")
+        if std_err_output != "N/A" and std_err_output: # Log if not empty
+            logging.error(f"Command Error: {std_err_output}")
 
         if result.returncode == 0:
             try:
@@ -302,23 +543,30 @@ def execute_lnd_command(
                 funding_txid = output_json.get("funding_txid")
                 if funding_txid:
                     logging.info(f"Funding transaction ID: {funding_txid}")
+                    return funding_txid, None # Return None for error message if successful
                 else:
-                    logging.error(
-                        "No funding transaction ID found in the command output."
-                    )
-                return funding_txid
+                    err_msg = "No funding transaction ID found in the command output."
+                    logging.error(err_msg)
+                    return None, err_msg # Return error message
             except json.JSONDecodeError as json_error:
-                logging.exception(f"Error decoding JSON: {json_error}")
-                return None
+                err_msg = f"Error decoding JSON: {json_error}. Output: {result.stdout.strip()}"
+                logging.exception(err_msg)
+                return None, err_msg # Return error message
         else:
             # Log a specific error message if the command fails
-            logging.error(f"Command failed with return code {result.returncode}")
-            return None
+            err_msg = f"Command failed with return code {result.returncode}. stderr: {std_err_output}"
+            logging.error(err_msg)
+            return None, err_msg # Return error message
 
-    except subprocess.CalledProcessError as e:
-        # Handle command execution errors
-        logging.exception(f"Error executing command: {e}")
-        return None
+    except subprocess.CalledProcessError as e: # Should be caught by check=False, but for safety
+        std_err_output = e.stderr.strip() if e.stderr else "N/A"
+        err_msg = f"Error executing command: {e}. stderr: {std_err_output}"
+        logging.exception(err_msg)
+        return None, err_msg # Return error message
+    except Exception as e: # Catch any other unexpected error
+        err_msg = f"Unexpected error executing LND command: {e}. Last known stderr: {std_err_output}"
+        logging.exception(err_msg)
+        return None, err_msg
 
 
 def get_fast_fee():
@@ -332,49 +580,44 @@ def get_fast_fee():
 
 
 def get_address_by_pubkey(peer_pubkey):
-    url = "https://api.amboss.space/graphql"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {AMBOSS_TOKEN}",
+    """Fetches the node address (IP/Tor) for a given peer pubkey from Amboss."""
+    logging.info(f"Fetching address for pubkey: {peer_pubkey} from Amboss...")
+    payload = {
+        "query": """
+            query GetNodeAddress($pubkey: String!) {
+              getNode(pubkey: $pubkey) {
+                graph_info {
+                  node {
+                    addresses {
+                      addr
+                    }
+                  }
+                }
+              }
+            }
+        """,
+        "variables": {"pubkey": peer_pubkey}
     }
 
-    query = f"""
-    query List($pubkey: String!) {{
-      getNode(pubkey: $pubkey) {{
-        graph_info {{
-          node {{
-            addresses {{
-              addr
-            }}
-          }}
-        }}
-      }}
-    }}
-    """
+    data = _execute_amboss_graphql_request(payload, f"GetNodeAddress-{peer_pubkey[:10]}")
 
-    variables = {"pubkey": peer_pubkey}
+    if not data:
+        logging.error(f"Failed to get address for {peer_pubkey} from Amboss.") # Error logged by helper
+        return None
 
-    payload = {"query": query, "variables": variables}
+    addresses = (
+        data.get("getNode", {})
+        .get("graph_info", {})
+        .get("node", {})
+        .get("addresses", [])
+    )
+    first_address = addresses[0]["addr"] if addresses else None
 
-    response = requests.post(url, json=payload, headers=headers)
-
-    if response.status_code == 200:
-        data = response.json()
-        addresses = (
-            data.get("data", {})
-            .get("getNode", {})
-            .get("graph_info", {})
-            .get("node", {})
-            .get("addresses", [])
-        )
-        first_address = addresses[0]["addr"] if addresses else None
-
-        if first_address:
-            return f"{peer_pubkey}@{first_address}"
-        else:
-            return None
+    if first_address:
+        logging.info(f"Found address for {peer_pubkey}: {first_address}")
+        return f"{peer_pubkey}@{first_address}"
     else:
-        logging.error(f"Error: {response.status_code}")
+        logging.warning(f"No address found for {peer_pubkey} on Amboss.")
         return None
 
 
@@ -382,33 +625,40 @@ def connect_to_node(node_key_address, max_retries=None):
     if max_retries is None:
         max_retries = MAX_CONNECT_RETRIES
     retries = 0
+    last_stderr = "N/A"
     while retries < max_retries:
         command = f"lncli connect {node_key_address} --timeout 120s"
-        logging.info(f"Connecting to node: {command}")
+        logging.info(f"Connecting to node (attempt {retries + 1}/{max_retries}): {command}")
         try:
-            result = subprocess.run(command, shell=True, capture_output=True, text=True)
+            result = subprocess.run(command, shell=True, capture_output=True, text=True, check=False) # check=False to inspect result
+            last_stderr = result.stderr.strip() if result.stderr else "N/A"
+
             if result.returncode == 0:
                 logging.info(f"Successfully connected to node {node_key_address}")
-                return result.returncode  # Return the process return code
-            elif "already connected to peer" in result.stderr:
+                return 0, None  # Return 0 for success, None for error message
+            elif "already connected to peer" in last_stderr.lower(): # Check lowercased stderr
                 logging.info(f"Peer {node_key_address} is already connected.")
-                return 0  # Return 0 to indicate success
+                return 0, None  # Return 0 for success
             else:
                 logging.error(
-                    f"Error connecting to node (attempt {retries + 1}): {result.stderr}"
+                    f"Error connecting to node {node_key_address} (attempt {retries + 1}): {last_stderr}"
                 )
-                retries += 1
-                time.sleep(CONNECT_RETRY_DELAY_SECONDS)  # Wait before retrying
-        except subprocess.CalledProcessError as e:
-            logging.error(f"Error executing lncli connect (attempt {retries + 1}): {e}")
-            retries += 1
-            time.sleep(CONNECT_RETRY_DELAY_SECONDS)  # Wait before retrying
+        except subprocess.CalledProcessError as e: # Should not happen with check=False
+            last_stderr = e.stderr.strip() if e.stderr else "N/A"
+            logging.error(f"CalledProcessError executing lncli connect (attempt {retries + 1}): {e}. stderr: {last_stderr}")
+        except Exception as e:
+            logging.error(f"Unexpected error executing lncli connect (attempt {retries + 1}): {e}")
+            last_stderr = f"Unexpected Exception: {str(e)}"
+        
+        retries += 1
+        if retries < max_retries:
+            logging.info(f"Waiting {CONNECT_RETRY_DELAY_SECONDS}s before retrying connection to {node_key_address}")
+            time.sleep(CONNECT_RETRY_DELAY_SECONDS)
 
     # If we reach this point, all retries have failed
-    logging.error(
-        f"Failed to connect to node {node_key_address} after {max_retries} retries."
-    )
-    return 1  # Return 1 or another non-zero value to indicate failure
+    error_message = f"Failed to connect to node {node_key_address} after {max_retries} retries. Last error: {last_stderr}"
+    logging.error(error_message)
+    return 1, error_message  # Return 1 for failure, and the detailed error message
 
 
 def get_lncli_utxos():
@@ -483,217 +733,169 @@ def calculate_transaction_size(utxos_needed):
 def calculate_utxos_required_and_fees(amount_input, fee_per_vbyte):
     utxos_data = get_lncli_utxos()
     channel_size = float(amount_input)
-    total = sum(utxo["amount_sat"] for utxo in utxos_data)
+    
+    # Ensure utxos_data is a list and contains dictionaries with 'amount_sat'
+    if not isinstance(utxos_data, list) or not all(isinstance(utxo, dict) and 'amount_sat' in utxo for utxo in utxos_data):
+        logging.error(f"Invalid UTXO data format received: {utxos_data}")
+        send_telegram_notification("🔥 Error: Invalid UTXO data format. Cannot calculate fees.", level="error")
+        return -1, 0, None
+
+    total_available_sats = sum(utxo.get("amount_sat", 0) for utxo in utxos_data) # Use .get for safety
     utxos_needed = 0
     fee_cost = 0
-    amount_with_fees = channel_size
+    # amount_with_fees = channel_size # This was incorrect, fee_cost needs to be added iteratively
+    selected_utxos_total_amount = 0 # Sum of selected UTXOs
     related_outpoints = []
 
-    if total < channel_size:
+    if total_available_sats < channel_size: # Initial check without considering fees yet
         logging.error(
-            f"There are not enough UTXOs to open a channel {channel_size} SATS. Total UTXOS: {total} SATS"
+            f"There are not enough UTXOs ({total_available_sats} sats) to cover the desired channel size {channel_size} SATS, even before fees."
         )
         return -1, 0, None
 
-    # for utxo_amount, utxo_outpoint in zip(utxos_data['amounts'], utxos_data['outpoints']):
+    # Iterate through sorted UTXOs (largest first, already sorted by get_lncli_utxos)
     for utxo in utxos_data:
         utxos_needed += 1
-        transaction_size = calculate_transaction_size(utxos_needed)
-        fee_cost = transaction_size * fee_per_vbyte
-        amount_with_fees = channel_size + fee_cost
-
+        selected_utxos_total_amount += utxo.get("amount_sat", 0)
         related_outpoints.append(utxo["outpoint"])
-
-        if utxo["amount_sat"] >= amount_with_fees:
-            break
-        channel_size -= utxo["amount_sat"]
-
-    return utxos_needed, fee_cost, related_outpoints if related_outpoints else None
-
-
-def check_channel():
-    logging.info("check_channel function called")
-    url = "https://api.amboss.space/graphql"
-    headers = {
-        "content-type": "application/json",
-        "Authorization": f"Bearer {AMBOSS_TOKEN}",
-    }
-    payload = {
-        "query": "query List {\n  getUser {\n    market {\n      offer_orders {\n        list {\n          id\n          size\n          status\n        account\n        seller_invoice_amount\n        }\n      }\n    }\n  }\n}"
-    }
-
-    try:
-        response = requests.post(url, json=payload, headers=headers)
-        response.raise_for_status()  # Raise an exception for 4xx and 5xx status codes
-
-        data = response.json().get("data", {})
-        market = data.get("getUser", {}).get("market", {})
-        offer_orders = market.get("offer_orders", {}).get("list", [])
-
-        # Log the entire offer list for debugging
-        # logging.info(f"All Offers: {offer_orders}")
-
-        # Find the first offer with status "WAITING_FOR_CHANNEL_OPEN"
-        valid_channel_to_open = next(
-            (
-                offer
-                for offer in offer_orders
-                if offer.get("status") == "WAITING_FOR_CHANNEL_OPEN"
-            ),
-            None,
+        
+        transaction_size = calculate_transaction_size(utxos_needed)
+        current_fee_cost = transaction_size * fee_per_vbyte
+        
+        # Check if the sum of selected UTXOs can cover the channel size plus current fees
+        if selected_utxos_total_amount >= (channel_size + current_fee_cost):
+            fee_cost = current_fee_cost # Final fee_cost
+            break 
+        # If not enough, continue to add more UTXOs
+    else: 
+        # This else block executes if the loop completed without breaking
+        # (i.e., even with all UTXOs, couldn't cover channel size + fees)
+        logging.error(
+            f"Not enough UTXOs to cover channel size {channel_size} + fees {fee_cost}. "
+            f"Selected UTXOs total: {selected_utxos_total_amount}. Needed: {channel_size + fee_cost}"
         )
+        return -1, 0, None # Not enough UTXOs
 
-        # Log the found offer for debugging
-        logging.info(f"Found Offer: {valid_channel_to_open}")
+    return utxos_needed, fee_cost, related_outpoints
 
-        if not valid_channel_to_open:
+
+def get_orders_awaiting_channel_open(): # Renamed from check_channel
+    logging.info("Checking for Magma orders awaiting channel open (WAITING_FOR_CHANNEL_OPEN)...")
+    payload = {"query": GET_USER_MARKET_OFFER_ORDERS_QUERY}
+    
+    data = _execute_amboss_graphql_request(payload, "GetOrdersAwaitingChannelOpen")
+
+    if not data:
+        return None # Error already logged by helper
+
+    market = data.get("getUser", {}).get("market", {})
+    offer_orders = market.get("offer_orders", {}).get("list", [])
+    
+    orders_to_open = [
+        offer for offer in offer_orders if offer.get("status") == "WAITING_FOR_CHANNEL_OPEN"
+    ]
+
+    if not orders_to_open:
+        logging.info("No orders found with status 'WAITING_FOR_CHANNEL_OPEN'.")
+        return None 
+    
+    if len(orders_to_open) > 1:
+        logging.warning(f"Found {len(orders_to_open)} orders WAITING_FOR_CHANNEL_OPEN. Processing one: {orders_to_open[0]['id']}")
+    
+    found_offer = orders_to_open[0]
+    logging.info(f"Found order WAITING_FOR_CHANNEL_OPEN: {found_offer['id']}")
+    return found_offer
+
+
+def get_offers_awaiting_seller_approval(): # Renamed from check_offers
+    logging.info("Checking for Magma offers awaiting seller approval (WAITING_FOR_SELLER_APPROVAL)...")
+    payload = {"query": GET_USER_MARKET_OFFER_ORDERS_QUERY}
+
+    data = _execute_amboss_graphql_request(payload, "GetOffersAwaitingSellerApproval")
+
+    if not data:
+        return None # Error already logged by helper
+        
+    market_data = data.get("getUser", {}).get("market", {})
+    offer_orders_list = market_data.get("offer_orders", {}).get("list", [])
+
+    for offer in offer_orders_list:
+        logging.debug(f"Offer ID: {offer.get('id')}, Status: {offer.get('status')}")
+        destination_pubkey = offer.get('account') or offer.get("endpoints", {}).get("destination")
+
+        if destination_pubkey in BANNED_PUBKEYS:
             logging.info(
-                "No orders with status 'WAITING_FOR_CHANNEL_OPEN' waiting for execution."
+                f"Offer {offer.get('id')} from banned pubkey {destination_pubkey}. Auto-rejecting."
             )
-            return None
+            reject_order(offer.get("id")) # Consider if this should be handled by caller
+            send_telegram_notification(f"🗑️ Auto-rejected offer `{offer.get('id')}` from banned pubkey: `{destination_pubkey}`.", level="warning", parse_mode="Markdown")
+            continue # Skip to next offer
 
-        return valid_channel_to_open
+        if offer.get("status") == "WAITING_FOR_SELLER_APPROVAL":
+            logging.info(f"Found valid, unbanned offer awaiting approval: {offer['id']}")
+            return offer # Return the first valid, unbanned offer
 
-    except requests.exceptions.RequestException as e:
-        logging.exception(
-            f"An error occurred while processing the check-channel request: {str(e)}"
-        )
-        return None
-
-
-def check_offers():
-    url = "https://api.amboss.space/graphql"
-    headers = {
-        "content-type": "application/json",
-        "Authorization": f"Bearer {AMBOSS_TOKEN}",
-    }
-    # Updated GraphQL query to include 'endpoints' and 'destination' to retrieve pubkey from channel-buyer
-    query = """
-    query ListChannelOffers {
-      getUser {
-        market {
-          offer_orders {
-            list {
-              id
-              seller_invoice_amount
-              status
-              endpoints {
-                destination
-              }
-            }
-          }
-        }
-      }
-    }
-    """
-
-    payload = {"query": query}
-
-    try:
-        response = requests.post(url, json=payload, headers=headers)
-        response.raise_for_status()  # Raise an exception for 4xx and 5xx status codes
-
-        data = response.json()
-
-        if data is None:  # Check if data is None
-            logging.error("No data received from the API")
-            return None
-
-        offer_orders = (
-            data.get("data", {})
-            .get("getUser", {})
-            .get("market", {})
-            .get("offer_orders", {})
-            .get("list", [])
-        )
-
-        # Initialize valid_channel_opening_offer to None
-        valid_channel_opening_offer = None
-
-        for offer in offer_orders:
-            logging.info(f"Offer ID: {offer.get('id')}, Status: {offer.get('status')}")
-
-            # Retrieve the pubkey for the offer
-            destination = offer.get("endpoints", {}).get("destination")
-
-            # Check whether the channel-buyer pubkey is in banned config file
-            if destination in BANNED_PUBKEYS:
-                logging.info(
-                    f"Pubkey {destination} is banned. Rejecting order {offer.get('id')}."
-                )
-                reject_order(offer.get("id"))
-                continue
-
-            # Find the first offer with status "WAITING_FOR_SELLER_APPROVAL"
-            if offer.get("status") == "WAITING_FOR_SELLER_APPROVAL":
-                logging.info(f"Found valid & unbanned offer to process: {offer}")
-                valid_channel_opening_offer = offer
-                break
-
-        if not valid_channel_opening_offer:
-            logging.info(
-                "No orders with status 'WAITING_FOR_SELLER_APPROVAL' waiting for approval."
-            )
-            return None
-
-        return valid_channel_opening_offer
-
-    except requests.exceptions.RequestException as e:
-        logging.exception(
-            f"An error occurred while processing the check-offers request: {str(e)}"
-        )
-        return None
+    logging.info("No unbanned offers found with status 'WAITING_FOR_SELLER_APPROVAL'.")
+    return None
 
 
 def open_channel(pubkey, size, invoice):
     # get fastest fee
     logging.info("Getting fastest fee...")
     fee_rate = get_fast_fee()
-    formatted_outpoints = None
+    formatted_outpoints = None # Initialize to ensure it's defined
+    msg_open_or_error = "Fee rate could not be determined." # Default error message
+
     if fee_rate:
         logging.info(f"Fastest Fee:{fee_rate} sat/vB")
-        # Check UTXOS and Fee Cost
         logging.info("Getting UTXOs, Fee Cost and Outpoints to open the channel")
         utxos_needed, fee_cost, related_outpoints = calculate_utxos_required_and_fees(
             size, fee_rate
         )
-        # Check if enough UTXOS
         if utxos_needed == -1:
-            msg_open = (
-                f"There isn't enough confirmed Balance to open a {size} SATS channel"
+            msg_open_or_error = (
+                f"Not enough confirmed balance for a {size} SATS channel."
             )
-            logging.info(msg_open)
-            return -1, msg_open
-        # Check if Fee Cost is less than the Invoice
-        if (fee_cost) >= float(invoice) * MAX_FEE_PERCENTAGE_OF_INVOICE: # Use new config variable
-            msg_open = f"Can't open this channel now, the fee {fee_cost} is bigger or equal to {MAX_FEE_PERCENTAGE_OF_INVOICE*100}% of the Invoice paid by customer" # Use new config variable
-            logging.info(msg_open)
-            return -2, msg_open
-        # Good to open channel
-        if related_outpoints is not None:
+            logging.info(msg_open_or_error)
+            return None, msg_open_or_error # Return None for TX, and error message
+        
+        if (fee_cost) >= float(invoice) * MAX_FEE_PERCENTAGE_OF_INVOICE:
+            msg_open_or_error = (
+                f"Fee ({fee_cost} sats) is >= {MAX_FEE_PERCENTAGE_OF_INVOICE*100}% of invoice ({float(invoice)} sats)."
+            )
+            logging.info(msg_open_or_error)
+            return None, msg_open_or_error # Return None for TX, and error message
+        
+        if related_outpoints:
             formatted_outpoints = " ".join(
                 [f"--utxo {outpoint}" for outpoint in related_outpoints]
             )
-            logging.info(f"Opening Channel: {pubkey}")
-            # Run function to open channel
         else:
-            # Handle the case when related_outpoints is None
-            logging.info("No related outpoints found.")
-        logging.info(f"Opening Channel: {pubkey}")
-        # Run function to open channel
-        funding_tx = execute_lnd_command(
-            pubkey, fee_rate, formatted_outpoints, size, CHANNEL_FEE_RATE_PPM # Use new config variable
-        )
-        if funding_tx is None:
-            msg_open = f"Problem to execute the LNCLI command to open the channel. Please check the Log Files"
-            logging.info(msg_open)
-            return -3, msg_open
-        msg_open = f"Channel opened with funding transaction: {funding_tx}"
-        logging.info(msg_open)
-        return funding_tx, msg_open
+            # This case means we might be using a single, large enough UTXO or LND handles selection.
+            # No specific error, but formatted_outpoints remains None if not constructed.
+            # execute_lnd_command handles formatted_outpoints being None by passing an empty string.
+            logging.info("No specific outpoints passed to lncli; LND will select UTXOs or using available balance.")
 
-    else:
-        return None
+
+        logging.info(f"Preparing to open channel to: {pubkey} with outpoints: {formatted_outpoints}")
+        # execute_lnd_command now returns (funding_txid_or_None, error_message_or_None)
+        funding_tx, lncli_error_msg = execute_lnd_command(
+            pubkey, fee_rate, formatted_outpoints, size, CHANNEL_FEE_RATE_PPM
+        )
+
+        if funding_tx is None:
+            # lncli_error_msg already contains the detailed error from execute_lnd_command
+            msg_open_or_error = f"lncli openchannel command failed. Details: {lncli_error_msg}"
+            logging.info(msg_open_or_error) # Log the detailed error
+            return None, msg_open_or_error # Propagate None for TX and the detailed error
+        
+        msg_open_or_error = f"Channel opened with funding transaction: {funding_tx}"
+        logging.info(msg_open_or_error)
+        return funding_tx, msg_open_or_error # Return TX and success message
+
+    else: # fee_rate was None
+        logging.error(msg_open_or_error) # Log the "Fee rate could not be determined" error
+        return None, msg_open_or_error # Return None for TX and this specific error
 
 
 def bos_confirm_income(amount, peer_pubkey):
@@ -716,199 +918,410 @@ def bos_confirm_income(amount, peer_pubkey):
         return None
 
 
-def process_new_offers():
-    """Checks for new offers and processes them (invoice, accept)."""
-    logging.info("Checking for new Magma offers (WAITING_FOR_SELLER_APPROVAL)...")
-    valid_channel_opening_offer = check_offers() # Fetches offers WAITING_FOR_SELLER_APPROVAL
-
-    if not valid_channel_opening_offer:
-        logging.info("No new Magma offers waiting for approval.")
-        return
-
-    order_id = valid_channel_opening_offer['id']
-    seller_invoice_amount = valid_channel_opening_offer['seller_invoice_amount']
-    current_status = valid_channel_opening_offer['status']
-
-    send_telegram_notification(
-        f"Found new Magma offer:\nID: {order_id}\nAmount: {seller_invoice_amount} sats\nStatus: {current_status}"
-    )
-
-    # Check for banned pubkey (already in check_offers, but good for direct call)
-    destination_pubkey = valid_channel_opening_offer.get("endpoints", {}).get("destination")
-    if destination_pubkey in BANNED_PUBKEYS:
-        logging.info(f"Offer {order_id} from banned pubkey {destination_pubkey}. Auto-rejecting.")
-        send_telegram_notification(f"Offer {order_id} from banned pubkey {destination_pubkey}. Auto-rejecting.")
-        reject_order(order_id)
-        return
-
-    send_telegram_notification(f"Generating invoice for {seller_invoice_amount} sats (Order ID: {order_id})...")
-    invoice_hash, invoice_request = execute_lncli_addinvoice(
+def _complete_offer_approval_process(order_id, order_details):
+    """Generates invoice, accepts on Amboss, and starts payment polling."""
+    seller_invoice_amount = order_details['seller_invoice_amount']
+    buyer_alias = order_details.get("buyer_alias", "N/A") 
+    
+    send_telegram_notification(f"✅ Order `{order_id}` approved by you ({buyer_alias}).\nGenerating invoice for {seller_invoice_amount} sats...", parse_mode="Markdown")
+    invoice_hash_or_error, invoice_request = execute_lncli_addinvoice( # Modified to return error message
         seller_invoice_amount,
         f"Magma-Channel-Sale-Order-ID:{order_id}",
         str(INVOICE_EXPIRY_SECONDS),
     )
 
-    if "Error" in invoice_hash or invoice_request is None:
-        error_msg = f"Failed to generate invoice for order {order_id}: {invoice_hash}"
+    if invoice_request is None or "Error" in invoice_hash_or_error: # Check if invoice_request is None or error in first part
+        # invoice_hash_or_error now contains the error message from execute_lncli_addinvoice
+        error_msg = f"🔥 Failed to generate invoice for approved order `{order_id}`.\n`lncli` error: `{invoice_hash_or_error}`"
         logging.error(error_msg)
-        send_telegram_notification(error_msg, level="error")
-        # Consider whether to auto-reject the order here or let it expire
-        return
+        send_telegram_notification(error_msg, level="error", parse_mode="Markdown")
+        return 
 
-    logging.debug(f"Invoice for order {order_id}: {invoice_request}")
-    send_telegram_notification(f"Invoice for order {order_id}:\n`{invoice_request}`")
+    invoice_hash = invoice_hash_or_error # If successful, this is the actual hash
+    logging.debug(f"Invoice for approved order {order_id} (hash: {invoice_hash}): {invoice_request}")
+    send_telegram_notification(f"🧾 Invoice for `{order_id}`:\n`{invoice_request}`", parse_mode="Markdown")
 
-    send_telegram_notification(f"Accepting Magma order: {order_id}")
+    send_telegram_notification(f"📡 Accepting Magma order `{order_id}` on Amboss...", parse_mode="Markdown")
     accept_result = accept_order(order_id, invoice_request)
-    logging.info(f"Order {order_id} acceptance result: {accept_result}")
+    logging.info(f"Order {order_id} Amboss acceptance result: {accept_result}")
 
     if "data" in accept_result and "sellerAcceptOrder" in accept_result["data"] and accept_result["data"]["sellerAcceptOrder"]:
-        success_message = f"Order {order_id} accepted. Invoice sent to Amboss. Waiting for buyer payment."
-        send_telegram_notification(success_message)
+        success_message = f"⏳ Order `{order_id}` accepted on Amboss. Invoice sent. Monitoring for buyer payment."
+        send_telegram_notification(success_message, parse_mode="Markdown")
         logging.info(success_message)
-        
-        # Start actively polling for this specific order's payment
-        wait_for_buyer_payment(order_id)
+        wait_for_buyer_payment(order_id) # Start active polling
     else:
-        failure_message = f"Failed to accept order {order_id}. Amboss response: {accept_result}"
+        errors = accept_result.get('errors', 'Unknown error')
+        failure_message = f"🔥 Failed to accept approved order `{order_id}` on Amboss. Response: {errors}"
         logging.error(failure_message)
-        send_telegram_notification(failure_message, level="error")
-        # Log critical error if Amboss acceptance fails unexpectedly
+        send_telegram_notification(failure_message, level="error", parse_mode="Markdown")
         if "errors" in accept_result:
-             with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
-                log_file.write(f"Failed to accept Amboss order {order_id}. Response: {accept_result.get('errors')}\n")
+            with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
+                log_file.write(f"Failed to accept Amboss order {order_id} after approval. Response: {accept_result.get('errors')}\n")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('decide_order:'))
+def handle_order_decision_callback(call):
+    """Handles callbacks from Approve/Reject offer buttons."""
+    try:
+        _, action, order_id = call.data.split(':')
+        logging.info(f"Received user decision: {action} for order {order_id} via Telegram callback.")
+
+        confirmation_details_entry = pending_user_confirmations.pop(order_id, None)
+
+        if not confirmation_details_entry:
+            logging.warning(f"Received callback for order {order_id}, but it was not in pending_user_confirmations (likely timed out or already processed).")
+            bot.answer_callback_query(call.id, text=f"Offer {order_id} already processed or timed out.")
+            try:
+                bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=None)
+            except Exception as e:
+                logging.debug(f"Could not edit message for already processed callback {order_id}: {e}")
+            return
+
+        order_original_details = confirmation_details_entry["details"]
+        buyer_alias = order_original_details.get("buyer_alias", "N/A")
+        buyer_pubkey = order_original_details.get('account') or order_original_details.get("endpoints", {}).get("destination", "Unknown")
+        amount = order_original_details['seller_invoice_amount']
+
+        decision_text_verb = "Approved" if action == "approve" else "Rejected"
+        decision_emoji = "✅" if action == "approve" else "❌"
+        
+        try:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=confirmation_details_entry["message_id"],
+                text=(
+                    f"{decision_emoji} Offer {decision_text_verb} by You:\n"
+                    f"ID: `{order_id}`\n"
+                    f"💰 Amount: {amount} sats\n"
+                    f"👤 Buyer: `{buyer_alias}` ({buyer_pubkey[:10]}...)"
+                ),
+                reply_markup=None,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logging.error(f"Error editing Telegram message for order {order_id} after decision: {e}")
+
+        if action == "approve":
+            send_telegram_notification(f"▶️ Proceeding with approved order `{order_id}` ({buyer_alias}).", parse_mode="Markdown")
+            if order_original_details.get("status") == "WAITING_FOR_SELLER_APPROVAL":
+                _complete_offer_approval_process(order_id, order_original_details)
+            else:
+                msg = f"⚠️ Order `{order_id}` status changed to `{order_original_details.get('status')}` before user approval ({action}) could be fully processed. No action taken."
+                logging.warning(msg)
+                send_telegram_notification(msg, level="warning", parse_mode="Markdown")
+
+        elif action == "reject":
+            send_telegram_notification(f"🗑️ Rejecting order `{order_id}` ({buyer_alias}) on Amboss.", parse_mode="Markdown")
+            reject_order(order_id)
+
+        bot.answer_callback_query(call.id, text=f"Order {order_id} {decision_text_verb}.")
+
+    except Exception as e:
+        logging.exception(f"Error in order_decision_callback for call data {call.data}:")
+        bot.answer_callback_query(call.id, text="Error processing your decision.")
+        send_telegram_notification("🔥 Error processing user decision from Telegram button. Check logs.", level="error", parse_mode="Markdown")
+
+
+def _handle_timeout_for_offer(order_id, confirmation_info):
+    """Handles the logic when an offer confirmation times out."""
+    logging.info(f"Order {order_id} timed out waiting for user confirmation. Defaulting to approve.")
+    
+    order_details = confirmation_info['details']
+    buyer_alias = order_details.get("buyer_alias", "N/A")
+    buyer_pubkey = order_details.get('account') or order_details.get("endpoints", {}).get("destination", "Unknown")
+    amount = order_details['seller_invoice_amount']
+
+    send_telegram_notification(
+        f"⏳ Offer Timeout & Auto-Approved:\n"
+        f"ID: `{order_id}`\n"
+        f"💰 Amount: {amount} sats\n"
+        f"👤 Buyer: `{buyer_alias}` ({buyer_pubkey[:10]}...)\n"
+        f"No response in 5 min.",
+        level="warning",
+        parse_mode="Markdown"
+    )
+    try:
+        bot.edit_message_text(
+            chat_id=CHAT_ID,
+            message_id=confirmation_info["message_id"],
+            text=(
+                f"✅ Auto-Approved (Timeout):\n"
+                f"ID: `{order_id}`\n"
+                f"💰 Amount: {amount} sats\n"
+                f"👤 Buyer: `{buyer_alias}` ({buyer_pubkey[:10]}...)"
+            ),
+            reply_markup=None,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logging.error(f"Error editing Telegram message for timed-out order {order_id}: {e}")
+    
+    order_details_fresh = get_order_details_from_amboss(order_id) 
+    if order_details_fresh:
+        # Add buyer_alias to fresh details if needed for _complete_offer_approval_process
+        order_details_fresh['buyer_alias'] = buyer_alias # Carry over known alias
+        if order_details_fresh.get("status") == "WAITING_FOR_SELLER_APPROVAL":
+             _complete_offer_approval_process(order_id, order_details_fresh)
+        else:
+            msg = f"⚠️ Order `{order_id}` (timed out) status changed to `{order_details_fresh.get('status')}` before auto-approval. No action taken."
+            logging.warning(msg)
+            send_telegram_notification(msg, level="warning", parse_mode="Markdown")
+    else:
+        msg = f"🔥 Could not fetch details for timed-out order `{order_id}` for auto-approval. Manual check required."
+        logging.error(msg)
+        send_telegram_notification(msg, level="error", parse_mode="Markdown")
+
+
+def process_new_offers():
+    """
+    Checks for new offers (WAITING_FOR_SELLER_APPROVAL).
+    If a new offer is found, it asks the user for confirmation via Telegram, including the buyer's alias.
+    It also handles timeouts for offers previously presented to the user.
+    """
+    global pending_user_confirmations
+
+    # 1. Handle Timeouts for pending user actions
+    current_time = time.time()
+    timed_out_orders_ids = []
+    for order_id, info in list(pending_user_confirmations.items()):
+        if current_time - info["timestamp"] > USER_CONFIRMATION_TIMEOUT_SECONDS:
+            timed_out_orders_ids.append(order_id)
+            
+    for order_id in timed_out_orders_ids:
+        confirmation_info = pending_user_confirmations.pop(order_id, None)
+        if confirmation_info:
+            _handle_timeout_for_offer(order_id, confirmation_info)
+
+    # 2. Fetch new offers from Amboss
+    logging.info("Checking for new Magma offers (WAITING_FOR_SELLER_APPROVAL)...")
+    new_offer_from_amboss = get_offers_awaiting_seller_approval() # Use renamed function
+
+    if not new_offer_from_amboss:
+        logging.info("No new Magma offers found requiring seller approval at this time.")
+        return
+
+    order_id = new_offer_from_amboss['id']
+    
+    # If it's already pending user confirmation, we've already asked. Let timeout or callback handle it.
+    if order_id in pending_user_confirmations:
+        logging.info(f"Offer {order_id} is already awaiting user confirmation. Skipping new prompt.")
+        return
+
+    # This is a genuinely new offer we haven't prompted for yet.
+    seller_invoice_amount = new_offer_from_amboss['seller_invoice_amount']
+    current_status = new_offer_from_amboss['status']
+    # 'account' is often the buyer's pubkey in Amboss market data,
+    # 'destination' under endpoints is also usually the buyer's pubkey. Prefer 'account' if available.
+    destination_pubkey = new_offer_from_amboss.get('account') or \
+                         new_offer_from_amboss.get("endpoints", {}).get("destination")
+
+
+    # Pre-check for banned pubkey before even asking user
+    if destination_pubkey in BANNED_PUBKEYS:
+        logging.info(f"New offer {order_id} from banned pubkey {destination_pubkey}. Auto-rejecting without user prompt.")
+        send_telegram_notification(f"Auto-rejecting new offer {order_id} from banned pubkey: {destination_pubkey}.", level="warning")
+        reject_order(order_id)
+        return
+
+    # Fetch buyer's alias
+    buyer_alias = "N/A"
+    if destination_pubkey:
+        buyer_alias = get_node_alias(destination_pubkey)
+    else:
+        logging.warning(f"Could not determine destination pubkey for order {order_id} to fetch alias.")
+
+
+    # Ask user for confirmation
+    markup = types.InlineKeyboardMarkup()
+    approve_button = types.InlineKeyboardButton("✅ Approve Offer", callback_data=f"decide_order:approve:{order_id}")
+    reject_button = types.InlineKeyboardButton("❌ Reject Offer", callback_data=f"decide_order:reject:{order_id}")
+    markup.add(approve_button, reject_button)
+
+    prompt_message = (
+        f"🔔 New Magma Offer:\n"
+        f"ID: `{order_id}`\n"
+        f"💰 Amount: {seller_invoice_amount} sats\n"
+        f"👤 Buyer: `{buyer_alias}` ({destination_pubkey[:10]}...)\n"
+        f"⏳ Please Approve/Reject within 5 min."
+    )
+    sent_message = send_telegram_notification(prompt_message, reply_markup=markup, parse_mode="Markdown")
+
+    if sent_message:
+        # Store comprehensive details in pending_user_confirmations for rich messages on timeout/callback
+        pending_confirmation_data = new_offer_from_amboss.copy()
+        pending_confirmation_data['buyer_alias'] = buyer_alias # Add the fetched alias
+
+        pending_user_confirmations[order_id] = {
+            "message_id": sent_message.message_id,
+            "timestamp": time.time(),
+            "details": pending_confirmation_data 
+        }
+        logging.info(f"Offer {order_id} (Buyer: {buyer_alias}) presented to user for confirmation. Awaiting response or timeout.")
+    else:
+        logging.error(f"Failed to send confirmation request to Telegram for order {order_id}.")
 
 
 def wait_for_buyer_payment(order_id):
     """Actively polls a specific order to see if it becomes WAITING_FOR_CHANNEL_OPEN."""
     logging.info(f"Starting active poll for payment of order {order_id} for {ACTIVE_ORDER_POLL_DURATION_MINUTES} minutes.")
-    send_telegram_notification(f"Actively monitoring order {order_id} for buyer payment...")
+    # Notification for starting active poll is now part of _complete_offer_approval_process
 
     start_time = time.time()
     max_duration_seconds = ACTIVE_ORDER_POLL_DURATION_MINUTES * 60
 
     while time.time() - start_time < max_duration_seconds:
-        order_details = get_order_details_from_amboss(order_id) # Fetches current status
+        order_details = get_order_details_from_amboss(order_id) 
         if order_details:
             current_status = order_details.get("status")
             logging.info(f"Order {order_id} current status: {current_status}")
             if current_status == "WAITING_FOR_CHANNEL_OPEN":
-                send_telegram_notification(f"Buyer has paid for order {order_id}! Status: {current_status}. Proceeding to open channel.")
+                send_telegram_notification(f"💰 Buyer paid for order `{order_id}`! Status: {current_status}.\nProceeding to open channel.", parse_mode="Markdown")
                 logging.info(f"Order {order_id} is now WAITING_FOR_CHANNEL_OPEN. Triggering channel open process.")
-                # Directly call the processing for this order, no need to wait for next main poll cycle
                 process_paid_order(order_details)
-                return # Exit after processing
-            elif current_status in ["CANCELLED", "EXPIRED", "SELLER_REJECTED", "ERROR", "COMPLETED"]: # Terminal states
-                send_telegram_notification(f"Order {order_id} reached terminal state: {current_status} during active payment poll. Stopping active poll.")
+                return 
+            elif current_status in ["CANCELLED", "EXPIRED", "SELLER_REJECTED", "ERROR", "COMPLETED"]: 
+                send_telegram_notification(f"ℹ️ Order `{order_id}` is now {current_status}. Stopped active payment monitoring.", parse_mode="Markdown")
                 logging.info(f"Order {order_id} reached terminal state {current_status}. Stopping active poll.")
                 return
         else:
             logging.warning(f"Could not fetch details for order {order_id} during active poll.")
-            # Continue polling, maybe a transient API issue
 
         time.sleep(ACTIVE_ORDER_POLL_INTERVAL_SECONDS)
 
-    send_telegram_notification(f"Finished active polling for order {order_id} after {ACTIVE_ORDER_POLL_DURATION_MINUTES} minutes. Buyer did not pay or status change not detected in time.")
+    send_telegram_notification(f"⏳ Order `{order_id}`: Buyer did not pay within {ACTIVE_ORDER_POLL_DURATION_MINUTES} min. Stopped active monitoring.", parse_mode="Markdown")
     logging.info(f"Active polling for order {order_id} finished. Buyer did not pay or status not WAITING_FOR_CHANNEL_OPEN in time.")
 
 
 def process_paid_order(order_details):
     """Processes a single order that is WAITING_FOR_CHANNEL_OPEN."""
     order_id = order_details['id']
-    customer_pubkey = order_details['account'] # Assuming 'account' is the buyer's pubkey
+    customer_pubkey = order_details['account'] 
     channel_size = order_details['size']
     seller_invoice_amount = order_details['seller_invoice_amount']
+    
+    buyer_alias = get_node_alias(customer_pubkey)
 
     send_telegram_notification(
-        f"Processing paid order {order_id}:\nCustomer: {customer_pubkey}\nSize: {channel_size} SATS\nInvoice: {seller_invoice_amount} SATS"
+        f"⚡️ Processing paid order `{order_id}`:\n"
+        f"👤 Buyer: `{buyer_alias}` ({customer_pubkey[:10]}...)\n"
+        f"📦 Size: {channel_size} sats\n"
+        f"🧾 Invoice: {seller_invoice_amount} sats",
+        parse_mode="Markdown"
     )
 
     # 1. Connect to Peer
-    send_telegram_notification(f"Attempting to connect to peer: {customer_pubkey} for order {order_id}")
+    send_telegram_notification(f"🔗 Attempting to connect to peer `{buyer_alias}` ({customer_pubkey[:10]}...) for order `{order_id}`.", parse_mode="Markdown")
     customer_addr_uri = get_address_by_pubkey(customer_pubkey)
 
     if not customer_addr_uri:
-        error_msg = f"Could not get address for peer {customer_pubkey} (Order {order_id}). Cannot open channel."
+        error_msg = f"🔥 Could not get address for peer `{buyer_alias}` ({customer_pubkey[:10]}...) (Order `{order_id}`). Cannot open channel."
         logging.error(error_msg)
-        send_telegram_notification(error_msg, level="error")
-        # This is critical as we can't proceed with this order
+        send_telegram_notification(error_msg, level="error", parse_mode="Markdown")
         with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
             log_file.write(f"Critical: Could not get address for peer {customer_pubkey} (Order {order_id})\n")
         return
 
-    node_connection_status = connect_to_node(customer_addr_uri)
+    node_connection_status, conn_error_msg = connect_to_node(customer_addr_uri) # Modified to return error message
     if node_connection_status == 0:
-        send_telegram_notification(f"Successfully connected to peer {customer_addr_uri} (Order {order_id}).")
+        send_telegram_notification(f"✅ Successfully connected to `{buyer_alias}` ({customer_addr_uri}).", parse_mode="Markdown")
     else:
-        # Don't fail outright, lncli might still open if already connected or connects during openchannel
-        send_telegram_notification(f"Could not connect to peer {customer_addr_uri} (Order {order_id}), or already connected. Attempting channel open anyway.", level="warning")
+        # conn_error_msg contains the detailed error from connect_to_node
+        tg_error_msg = (
+            f"⚠️ Could not connect to `{buyer_alias}` ({customer_addr_uri}) for order `{order_id}`.\n"
+            f"`lncli` error: `{conn_error_msg}`\n"
+            f"Will attempt channel open anyway."
+        )
+        send_telegram_notification(tg_error_msg, level="warning", parse_mode="Markdown")
+
 
     # 2. Open Channel
-    send_telegram_notification(f"Attempting to open {channel_size} SATS channel with {customer_pubkey} (Order {order_id}).")
-    funding_tx, msg_open = open_channel(customer_pubkey, channel_size, seller_invoice_amount)
+    send_telegram_notification(f"🛠️ Attempting to open {channel_size} sats channel with `{buyer_alias}` ({customer_pubkey[:10]}...) for order `{order_id}`.", parse_mode="Markdown")
+    # open_channel now returns (funding_tx_or_None, error_message_or_None)
+    # The second element (msg_open_or_error) will contain detailed lncli error if funding_tx is None
+    funding_tx, msg_open_or_error = open_channel(customer_pubkey, channel_size, seller_invoice_amount)
 
-    if funding_tx == -1 or funding_tx == -2 or funding_tx == -3 or funding_tx is None:
-        error_msg = f"Failed to open channel for order {order_id}: {msg_open}"
-        logging.error(error_msg)
-        send_telegram_notification(error_msg, level="error")
-        # This is critical for this order
-        with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
-            log_file.write(f"Critical: Failed to open channel for order {order_id}. Reason: {msg_open}. Funding TX: {funding_tx}\n")
+
+    if funding_tx is None: # Indicates an error occurred
+        # msg_open_or_error now contains the detailed error from execute_lnd_command (via open_channel)
+        error_msg = f"🔥 Failed to open channel for order `{order_id}`.\n`lncli` error: `{msg_open_or_error}`"
+        logging.error(error_msg) 
+        send_telegram_notification(error_msg, level="error", parse_mode="Markdown")
+        # Do NOT create CRITICAL_ERROR_FILE_PATH here, this is an order-specific failure.
+        # Log to a separate file for critical ORDER issues if desired, or just rely on main log and Telegram.
+        # with open(CRITICAL_ORDER_FAILURES_LOG , "a") as log_file:
+        # log_file.write(f"Critical: Failed to open channel for order {order_id}. Reason: {msg_open_or_error}.\n")
         return
     
-    send_telegram_notification(f"Channel opening initiated for order {order_id}. Funding TX: `{funding_tx}`. {msg_open}")
+    # If successful, msg_open_or_error is the success message
+    send_telegram_notification(f"✅ Channel opening initiated for order `{order_id}`.\nFunding TX: `{funding_tx}`\nDetails: {msg_open_or_error}", parse_mode="Markdown")
 
     # 3. Get Channel Point (with retries and timeout)
-    send_telegram_notification(f"Waiting for channel point for TX {funding_tx} (Order {order_id})...", level="info")
+    send_telegram_notification(f"⏳ Waiting for channel point for TX `{funding_tx}` (Order `{order_id}`)...", level="info", parse_mode="Markdown")
     logging.info(f"Waiting up to 5 minutes to get channel point for TX {funding_tx} (Order {order_id})...")
     
     channel_point = None
     get_cp_start_time = time.time()
-    while time.time() - get_cp_start_time < 300: # 5 minute timeout for channel point
+    while time.time() - get_cp_start_time < 300: 
         channel_point = get_channel_point(funding_tx)
         if channel_point:
-            break
+            break  
         logging.debug(f"Channel point for {funding_tx} not found yet, retrying in 10s...")
         time.sleep(10)
 
     if channel_point is None:
-        error_msg = f"Could not get channel point for TX {funding_tx} (Order {order_id}) after 5 mins. Please check manually."
+        error_msg = f"🔥 Could not get channel point for TX `{funding_tx}` (Order `{order_id}`) after 5 mins. Please check manually."
         logging.error(error_msg)
-        send_telegram_notification(error_msg, level="error")
-        with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
-            log_file.write(f"Critical: Failed to get channel point for TX {funding_tx} (Order {order_id}). Confirm manually.\n")
+        send_telegram_notification(error_msg, level="error", parse_mode="Markdown")
+        # Do NOT create CRITICAL_ERROR_FILE_PATH here. Manual check for this order.
         return
-    send_telegram_notification(f"Channel point for order {order_id}: `{channel_point}`")
+    send_telegram_notification(f"✅ Channel point for order `{order_id}`: `{channel_point}`", parse_mode="Markdown")
 
     # 4. Confirm Channel Point to Amboss (with a small delay)
     logging.info(f"Waiting 10 seconds before confirming channel point {channel_point} to Amboss for order {order_id}.")
     time.sleep(10)
-    send_telegram_notification(f"Confirming channel point to Amboss for order {order_id}...")
+    send_telegram_notification(f"📡 Confirming channel point to Amboss for order `{order_id}`...", parse_mode="Markdown")
     
     channel_confirmed_result = confirm_channel_point_to_amboss(order_id, channel_point)
-    if channel_confirmed_result is None or (isinstance(channel_confirmed_result, str) and "Error" in channel_confirmed_result) or ("errors" in channel_confirmed_result):
-        error_msg = f"Failed to confirm channel point {channel_point} to Amboss for order {order_id}. Result: {channel_confirmed_result}. Confirm manually."
-        logging.error(error_msg)
-        send_telegram_notification(error_msg, level="error")
-        with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
-            log_file.write(f"Critical: Failed to confirm channel point to Amboss for order {order_id}, CP: {channel_point}. Result: {channel_confirmed_result}\n")
+    # Check for various error indications in channel_confirmed_result
+    has_errors = False
+    if channel_confirmed_result is None: # This means _execute_amboss_graphql_request had a fundamental issue
+        has_errors = True
+        # Error message would have been logged by the helper or confirm_channel_point_to_amboss for specific Amboss GQL errors
+        # If confirm_channel_point_to_amboss returned None without specific errors, it means network/request level issue
+        if not (isinstance(channel_confirmed_result, dict) and "errors" in channel_confirmed_result) : # if not already an error dict
+             channel_confirmed_result = {"errors": [{"message": "Network/request level error during Amboss confirmation or helper returned None."}]}
+
+    elif isinstance(channel_confirmed_result, dict) and "errors" in channel_confirmed_result:
+        # This means Amboss returned a GraphQL error. confirm_channel_point_to_amboss handles CRITICAL_ERROR_FILE_PATH for these.
+        has_errors = True
+        
+    if has_errors:
+        # The CRITICAL_ERROR_FILE_PATH is created by confirm_channel_point_to_amboss if Amboss returns a GQL error.
+        # For other errors (like timeout from the wrapper), we just notify and log.
+        err_detail = channel_confirmed_result.get("errors", [{"message": "Unknown confirmation failure"}])[0].get("message", "details unavailable")
+        error_msg = f"🔥 Failed to confirm channel point `{channel_point}` to Amboss for order `{order_id}`. Result: `{err_detail}`. Confirm manually."
+        logging.error(error_msg) # Full error already logged by confirm_channel_point_to_amboss or helper
+        send_telegram_notification(error_msg, level="error", parse_mode="Markdown")
+        # No CRITICAL_ERROR_FILE_PATH creation here unless confirm_channel_point_to_amboss did it for a direct Amboss API error.
         return
 
-    success_msg = f"Channel for order {order_id} confirmed to Amboss! Result: {channel_confirmed_result}"
-    logging.info(success_msg)
-    send_telegram_notification(success_msg)
+    success_msg = f"✅ Channel for order `{order_id}` confirmed to Amboss!"
+    logging.info(f"{success_msg} Result: {channel_confirmed_result}") # Log full result
+    send_telegram_notification(success_msg, parse_mode="Markdown")
+
 
     # 5. BOS Confirm Income (Optional accounting step)
-    if customer_addr_uri: # Re-use from earlier
+    if customer_addr_uri: 
         logging.info(f"Attempting BOS income confirmation for order {order_id}, peer: {customer_addr_uri}")
-        bos_result = bos_confirm_income(seller_invoice_amount, peer_pubkey=customer_pubkey) # Use pubkey for message
+        bos_result = bos_confirm_income(seller_invoice_amount, peer_pubkey=customer_pubkey) 
         if bos_result:
-            send_telegram_notification(f"BOS income confirmation for order {order_id} attempted. Output: {bos_result[:200]}...", level="info")
+            send_telegram_notification(f"ℹ️ BOS income confirmation for order `{order_id}` attempted. Output: {bos_result[:150]}...", level="info", parse_mode="Markdown")
             logging.info(f"BOS income confirmation for order {order_id} successful.")
         else:
-            send_telegram_notification(f"BOS income confirmation for order {order_id} failed.", level="warning")
+            send_telegram_notification(f"⚠️ BOS income confirmation for order `{order_id}` failed.", level="warning", parse_mode="Markdown")
             logging.error(f"BOS income confirmation failed for order {order_id}.")
-    else: # Should not happen if we got this far, but as a fallback.
+    else: 
         logging.warning(f"Skipping BOS income confirmation for order {order_id} as customer_addr_uri was not available.")
 
     logging.info(f"Successfully processed paid order {order_id}.")
@@ -918,15 +1331,7 @@ def process_paid_orders_for_channel_opening():
     """Checks for orders WAITING_FOR_CHANNEL_OPEN and processes them."""
     logging.info("Checking for paid Magma orders (WAITING_FOR_CHANNEL_OPEN)...")
     
-    # `check_channel()` fetches orders with WAITING_FOR_CHANNEL_OPEN status
-    # In a high-volume scenario, this might return multiple.
-    # The current `check_channel` returns only the first one it finds.
-    # We should process all of them if multiple are found.
-    
-    # For now, let's adapt to process one at a time as per original logic, but ideally, loop through all.
-    # TODO: Modify check_channel to return a list and loop here.
-    
-    order_to_open = check_channel() # Gets one order WAITING_FOR_CHANNEL_OPEN
+    order_to_open = get_orders_awaiting_channel_open() # Use renamed function
 
     if not order_to_open:
         logging.info("No paid Magma orders waiting for channel opening.")
@@ -969,36 +1374,94 @@ def execute_bot_behavior():
 
     except Exception as e:
         logging.exception("Unhandled exception in execute_bot_behavior:")
-        send_telegram_notification(f"FATAL ERROR in bot behavior: {e}. Check logs immediately!", level="error")
+        send_telegram_notification(f"🔥🔥 FATAL ERROR in bot behavior: {e}. Check logs immediately!", level="error", parse_mode="Markdown")
         # Create critical error flag for any unhandled exception in the main flow
         with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
-            log_file.write(f"Unhandled exception at {formatted_datetime}: {e}\n")
+            log_file.write(f"{formatted_datetime}: {e}\n")
 
     logging.info(f"Magma bot behavior cycle completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 
-@bot.message_handler(commands=["runnow", "channelopen"]) # Keep runnow, add channelopen for manual trigger
+@bot.message_handler(commands=["runnow", "channelopen"]) 
 def handle_run_command(message):
     logging.info(f"'{message.text}' command received. Executing bot behavior now.")
-    send_telegram_notification(f"'{message.text}' command received. Triggering Magma processing cycle.")
-    # Run in a new thread to avoid blocking Telegram bot polling if behavior takes time
-    threading.Thread(target=execute_bot_behavior).start()
+    send_telegram_notification(f"🚀 Manual trigger '{message.text}' received. Starting Magma processing cycle...", parse_mode="Markdown")
+    threading.Thread(target=execute_bot_behavior, name=f"ManualRun-{message.text[1:]}").start()
 
 
 if __name__ == "__main__":
+    # Ensure logs directory exists before setting up handler
+    logs_dir_for_main = os.path.join(parent_dir, "..", "logs")
+    if not os.path.exists(logs_dir_for_main):
+        try:
+            os.makedirs(logs_dir_for_main, exist_ok=True)
+        except OSError as e:
+            # Cannot create log directory, a truly critical startup failure
+            print(f"CRITICAL: Cannot create log directory {logs_dir_for_main}. Error: {e}. Exiting.")
+            # Optionally, try to write to a flag file in a known location if possible, or just exit.
+            with open(os.path.join(parent_dir, "..", "magma_bot_STARTUP_FAILED_LOGDIR.flag"), "w") as f:
+                f.write(f"Could not create log directory: {logs_dir_for_main}. Error: {e}")
+            exit(1) # Exit immediately
+
+    # Initialize logging (moved handler setup after logs_dir check)
+    log_file_path_for_main = os.path.join(logs_dir_for_main, "magma-sale-process.log")
+    main_handler = RotatingFileHandler(
+        log_file_path_for_main, maxBytes=10 * 1024 * 1024, backupCount=5  # 10 MB
+    )
+    logging.basicConfig(
+        level=logging.INFO, # Default to INFO, can be overridden by config later if needed
+        format="%(asctime)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s", # Added funcName and lineno
+        handlers=[main_handler],
+    )
+    # Adjust logging levels for third-party libraries
+    logging.getLogger("requests").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("telebot").setLevel(logging.WARNING)
+    
+    # Load config after basic logging is up, so config loading errors can be logged.
+    config = configparser.ConfigParser()
+    try:
+        if not config.read(config_file_path):
+            logging.critical(f"CRITICAL: Configuration file {config_file_path} not found or empty. Bot cannot start.")
+            with open(CRITICAL_ERROR_FILE_PATH, "a") as f:
+                f.write(f"{datetime.now()}: Config file {config_file_path} not found or empty.\n")
+            # Attempt to send Telegram if basic token/chat_id might be hardcoded or environment vars
+            if TOKEN and CHAT_ID: # TOKEN and CHAT_ID are global, might be defined before full config load
+                 send_telegram_notification(f"☠️ Magma Bot STARTUP FAILED: Config file `{config_file_path}` not found/empty.", level="error")
+            exit(1)
+        # Re-apply config based logging level if specified
+        log_level_str = config.get("system", "log_level", fallback="INFO").upper()
+        numeric_level = getattr(logging, log_level_str, logging.INFO)
+        logging.getLogger().setLevel(numeric_level) # Set root logger level
+        main_handler.setLevel(numeric_level) # Ensure handler also respects this level
+        logging.info(f"Log level set to {log_level_str} from config.")
+
+    except configparser.Error as e:
+        logging.critical(f"CRITICAL: Error parsing configuration file {config_file_path}: {e}. Bot cannot start.")
+        with open(CRITICAL_ERROR_FILE_PATH, "a") as f:
+            f.write(f"{datetime.now()}: Error parsing config file {config_file_path}: {e}\n")
+        if TOKEN and CHAT_ID:
+             send_telegram_notification(f"☠️ Magma Bot STARTUP FAILED: Error parsing config `{config_file_path}`: {e}", level="error")
+        exit(1)
+
+
     if os.path.exists(CRITICAL_ERROR_FILE_PATH):
         logging.critical(
             f"The critical error flag file {CRITICAL_ERROR_FILE_PATH} exists. "
             "Magma Sale Process will not start its scheduled tasks. Please investigate and remove the flag file."
         )
-        # Optionally send a startup Telegram error if CRITICAL_ERROR_FILE_PATH exists
-        # send_telegram_notification(f"Magma Bot STARTUP FAILED: Critical error flag {CRITICAL_ERROR_FILE_PATH} exists.", level="error")
+        # Check if TOKEN and CHAT_ID are available before trying to send a message
+        if TOKEN and CHAT_ID:
+            try:
+                # Need a temporary bot instance or ensure global 'bot' is initialized enough
+                # For simplicity, let's assume if we are here, basic config is loaded.
+                 send_telegram_notification(f"☠️ Magma Bot STARTUP FAILED: Critical error flag found at `{CRITICAL_ERROR_FILE_PATH}`. Manual intervention required.", level="error")
+            except Exception as e:
+                logging.error(f"Could not send startup critical error Telegram message: {e}")
     else:
         logging.info("Starting Magma Sale Process scheduler.")
-        send_telegram_notification("Magma Sale Process bot started and scheduler running.", level="info")
-        # Schedule the bot behavior to run every POLLING_INTERVAL_MINUTES
+        send_telegram_notification("🤖 Magma Sale Process Bot Started\nScheduler running. Listening for orders.", level="info", parse_mode="Markdown")
         schedule.every(POLLING_INTERVAL_MINUTES).minutes.do(execute_bot_behavior)
-
         # Start the Telegram bot polling in a separate thread
         logging.info("Starting Telegram bot poller thread.")
         threading.Thread(target=lambda: bot.polling(none_stop=True, interval=30), name="TelegramPoller").start()
