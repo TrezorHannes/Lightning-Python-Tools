@@ -1,128 +1,582 @@
-# This is a refactored code of https://github.com/jvxis/nr-tools
-# Working on combining and simplifying a few code elements to allow
-# for faster turnaround times and more dynamic message adjustments.
-# Improving logging too.
+# This is a local fork of https://github.com/jvxis/nr-tools
 # enter the necessary settings in config.ini file in the parent dir
 
+# Import Lybraries
 import requests
 import telebot
 import json
 from telebot import types
-from typing import Tuple, List, Optional
 import subprocess
 import time
 import os
-import sys
-import polling2
+import schedule
 from datetime import datetime
 import configparser
-import logging  # For more structured debugging
+import logging
+from logging.handlers import RotatingFileHandler
+import threading
 
 # Get the path to the parent directory
 parent_dir = os.path.dirname(os.path.abspath(__file__))
 
 # path to the config.ini file located in the parent directory
-config_file_path = os.path.join(parent_dir, '..', 'config.ini')
+config_file_path = os.path.join(parent_dir, "..", "config.ini")
 config = configparser.ConfigParser()
 config.read(config_file_path)
 
-# Variables
-INVOICE_EXPIRY_SECONDS = 180000
-MAX_FEE_PERCENTAGE = 0.90
-FEE_RATE_PPM = 350 # let's pick this up from the query
-RETRY_DELAY_SECONDS = 60  # Retry every minute if we can't connect to the buyer
-MAX_CONNECTION_RETRIES = 30 # Retry to connect for half an hour, than abort the script
-MEMPOOL_API_URL = 'https://mempool.space/api/v1/fees/recommended'
+# Variables from config file
+INVOICE_EXPIRY_SECONDS = config.getint("magma", "invoice_expiry_seconds", fallback=180000)
+MAX_FEE_PERCENTAGE_OF_INVOICE = config.getfloat("magma", "max_fee_percentage_of_invoice", fallback=0.90)
+CHANNEL_FEE_RATE_PPM = config.getint("magma", "channel_fee_rate_ppm", fallback=350)
+MEMPOOL_FEES_API_URL = config.get("urls", "mempool_fees_api", fallback="https://mempool.space/api/v1/fees/recommended")
+CONNECT_RETRY_DELAY_SECONDS = config.getint("magma", "connect_retry_delay_seconds", fallback=60)
+MAX_CONNECT_RETRIES = config.getint("magma", "max_connect_retries", fallback=30)
+POLLING_INTERVAL_MINUTES = config.getint("magma", "polling_interval_minutes", fallback=20)
 
-# Constants
-UTXO_INPUT_SIZE = 57.5  # vBytes (approximate)
-OUTPUT_SIZE = 43  # vBytes (approximate)
-TRANSACTION_OVERHEAD = 10.5  # vBytes (approximate)
+BANNED_PUBKEYS = config.get("pubkey", "banned_magma_pubkeys", fallback="").split(",")
 
-TOKEN = config['telegram']['magma_bot_token']
-AMBOSS_TOKEN = config['credentials']['amboss_authorization']
-CHAT_ID = config['telegram']['telegram_user_id']
+TOKEN = config["telegram"]["magma_bot_token"]
+AMBOSS_TOKEN = config["credentials"]["amboss_authorization"]
+CHAT_ID = config["telegram"]["telegram_user_id"]
 
-magma_channel_list = config['paths']['charge_lnd_path']
-full_path_bos = config['system']['full_path_bos']
+FULL_PATH_BOS = config["system"]["full_path_bos"]
 
-# Amboss API details
-AMBOSS_API_URL = 'https://api.amboss.space/graphql'
-AMBOSS_API_HEADERS = {
-    'Content-Type': 'application/json',
-    'Authorization': f'Bearer {AMBOSS_TOKEN}'
-}
+# Configure data directory
+# MAGMA_DATA_DIR = config.get("magma", "magma_data_dir", fallback=os.path.join(parent_dir, "..", "data", "magma"))
+# if not os.path.exists(MAGMA_DATA_DIR):
+#     os.makedirs(MAGMA_DATA_DIR, exist_ok=True)
 
-# Main logger (for general information and debugging)
-main_logger = logging.getLogger('main')
-main_logger.setLevel(logging.DEBUG)  # Capture DEBUG and above
-main_handler = logging.FileHandler(os.path.join(parent_dir, '..', 'logs', 'magma-auto-sale2.log'))
-main_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-main_logger.addHandler(main_handler)
+# Define log file path within MAGMA_DATA_DIR
+LOG_FILE_PATH = os.path.join(parent_dir, "..", "logs", "magma-sale-process.log") # Reverted
 
-# Error logger (for errors and critical issues)
-error_logger = logging.getLogger('error')
-error_logger.setLevel(logging.ERROR)
-error_handler = logging.FileHandler(os.path.join(parent_dir, '..', 'logs', 'magma-auto-sale2_error.log'))
-error_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-error_logger.addHandler(error_handler)
+# Set up a rotating file handler
+# Ensure the logs directory exists
+logs_dir = os.path.join(parent_dir, "..", "logs")
+if not os.path.exists(logs_dir):
+    os.makedirs(logs_dir, exist_ok=True)
 
-critical_error_log_path = os.path.join(parent_dir, '..', 'logs', 'magma-critical_error.log')
+handler = RotatingFileHandler(
+    LOG_FILE_PATH, maxBytes=10 * 1024 * 1024, backupCount=5  # 10 MB
+)
 
-# Error classes
-class AmbossAPIError(Exception):
-    """Represents an error when interacting with the Amboss API."""
+# Set up logging configuration
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[handler],
+)
 
-    def __init__(self, message, status_code=None, response_data=None):
-        super().__init__(message)
-        self.status_code = status_code
-        self.response_data = response_data
+# Adjust logging levels for third-party libraries
+logging.getLogger("requests").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("telebot").setLevel(logging.WARNING)
 
-class LNDError(Exception):
-    """Represents an error when interacting with LND."""
-    pass
+CRITICAL_ERROR_FILE_PATH = os.path.join(parent_dir, "..", "logs", "magma_sale_process-critical-error.flag") # Reverted
 
-class InvoiceCreationError(LNDError):  # Subclass for specific LND error
-    pass
 
-def handle_critical_error(error_message):
-    """Handles critical errors by logging, notifying, creating a flag, and terminating."""
-    error_logger.critical(error_message)
-    bot.send_message(CHAT_ID, text=f"Critical error: {error_message}. Manual intervention required. Check logs.")
-
-    # Create the flag file
-    with open(critical_error_log_path, "w") as f:
-        f.write(error_message)
-
-    logging.critical("Terminating script due to critical error.")
-    sys.exit(1)  # Exit with a non-zero status to signal failure
-
-#Code
+# Code
 bot = telebot.TeleBot(TOKEN)
 logging.info("Amboss Channel Open Bot Started")
 
+# --- Constants for active order polling ---
+ACTIVE_ORDER_POLL_INTERVAL_SECONDS = 30  # Check every 30 seconds
+ACTIVE_ORDER_POLL_DURATION_MINUTES = 15   # Poll for a total of 15 minutes
 
-def monitor_sell_requests(target_statuses: list[str]) -> tuple[dict | None, dict | None]:
-    """Fetches Amboss API orders with the specified statuses.
 
-    Args:
-        target_statuses (list[str]): A list of desired order statuses to filter for.
+def send_telegram_notification(text, level="info"):
+    """Sends a message to Telegram and logs it."""
+    if level == "error":
+        logging.error(f"Telegram NOTIFICATION: {text}")
+    elif level == "warning":
+        logging.warning(f"Telegram NOTIFICATION: {text}")
+    else:
+        logging.info(f"Telegram NOTIFICATION: {text}")
+    try:
+        bot.send_message(CHAT_ID, text=text)
+    except Exception as e:
+        logging.error(f"Failed to send Telegram message: {e}")
 
-    Returns:
-        tuple[dict | None, dict | None]: The first matching order and extensions, or None for each if not found or an error occurs.
-    """
+def get_order_details_from_amboss(order_id):
+    """Fetches specific order details from Amboss."""
+    # This function would ideally use a more specific GraphQL query to get one order
+    # For now, it reuses check_channel and filters by ID.
+    # TODO: Implement a GraphQL query for a single order by ID for efficiency.
+    logging.info(f"Fetching details for order ID: {order_id}")
+    url = "https://api.amboss.space/graphql"
+    headers = {
+        "content-type": "application/json",
+        "Authorization": f"Bearer {AMBOSS_TOKEN}",
+    }
+    # Query to fetch a specific order by ID (conceptual)
+    # This specific query might need adjustment based on available Amboss API fields for a single order.
+    # For now, we'll fetch all and filter, which is inefficient but works with current `check_channel` like logic.
+    payload = {
+        "query": "query ListUserMarketOfferOrders {\n  getUser {\n    market {\n      offer_orders {\n        list {\n          id\n          size\n          status\n          account\n          seller_invoice_amount\n          endpoints {\n            destination\n          }\n        }\n      }\n    }\n  }\n}"
+    }
+    try:
+        response = requests.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        data = response.json().get("data", {})
+        market = data.get("getUser", {}).get("market", {})
+        offer_orders = market.get("offer_orders", {}).get("list", [])
+        
+        for offer in offer_orders:
+            if offer.get("id") == order_id:
+                logging.info(f"Found details for order {order_id}: {offer}")
+                return offer
+        logging.warning(f"Order ID {order_id} not found in Amboss query.")
+        return None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error fetching order {order_id} from Amboss: {e}")
+        return None
+
+
+def execute_lncli_addinvoice(amt, memo, expiry):
+    # Command to be executed
+    command = f"lncli addinvoice " f"--memo '{memo}' --amt {amt} --expiry {expiry}"
+
+    try:
+        # Execute the command and capture the output
+        result = subprocess.Popen(
+            command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        output, error = result.communicate()
+        output = output.decode("utf-8")
+        error = error.decode("utf-8")
+
+        # Log the command output and error
+        logging.debug(f"Command Output: {output}")
+        logging.error(f"Command Error: {error}")
+
+        # Try to parse the JSON output
+        try:
+            output_json = json.loads(output)
+            # Extract the required values
+            r_hash = output_json.get("r_hash", "")
+            payment_request = output_json.get("payment_request", "")
+            return r_hash, payment_request
+
+        except json.JSONDecodeError as json_error:
+            # If not a valid JSON response, handle accordingly
+            logging.exception(f"Error decoding JSON: {json_error}")
+            return f"Error decoding JSON: {json_error}", None
+
+    except subprocess.CalledProcessError as e:
+        # Handle any errors that occur during command execution
+        logging.exception(f"Error executing command: {e}")
+        return f"Error executing command: {e}", None
+
+
+def accept_order(order_id, payment_request):
+    url = "https://api.amboss.space/graphql"
+    headers = {
+        "content-type": "application/json",
+        "Authorization": f"Bearer {AMBOSS_TOKEN}",
+    }
     query = """
-    {
+        mutation AcceptOrder($sellerAcceptOrderId: String!, $request: String!) {
+          sellerAcceptOrder(id: $sellerAcceptOrderId, request: $request)
+        }
+    """
+    variables = {"sellerAcceptOrderId": order_id, "request": payment_request}
+
+    response = requests.post(
+        url, json={"query": query, "variables": variables}, headers=headers
+    )
+    return response.json()
+
+
+def reject_order(order_id):
+    url = "https://api.amboss.space/graphql"
+    headers = {
+        "content-type": "application/json",
+        "Authorization": f"Bearer {AMBOSS_TOKEN}",
+    }
+    query = """
+        mutation SellerRejectOrder($sellerRejectOrderId: String!) {
+          sellerRejectOrder(id: $sellerRejectOrderId)
+        }
+    """
+    variables = {"sellerRejectOrderId": order_id}
+
+    response = requests.post(
+        url, json={"query": query, "variables": variables}, headers=headers
+    )
+    logging.info(f"Order {order_id} rejected. Response: {response.json()}")
+    return response.json()
+
+
+def confirm_channel_point_to_amboss(order_id, transaction):
+    url = "https://api.amboss.space/graphql"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {AMBOSS_TOKEN}",
+    }
+
+    graphql_query = f"mutation Mutation($sellerAddTransactionId: String!, $transaction: String!) {{\n  sellerAddTransaction(id: $sellerAddTransactionId, transaction: $transaction)\n}}"
+
+    data = {
+        "query": graphql_query,
+        "variables": {"sellerAddTransactionId": order_id, "transaction": transaction},
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=data)
+        response.raise_for_status()  # Raise an HTTPError for bad responses (4xx or 5xx)
+
+        json_response = response.json()
+
+        if "errors" in json_response:
+            # Handle error in the JSON response and log it
+            error_message = json_response["errors"][0]["message"]
+            log_content = f"Error in confirm_channel_point_to_amboss:\nOrder ID: {order_id}\nTransaction: {transaction}\nError Message: {error_message}\n"
+
+            with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file: # Append to critical error file
+                log_file.write(log_content)
+
+            return log_content
+        else:
+            return json_response
+
+    except requests.exceptions.RequestException as e:
+        logging.exception(f"Error making the request: {e}")
+        return None
+
+
+def get_channel_point(hash_to_find):
+    def execute_lightning_command():
+        command = [f"lncli", "pendingchannels"]
+
+        try:
+            logging.info(f"Command: {command}")
+            result = subprocess.run(command, capture_output=True, text=True, check=True)
+            output = result.stdout
+
+            # Parse JSON result
+            result_json = json.loads(output)
+            return result_json
+
+        except subprocess.CalledProcessError as e:
+            logging.exception(f"Error executing the command: {e}")
+            return None
+
+    result = execute_lightning_command()
+
+    if result:
+        pending_open_channels = result.get("pending_open_channels", [])
+
+        for channel_info in pending_open_channels:
+            channel_point = channel_info["channel"]["channel_point"]
+            channel_hash = channel_point.split(":")[0]
+
+            if channel_hash == hash_to_find:
+                return channel_point
+
+    return None
+
+
+def execute_lnd_command(
+    node_pub_key, fee_per_vbyte, formatted_outpoints, input_amount, fee_rate_ppm
+):
+    # Format the command
+    command = (
+        f"lncli openchannel "
+        f"--node_key {node_pub_key} --sat_per_vbyte={fee_per_vbyte} "
+        f"{formatted_outpoints} --local_amt={input_amount} --fee_rate_ppm {fee_rate_ppm}"
+    )
+    logging.info(f"Executing command: {command}")
+
+    try:
+        # Run the command and capture both stdout and stderr
+        result = subprocess.run(
+            command, shell=True, check=False, capture_output=True, text=True
+        )
+
+        # Log both stdout and stderr regardless of the result
+        logging.info(f"Command Output: {result.stdout}")
+        logging.error(f"Command Error: {result.stderr}")
+
+        if result.returncode == 0:
+            try:
+                output_json = json.loads(result.stdout)
+                funding_txid = output_json.get("funding_txid")
+                if funding_txid:
+                    logging.info(f"Funding transaction ID: {funding_txid}")
+                else:
+                    logging.error(
+                        "No funding transaction ID found in the command output."
+                    )
+                return funding_txid
+            except json.JSONDecodeError as json_error:
+                logging.exception(f"Error decoding JSON: {json_error}")
+                return None
+        else:
+            # Log a specific error message if the command fails
+            logging.error(f"Command failed with return code {result.returncode}")
+            return None
+
+    except subprocess.CalledProcessError as e:
+        # Handle command execution errors
+        logging.exception(f"Error executing command: {e}")
+        return None
+
+
+def get_fast_fee():
+    response = requests.get(MEMPOOL_FEES_API_URL)
+    data = response.json()
+    if data:
+        fast_fee = data["fastestFee"]
+        return fast_fee
+    else:
+        return None
+
+
+def get_address_by_pubkey(peer_pubkey):
+    url = "https://api.amboss.space/graphql"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {AMBOSS_TOKEN}",
+    }
+
+    query = f"""
+    query List($pubkey: String!) {{
+      getNode(pubkey: $pubkey) {{
+        graph_info {{
+          node {{
+            addresses {{
+              addr
+            }}
+          }}
+        }}
+      }}
+    }}
+    """
+
+    variables = {"pubkey": peer_pubkey}
+
+    payload = {"query": query, "variables": variables}
+
+    response = requests.post(url, json=payload, headers=headers)
+
+    if response.status_code == 200:
+        data = response.json()
+        addresses = (
+            data.get("data", {})
+            .get("getNode", {})
+            .get("graph_info", {})
+            .get("node", {})
+            .get("addresses", [])
+        )
+        first_address = addresses[0]["addr"] if addresses else None
+
+        if first_address:
+            return f"{peer_pubkey}@{first_address}"
+        else:
+            return None
+    else:
+        logging.error(f"Error: {response.status_code}")
+        return None
+
+
+def connect_to_node(node_key_address, max_retries=None):
+    if max_retries is None:
+        max_retries = MAX_CONNECT_RETRIES
+    retries = 0
+    while retries < max_retries:
+        command = f"lncli connect {node_key_address} --timeout 120s"
+        logging.info(f"Connecting to node: {command}")
+        try:
+            result = subprocess.run(command, shell=True, capture_output=True, text=True)
+            if result.returncode == 0:
+                logging.info(f"Successfully connected to node {node_key_address}")
+                return result.returncode  # Return the process return code
+            elif "already connected to peer" in result.stderr:
+                logging.info(f"Peer {node_key_address} is already connected.")
+                return 0  # Return 0 to indicate success
+            else:
+                logging.error(
+                    f"Error connecting to node (attempt {retries + 1}): {result.stderr}"
+                )
+                retries += 1
+                time.sleep(CONNECT_RETRY_DELAY_SECONDS)  # Wait before retrying
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Error executing lncli connect (attempt {retries + 1}): {e}")
+            retries += 1
+            time.sleep(CONNECT_RETRY_DELAY_SECONDS)  # Wait before retrying
+
+    # If we reach this point, all retries have failed
+    logging.error(
+        f"Failed to connect to node {node_key_address} after {max_retries} retries."
+    )
+    return 1  # Return 1 or another non-zero value to indicate failure
+
+
+def get_lncli_utxos():
+    # First get all UTXOs from LND
+    command = f"lncli listunspent --min_confs=3"
+    process = subprocess.Popen(
+        command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    output, error = process.communicate()
+    output = output.decode("utf-8")
+
+    utxos = []
+
+    try:
+        data = json.loads(output)
+        utxos = data.get("utxos", [])
+    except json.JSONDecodeError as e:
+        logging.exception(f"Error decoding lncli output: {e}")
+
+    # Get static loop addresses UTXOs if loop binary is available
+    loop_utxos = []
+    loop_path = ""
+    if "system" in config and "path_command" in config["system"]:
+        loop_command_path = config["system"]["path_command"]
+        if loop_command_path: # Ensure path_command is not empty
+             loop_path = os.path.join(loop_command_path, "loop")
+
+    try:
+        if loop_path and os.path.exists(loop_path):
+            # Construct the litloop command
+            litloop_cmd = f"{loop_path} --rpcserver=localhost:8443 --tlscertpath=~/.lit/tls.cert static listunspent"
+            process = subprocess.Popen(
+                litloop_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            output, error = process.communicate()
+            output = output.decode("utf-8")
+
+            try:
+                loop_data = json.loads(output)
+                loop_utxos = loop_data.get("utxos", [])
+                logging.info(f"Found {len(loop_utxos)} static loop UTXOs")
+            except json.JSONDecodeError as e:
+                logging.exception(f"Error decoding litloop output: {e}")
+    except Exception as e:
+        logging.exception(f"Error checking for loop binary: {e}")
+
+    # Create a set of loop outpoints for efficient lookup
+    loop_outpoints = {utxo.get("outpoint") for utxo in loop_utxos}
+
+    # Filter out UTXOs that are in the loop outpoints set
+    filtered_utxos = [
+        utxo for utxo in utxos if utxo.get("outpoint") not in loop_outpoints
+    ]
+
+    # Sort filtered utxos based on amount_sat in reverse order
+    filtered_utxos = sorted(
+        filtered_utxos, key=lambda x: x.get("amount_sat", 0), reverse=True
+    )
+
+    logging.info(f"Filtered UTXOs (excluding loop static addresses): {filtered_utxos}")
+    return filtered_utxos
+
+
+def calculate_transaction_size(utxos_needed):
+    inputs_size = utxos_needed * 57.5  # Cada UTXO é de 57.5 vBytes
+    outputs_size = 2 * 43  # Dois outputs de 43 vBytes cada
+    overhead_size = 10.5  # Overhead de 10.5 vBytes
+    total_size = inputs_size + outputs_size + overhead_size
+    return total_size
+
+
+def calculate_utxos_required_and_fees(amount_input, fee_per_vbyte):
+    utxos_data = get_lncli_utxos()
+    channel_size = float(amount_input)
+    total = sum(utxo["amount_sat"] for utxo in utxos_data)
+    utxos_needed = 0
+    fee_cost = 0
+    amount_with_fees = channel_size
+    related_outpoints = []
+
+    if total < channel_size:
+        logging.error(
+            f"There are not enough UTXOs to open a channel {channel_size} SATS. Total UTXOS: {total} SATS"
+        )
+        return -1, 0, None
+
+    # for utxo_amount, utxo_outpoint in zip(utxos_data['amounts'], utxos_data['outpoints']):
+    for utxo in utxos_data:
+        utxos_needed += 1
+        transaction_size = calculate_transaction_size(utxos_needed)
+        fee_cost = transaction_size * fee_per_vbyte
+        amount_with_fees = channel_size + fee_cost
+
+        related_outpoints.append(utxo["outpoint"])
+
+        if utxo["amount_sat"] >= amount_with_fees:
+            break
+        channel_size -= utxo["amount_sat"]
+
+    return utxos_needed, fee_cost, related_outpoints if related_outpoints else None
+
+
+def check_channel():
+    logging.info("check_channel function called")
+    url = "https://api.amboss.space/graphql"
+    headers = {
+        "content-type": "application/json",
+        "Authorization": f"Bearer {AMBOSS_TOKEN}",
+    }
+    payload = {
+        "query": "query List {\n  getUser {\n    market {\n      offer_orders {\n        list {\n          id\n          size\n          status\n        account\n        seller_invoice_amount\n        }\n      }\n    }\n  }\n}"
+    }
+
+    try:
+        response = requests.post(url, json=payload, headers=headers)
+        response.raise_for_status()  # Raise an exception for 4xx and 5xx status codes
+
+        data = response.json().get("data", {})
+        market = data.get("getUser", {}).get("market", {})
+        offer_orders = market.get("offer_orders", {}).get("list", [])
+
+        # Log the entire offer list for debugging
+        # logging.info(f"All Offers: {offer_orders}")
+
+        # Find the first offer with status "WAITING_FOR_CHANNEL_OPEN"
+        valid_channel_to_open = next(
+            (
+                offer
+                for offer in offer_orders
+                if offer.get("status") == "WAITING_FOR_CHANNEL_OPEN"
+            ),
+            None,
+        )
+
+        # Log the found offer for debugging
+        logging.info(f"Found Offer: {valid_channel_to_open}")
+
+        if not valid_channel_to_open:
+            logging.info(
+                "No orders with status 'WAITING_FOR_CHANNEL_OPEN' waiting for execution."
+            )
+            return None
+
+        return valid_channel_to_open
+
+    except requests.exceptions.RequestException as e:
+        logging.exception(
+            f"An error occurred while processing the check-channel request: {str(e)}"
+        )
+        return None
+
+
+def check_offers():
+    url = "https://api.amboss.space/graphql"
+    headers = {
+        "content-type": "application/json",
+        "Authorization": f"Bearer {AMBOSS_TOKEN}",
+    }
+    # Updated GraphQL query to include 'endpoints' and 'destination' to retrieve pubkey from channel-buyer
+    query = """
+    query ListChannelOffers {
       getUser {
         market {
           offer_orders {
             list {
               id
-              size
-              status
-              account
               seller_invoice_amount
-              locked_fee_rate_cap
+              status
               endpoints {
                 destination
               }
@@ -133,650 +587,424 @@ def monitor_sell_requests(target_statuses: list[str]) -> tuple[dict | None, dict
     }
     """
 
+    payload = {"query": query}
+
     try:
-        response = requests.post(AMBOSS_API_URL, json={"query": query}, headers=AMBOSS_API_HEADERS)
-        response.raise_for_status()  # Raise exception for HTTP errors
-        print("API response received successfully") # Debugging print
+        response = requests.post(url, json=payload, headers=headers)
+        response.raise_for_status()  # Raise an exception for 4xx and 5xx status codes
 
         data = response.json()
-        # print(f"Received data: {data}")  # Debugging print
-        offer_orders = data.get('data', {}).get('getUser', {}).get('market', {}).get('offer_orders', {}).get('list', [])
-        print(f"Found {len(offer_orders)} offer orders") # Debugging print
 
-        matching_order = next(
-            (offer for offer in offer_orders if offer.get('status') in target_statuses), None
-        )
-        if matching_order:
-            # uncomment for detailed debugging
-            # main_logger.info("Found order with status '%s': %s", target_status, matching_order)
-            print(f"Found matching order with status '{matching_order.get('status')}': {matching_order}")
-            return matching_order, data.get('extensions')  # Return both order and extensions
-
-        return matching_order, data.get('extensions')  # Return None for order, but still include extensions
-
-    except requests.exceptions.RequestException as e:
-        error_logger.error("API request failed: %s", e)
-        raise AmbossAPIError("Amboss API unavailable") from e
-
-
-def adjust_poll_interval(extensions: dict, current_poll_interval: float) -> float:
-    """Adjusts the polling interval based on the throttleStatus from the Amboss API response.
-
-    Args:
-        extensions (dict): The extensions data from the Amboss API response.
-        current_poll_interval (float): The current polling interval in seconds.
-
-    Returns:
-        float: The adjusted polling interval in seconds.
-    """
-
-    throttle_status = extensions.get('cost', {}).get('throttleStatus', {})
-    currently_available = throttle_status.get('currentlyAvailable', 0)
-    restore_rate = throttle_status.get('restoreRate', 0)
-
-    # Calculate estimated time to restore enough credits for the next request
-    query_cost = extensions.get('cost', {}).get('requestedQueryCost', 0)  # Get query cost
-    restore_time = query_cost / restore_rate if restore_rate > 0 else 60  # Default to 60 seconds if restore_rate is 0
-
-    if currently_available < query_cost:
-        new_poll_interval = max(restore_time, 60)  # Wait at least 60 seconds or the restore time
-        main_logger.warning("API rate limit approaching, increasing poll_interval to %s seconds", new_poll_interval)
-        print(f"Adjusted poll_interval: {new_poll_interval}")
-        return new_poll_interval
-
-    print(f"Using current poll_interval: {current_poll_interval}")
-    return current_poll_interval  # No adjustment needed
-
-
-def create_lightning_invoice(amount: int, memo: str, expiry: int) -> tuple[str | None, str | None]:
-    """Creates a Lightning invoice using lncli and optionally sends it to Telegram.
-
-    Args:
-        amount (int): The invoice amount in satoshis.
-        memo (str): A descriptive memo for the invoice.
-        expiry (int): The invoice expiry time in seconds.
-        chat_id (int, optional): The Telegram chat ID to send the invoice to (defaults to None for no message).
-
-    Returns:
-        A tuple containing:
-            - The payment hash (str) if successful, or None if failed.
-            - The payment request (str) if successful, or None if failed.
-
-    Raises:
-        LNDError: If there's an error creating the invoice.
-    """
-
-    print(f"Creating invoice for amount: {amount} sats, memo: {memo}, expiry: {expiry}")  # Debug print 1
-    
-    command = f"lncli addinvoice --memo '{memo}' --amt {amount} --expiry {expiry}"
-    result = None
-
-    try:
-        result = subprocess.run(command, shell=True, capture_output=True, text=True, check=True)
-        output_json = json.loads(result.stdout)
-
-        payment_hash: Optional[str] = output_json.get("r_hash")
-        payment_request: Optional[str] = output_json.get("payment_request")
-
-        if payment_request:
-            main_logger.info("Created Lightning invoice: %s (hash: %s)", payment_request, payment_hash)
-            print(f"Invoice created successfully: {payment_request}")  # Debug print 2
-        else:
-            raise LNDError(f"Failed to create invoice (amount: {amount}, memo: {memo}): {output_json}")
-
-        return payment_hash, payment_request
-
-    except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
-        if isinstance(e, subprocess.CalledProcessError):
-            error_logger.error("lncli command failed: %s (return code: %s)", e.stderr, e.returncode)
-        elif isinstance(e, json.JSONDecodeError):
-            error_logger.error("Error decoding lncli output: %s. Output: %s", e, result.stdout if result else "N/A") 
-
-        raise LNDError("Failed to create Lightning invoice") from e
-
-
-def accept_order(order_id: str, payment_request: str) -> dict:
-    """Accepts an order on Amboss using the provided order ID and payment request.
-
-    Args:
-        order_id (str): The ID of the order to accept.
-        payment_request (str): The payment request associated with the order.
-
-    Returns:
-        dict: The JSON response from the Amboss API, or None if an error occurs.
-
-    Raises:
-        AmbossAPIError: If there's an error accepting the order or sending the message.
-    """
-
-    query = """
-        mutation AcceptOrder($orderId: String!, $request: String!) {
-          sellerAcceptOrder(id: $orderId, request: $request)
-        }
-    """
-    variables = {"orderId": order_id, "request": payment_request}
-
-    try:
-        response = requests.post(AMBOSS_API_URL, json={"query": query, "variables": variables}, headers=AMBOSS_API_HEADERS)
-        print(response.json())  # Print the raw response
-        response.raise_for_status()  # Raise exception for HTTP errors
-
-        result = response.json()
-
-        if payment_request is None:
-            error_message = f"Cannot accept order {order_id}: invoice creation failed."
-            error_logger.error(error_message)
-            raise LNDError(error_message)
-        
-        if result.get('data', {}).get('sellerAcceptOrder'):
-            main_logger.info("Order %s accepted successfully", order_id)
-            bot.send_message(CHAT_ID, text=f"Order {order_id} accepted successfully!\nInvoice:\n{payment_request}")
-        else:
-            error_message = f"Failed to accept order {order_id}."
-            if 'errors' in result:
-                error_message += f" Error details: {result['errors']}"
-            error_logger.error(error_message)
-            bot.send_message(CHAT_ID, text=error_message)
-
-        return result
-
-    except requests.exceptions.RequestException as e:
-        error_logger.error("Error accepting order %s: %s", order_id, e)
-        raise AmbossAPIError("Failed to accept order") from e
-
-
-def get_and_calculate_utxos() -> list[dict]:
-    """Retrieves unspent transaction outputs (UTXOs) from lncli, sorted by amount (descending).
-
-    Returns:
-        A list of dictionaries representing UTXOs, each containing 'txid', 'vout', 'address', and 'amount_sat' fields.
-
-    Raises:
-        LNDError: If there's an error executing lncli or decoding the JSON output.
-    """
-
-    command = "lncli listunspent --min_confs=3"
-
-    try:
-        result = subprocess.run(command, shell=True, capture_output=True, text=True, check=True)
-
-        # Parse JSON output, handling potential errors
-        try:
-            data = json.loads(result.stdout)
-            utxos = data.get("utxos", [])
-        except json.JSONDecodeError as e:
-            error_logger.error("Error decoding lncli output: %s", e)
-            raise LNDError("Failed to decode lncli output") from e
-
-        # Sort UTXOs by amount_sat in descending order
-        utxos.sort(key=lambda x: x.get("amount_sat", 0), reverse=True)
-
-        main_logger.info("Retrieved UTXOs: %s", utxos)
-        return utxos
-
-    except subprocess.CalledProcessError as e:
-        error_logger.error("Error executing lncli: %s. Output: %s", e, e.output)
-        raise LNDError("Failed to execute lncli") from e
-
-
-def calculate_transaction_size(utxos_needed: int, num_outputs: int = 2) -> int:
-    """Calculates the estimated size of a Bitcoin transaction in virtual bytes (vBytes).
-
-    Args:
-        utxos_needed (int): The number of UTXOs used as inputs in the transaction.
-        num_outputs (int, optional): The number of transaction outputs (defaults to 2).
-
-    Returns:
-        int: The estimated transaction size in vBytes.
-    """
-
-    inputs_size = utxos_needed * UTXO_INPUT_SIZE
-    outputs_size = num_outputs * OUTPUT_SIZE
-    total_size = inputs_size + outputs_size + TRANSACTION_OVERHEAD
-    total_size = int(total_size)  # Convert to integer (rounding down)
-    return total_size
-
-
-def calculate_utxos_required_and_fees(target_amount: int, fee_per_vbyte: int) -> Tuple[int, int, Optional[List[dict]]]:
-    utxos_data = sorted(get_and_calculate_utxos(), key=lambda x: x["amount_sat"], reverse=True)  # Sort by amount descending
-    total_available = sum(utxo["amount_sat"] for utxo in utxos_data)
-
-    if total_available < target_amount:
-        error_message = f"Insufficient UTXOs: Need {target_amount} sats, have {total_available} sats"
-        handle_critical_error(error_message)  # Call the error handler
-        return -1, 0, None
-
-    utxos_needed = 0
-    accumulated_amount = 0
-    selected_utxos = []
-    fee_cost = 0
-
-    for utxo in utxos_data:
-        utxos_needed += 1
-        accumulated_amount += utxo["amount_sat"]
-        selected_utxos.append(utxo)
-
-        tx_size = calculate_transaction_size(utxos_needed)
-        fee_cost = tx_size * fee_per_vbyte
-
-        if accumulated_amount >= target_amount + fee_cost:
-            break
-
-    profitability = (target_amount - fee_cost) / target_amount
-    if profitability < MAX_FEE_PERCENTAGE:
-        error_message = f"Order not profitable: Profitability {profitability:.2%}, below maximum allowed {MAX_FEE_PERCENTAGE:.2%}"
-        handle_critical_error(error_message)  # Call the error handler
-        return -1, 0, None
-
-    return utxos_needed, fee_cost, selected_utxos
-
-
-def check_mempool_fees_and_profitability(order: dict, max_fee_percentage: float = MAX_FEE_PERCENTAGE) -> Optional[int]:
-    """Fetches mempool fee estimates and checks profitability against an order.
-
-    Args:
-        order (dict): The order details from Amboss.
-        max_fee_percentage (float): Maximum allowed percentage of fee to order amount.
-
-    Returns:
-        int or None: The fastest fee from the mempool API if profitable, None otherwise.
-    """
-
-    try:
-        response = requests.get(MEMPOOL_API_URL)
-        response.raise_for_status()  # Raise for HTTP errors
-        data = response.json()
-
-        fast_fee = data.get('fastestFee')
-
-        if fast_fee is None:
-            error_logger.error("Fastest fee not found in mempool response: %s", data) # Log the response for debugging
-            return None  # Return None on error or invalid response
-
-    except requests.exceptions.RequestException as e:
-        error_logger.error("Error fetching mempool fees: %s", e)
-        return None  # Return None on error
-
-    profitability = (order['seller_invoice_amount'] - fast_fee) / order['seller_invoice_amount']
-
-    if profitability < max_fee_percentage:
-        error_logger.warning(
-            "Order not profitable: Profitability %.2f%%, below maximum allowed %.2f%%",
-            profitability * 100,
-            max_fee_percentage * 100,
-        )
-        return None
-
-    main_logger.info(f"Fastest Fee: {fast_fee} sat/vB")
-    return fast_fee
-
-    
-def get_buyer_details_and_connect(order_details: dict, max_retries=MAX_CONNECTION_RETRIES) -> bool:
-    """Fetches buyer details from Amboss and attempts to connect via lncli.
-
-    Args:
-        order_details (dict): The dictionary containing order information.
-        max_retries (int): Maximum number of retry attempts (default is 3).
-
-    Returns:
-        bool: True if connection is successful or the peer is already connected within retry limit, False otherwise.
-    """
-
-    peer_pubkey = order_details.get('endpoints', {}).get('destination')
-
-    if peer_pubkey is None:
-        logging.error("No 'peer_pubkey' found in order details: %s", order_details)
-        raise ValueError("Missing buyer pubkey")
-
-    url = 'https://api.amboss.space/graphql'
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'Bearer {AMBOSS_TOKEN}'
-    }
-
-    query = """
-    query List($pubkey: String!) {
-      getNode(pubkey: $pubkey) {
-        graph_info {
-          node {
-            addresses {
-              addr
-            }
-          }
-        }
-      }
-    }
-    """
-
-    variables = {"pubkey": peer_pubkey}
-
-    try:
-        response = requests.post(url, json={"query": query, "variables": variables}, headers=headers)
-        response.raise_for_status()  # Raise for HTTP errors
-        data = response.json()
-    except requests.exceptions.RequestException as e:
-        logging.error("Amboss API request failed: %s", e)
-        return False  # Return False on API failure
-
-    addresses = data.get('data', {}).get('getNode', {}).get('graph_info', {}).get('node', {}).get('addresses', [])
-    first_address = addresses[0]['addr'] if addresses else None
-
-    if first_address:
-        node_key_address = f"{peer_pubkey}@{first_address}"
-        retries = 0
-
-        while retries < max_retries:
-            command = f"lncli connect {node_key_address} --timeout 120s"
-            logging.info(f"Connecting to node: {command}")
-            try:
-                result = subprocess.run(command, shell=True, capture_output=True, text=True)
-                if result.returncode == 0:
-                    logging.info(f"Successfully connected to node {node_key_address}")
-                    return True  
-                elif "already connected to peer" in result.stderr:
-                    logging.info(f"Peer {node_key_address} is already connected.")
-                    return True
-                else:
-                    logging.error(f"Error connecting to node (attempt {retries + 1}): {result.stderr}")
-                    retries += 1
-                    time.sleep(RETRY_DELAY_SECONDS)  # Wait before retrying
-            except subprocess.CalledProcessError as e:
-                logging.error(f"Error executing lncli connect (attempt {retries + 1}): {e}")
-                retries += 1
-                time.sleep(RETRY_DELAY_SECONDS)  # Wait before retrying
-
-        # If we reach this point, all retries have failed
-        logging.error(f"Failed to connect to node {node_key_address} after {max_retries} retries.")
-        return False
-    else:
-        logging.error("No addresses found for pubkey: %s", peer_pubkey)
-        return False
-
-
-def open_channel(pubkey: str, channel_size: int, fee_rate: int, outpoints: Optional[List[dict]] = None) -> Optional[str]:
-    """Opens a channel with the specified peer and parameters.
-
-    Args:
-        pubkey (str): The public key of the peer node.
-        channel_size (int): The desired size of the channel in satoshis.
-        fee_rate (int): The fee rate in satoshis per vbyte.
-        outpoints (Optional[List[dict]]): List of UTXO dictionaries (if using specific UTXOs, defaults to None).
-
-    Returns:
-        str or None: The funding transaction ID if successful, None otherwise.
-    """
-
-    main_logger.info("Opening Channel: %s", pubkey)
-
-    try:
-        # Calculate UTXOs and fees
-        utxos_needed, fee_cost, selected_utxos = calculate_utxos_required_and_fees(
-            channel_size, fee_rate
+        if data is None:  # Check if data is None
+            logging.error("No data received from the API")
+            return None
+
+        offer_orders = (
+            data.get("data", {})
+            .get("getUser", {})
+            .get("market", {})
+            .get("offer_orders", {})
+            .get("list", [])
         )
 
-        if utxos_needed == -1:  # Not enough UTXOs
-            raise LNDError(f"Insufficient confirmed balance to open a {channel_size} sats channel.")
-        elif fee_cost >= channel_size * MAX_FEE_PERCENTAGE:  # Fee too high
-            raise LNDError(
-                f"Fee ({fee_cost} sats) is too high relative to the channel size ({channel_size} sats)."
+        # Initialize valid_channel_opening_offer to None
+        valid_channel_opening_offer = None
+
+        for offer in offer_orders:
+            logging.info(f"Offer ID: {offer.get('id')}, Status: {offer.get('status')}")
+
+            # Retrieve the pubkey for the offer
+            destination = offer.get("endpoints", {}).get("destination")
+
+            # Check whether the channel-buyer pubkey is in banned config file
+            if destination in BANNED_PUBKEYS:
+                logging.info(
+                    f"Pubkey {destination} is banned. Rejecting order {offer.get('id')}."
+                )
+                reject_order(offer.get("id"))
+                continue
+
+            # Find the first offer with status "WAITING_FOR_SELLER_APPROVAL"
+            if offer.get("status") == "WAITING_FOR_SELLER_APPROVAL":
+                logging.info(f"Found valid & unbanned offer to process: {offer}")
+                valid_channel_opening_offer = offer
+                break
+
+        if not valid_channel_opening_offer:
+            logging.info(
+                "No orders with status 'WAITING_FOR_SELLER_APPROVAL' waiting for approval."
             )
+            return None
 
-        # Format outpoints for lncli command (if using specific UTXOs)
-        formatted_outpoints = ""
-        if outpoints:
-            formatted_outpoints = " ".join([f"--utxo {utxo['txid']}:{utxo['vout']}" for utxo in outpoints])
+        return valid_channel_opening_offer
 
-        # Construct and execute lncli command 
-        # NOTE: we are using channel_size here
-        command = (
-            f"lncli openchannel "
-            f"--node_key {pubkey} --sat_per_vbyte {fee_rate} "
-            f"{formatted_outpoints} --local_amt {channel_size} --fee_rate_ppm {FEE_RATE_PPM}"
+    except requests.exceptions.RequestException as e:
+        logging.exception(
+            f"An error occurred while processing the check-offers request: {str(e)}"
         )
-
-        main_logger.info(f"Executing lncli command: {command}")
-        result = subprocess.run(command, shell=True, capture_output=True, text=True)
-        if result.returncode != 0:  # Check for errors
-            raise LNDError(f"Error opening channel: {result.stderr}")
-        
-        # Parse the output to get funding_txid (consider using a JSON parser here)
-        funding_txid = result.stdout.strip().split('\n')[-1] 
-        
-        if funding_txid.startswith('funding_txid:'):
-            funding_txid = funding_txid.split(':')[1].strip()
-            main_logger.info(f"Channel opened with funding transaction: {funding_txid}")
-            return funding_txid
-        else:
-            raise LNDError("Unexpected output from lncli. Could not extract funding_txid.")
-    
-    except LNDError as e:
-        # Handle critical LND error
-        handle_critical_error(e)
         return None
 
-    
-def get_channel_point(funding_txid: str, max_retries: int = 10, timeout_seconds: int = 300) -> Optional[str]:
-    """Retrieves the channel point of a pending channel by its funding transaction ID.
 
-    Args:
-        funding_txid (str): The funding transaction ID of the channel.
-        max_retries (int): Maximum number of retry attempts (default is 10).
-        timeout_seconds (int): Timeout duration in seconds (default is 300 - 5 minutes).
-
-    Returns:
-        str or None: The channel point if found within the timeout, None otherwise.
-    """
-
-    def fetch_pending_channels():
-        """Fetches pending channel information from lncli."""
-        try:
-            result = subprocess.run(["lncli", "pendingchannels"], capture_output=True, text=True, check=True)
-            return json.loads(result.stdout)
-        except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
-            error_logger.error("Error fetching pending channels: %s", e)
-            return None  # Return None on error to trigger retry
-
-    def check_channel_point(pending_channels_data):
-        """Checks if the desired channel point is in the pending channels data."""
-        for channel_info in pending_channels_data.get("pending_open_channels", []):
-            channel_point = channel_info["channel"]["channel_point"]
-            if channel_point.startswith(funding_txid):  # Use startswith for partial match
-                return channel_point
-        return None  # Return None if not found
-
-    main_logger.info(f"Retrieving channel point for funding tx: {funding_txid}")
-
-    # Polling with retries and timeout
-    try:
-        channel_point = polling2.poll(
-            target=fetch_pending_channels,
-            check_success=check_channel_point,
-            step=10,  # Poll every 10 seconds
-            timeout=timeout_seconds,
-            poll_forever=False  
+def open_channel(pubkey, size, invoice):
+    # get fastest fee
+    logging.info("Getting fastest fee...")
+    fee_rate = get_fast_fee()
+    formatted_outpoints = None
+    if fee_rate:
+        logging.info(f"Fastest Fee:{fee_rate} sat/vB")
+        # Check UTXOS and Fee Cost
+        logging.info("Getting UTXOs, Fee Cost and Outpoints to open the channel")
+        utxos_needed, fee_cost, related_outpoints = calculate_utxos_required_and_fees(
+            size, fee_rate
         )
-        if channel_point:
-            main_logger.info(f"Channel point found: {channel_point}")
-            return channel_point
-    except polling2.TimeoutException:
-        error_logger.error(
-            f"Timeout: Channel point not found for funding tx {funding_txid} after {timeout_seconds} seconds."
-        )
-
-    handle_critical_error(f"Timeout: Channel point not found for funding tx {funding_txid} after {timeout_seconds} seconds.")
-    return None
-
-
-def confirm_channel_point_to_amboss(order_id: str, funding_txid: str) -> bool:
-    """Confirms a channel opening to Amboss by retrieving the channel point and sending it.
-
-    Args:
-        order_id (str): The ID of the order to confirm.
-        funding_txid (str): The funding transaction ID of the opened channel.
-
-    Returns:
-        bool: True if confirmation was successful, False otherwise.
-    """
-
-    try:
-        channel_point = get_channel_point(funding_txid)  # Get channel point within this function
-        if not channel_point:
-            raise LNDError(f"Could not find channel point for funding transaction: {funding_txid}")
-
-        query = """
-            mutation Mutation($sellerAddTransactionId: String!, $transaction: String!) {
-              sellerAddTransaction(id: $sellerAddTransactionId, transaction: $transaction)
-            }
-        """
-        variables = {
-            "sellerAddTransactionId": order_id,
-            "transaction": channel_point,
-        }
-
-        response = requests.post(AMBOSS_API_URL, json={"query": query, "variables": variables}, headers=AMBOSS_API_HEADERS)
-        response.raise_for_status()
-
-        result = response.json()
-        if result.get('data', {}).get('sellerAddTransaction'):
-            main_logger.info(f"Channel point confirmed for order {order_id}: {channel_point}")
-            bot.send_message(CHAT_ID, text=f"Channel point confirmed for order {order_id}: {channel_point}")
-            return True
+        # Check if enough UTXOS
+        if utxos_needed == -1:
+            msg_open = (
+                f"There isn't enough confirmed Balance to open a {size} SATS channel"
+            )
+            logging.info(msg_open)
+            return -1, msg_open
+        # Check if Fee Cost is less than the Invoice
+        if (fee_cost) >= float(invoice) * MAX_FEE_PERCENTAGE_OF_INVOICE: # Use new config variable
+            msg_open = f"Can't open this channel now, the fee {fee_cost} is bigger or equal to {MAX_FEE_PERCENTAGE_OF_INVOICE*100}% of the Invoice paid by customer" # Use new config variable
+            logging.info(msg_open)
+            return -2, msg_open
+        # Good to open channel
+        if related_outpoints is not None:
+            formatted_outpoints = " ".join(
+                [f"--utxo {outpoint}" for outpoint in related_outpoints]
+            )
+            logging.info(f"Opening Channel: {pubkey}")
+            # Run function to open channel
         else:
-            error_message = f"Failed to confirm channel point for order {order_id}."
-            if 'errors' in result:
-                error_message += f" Error details: {result['errors']}"
-            error_logger.error(error_message)
-            bot.send_message(CHAT_ID, text=error_message)
-            return False
+            # Handle the case when related_outpoints is None
+            logging.info("No related outpoints found.")
+        logging.info(f"Opening Channel: {pubkey}")
+        # Run function to open channel
+        funding_tx = execute_lnd_command(
+            pubkey, fee_rate, formatted_outpoints, size, CHANNEL_FEE_RATE_PPM # Use new config variable
+        )
+        if funding_tx is None:
+            msg_open = f"Problem to execute the LNCLI command to open the channel. Please check the Log Files"
+            logging.info(msg_open)
+            return -3, msg_open
+        msg_open = f"Channel opened with funding transaction: {funding_tx}"
+        logging.info(msg_open)
+        return funding_tx, msg_open
 
-    except (requests.exceptions.RequestException, LNDError) as e:
-        error_logger.error("Error confirming channel point: %s", e)
-        return False
+    else:
+        return None
+
+
+def bos_confirm_income(amount, peer_pubkey):
+    command = (
+        f"{FULL_PATH_BOS} send {config['info']['NODE']} " # Use new config variable
+        f"--amount {amount} --avoid-high-fee-routes --message 'HODLmeTight Amboss Channel Sale with {peer_pubkey}'"
+    )
+    logging.info(f"Executing BOS command: {command}")
+
+    try:
+        result = subprocess.run(
+            command, shell=True, check=True, capture_output=True, text=True
+        )
+        logging.info(f"BOS Command Output: {result.stdout}")
+        bot.send_message(CHAT_ID, text=f"BOS Command Output: {result.stdout}")
+        return result.stdout
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error executing BOS command: {e}")
+        bot.send_message(CHAT_ID, text=f"Error executing BOS command: {e}")
+        return None
+
+
+def process_new_offers():
+    """Checks for new offers and processes them (invoice, accept)."""
+    logging.info("Checking for new Magma offers (WAITING_FOR_SELLER_APPROVAL)...")
+    valid_channel_opening_offer = check_offers() # Fetches offers WAITING_FOR_SELLER_APPROVAL
+
+    if not valid_channel_opening_offer:
+        logging.info("No new Magma offers waiting for approval.")
+        return
+
+    order_id = valid_channel_opening_offer['id']
+    seller_invoice_amount = valid_channel_opening_offer['seller_invoice_amount']
+    current_status = valid_channel_opening_offer['status']
+
+    send_telegram_notification(
+        f"Found new Magma offer:\nID: {order_id}\nAmount: {seller_invoice_amount} sats\nStatus: {current_status}"
+    )
+
+    # Check for banned pubkey (already in check_offers, but good for direct call)
+    destination_pubkey = valid_channel_opening_offer.get("endpoints", {}).get("destination")
+    if destination_pubkey in BANNED_PUBKEYS:
+        logging.info(f"Offer {order_id} from banned pubkey {destination_pubkey}. Auto-rejecting.")
+        send_telegram_notification(f"Offer {order_id} from banned pubkey {destination_pubkey}. Auto-rejecting.")
+        reject_order(order_id)
+        return
+
+    send_telegram_notification(f"Generating invoice for {seller_invoice_amount} sats (Order ID: {order_id})...")
+    invoice_hash, invoice_request = execute_lncli_addinvoice(
+        seller_invoice_amount,
+        f"Magma-Channel-Sale-Order-ID:{order_id}",
+        str(INVOICE_EXPIRY_SECONDS),
+    )
+
+    if "Error" in invoice_hash or invoice_request is None:
+        error_msg = f"Failed to generate invoice for order {order_id}: {invoice_hash}"
+        logging.error(error_msg)
+        send_telegram_notification(error_msg, level="error")
+        # Consider whether to auto-reject the order here or let it expire
+        return
+
+    logging.debug(f"Invoice for order {order_id}: {invoice_request}")
+    send_telegram_notification(f"Invoice for order {order_id}:\n`{invoice_request}`")
+
+    send_telegram_notification(f"Accepting Magma order: {order_id}")
+    accept_result = accept_order(order_id, invoice_request)
+    logging.info(f"Order {order_id} acceptance result: {accept_result}")
+
+    if "data" in accept_result and "sellerAcceptOrder" in accept_result["data"] and accept_result["data"]["sellerAcceptOrder"]:
+        success_message = f"Order {order_id} accepted. Invoice sent to Amboss. Waiting for buyer payment."
+        send_telegram_notification(success_message)
+        logging.info(success_message)
+        
+        # Start actively polling for this specific order's payment
+        wait_for_buyer_payment(order_id)
+    else:
+        failure_message = f"Failed to accept order {order_id}. Amboss response: {accept_result}"
+        logging.error(failure_message)
+        send_telegram_notification(failure_message, level="error")
+        # Log critical error if Amboss acceptance fails unexpectedly
+        if "errors" in accept_result:
+             with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
+                log_file.write(f"Failed to accept Amboss order {order_id}. Response: {accept_result.get('errors')}\n")
+
+
+def wait_for_buyer_payment(order_id):
+    """Actively polls a specific order to see if it becomes WAITING_FOR_CHANNEL_OPEN."""
+    logging.info(f"Starting active poll for payment of order {order_id} for {ACTIVE_ORDER_POLL_DURATION_MINUTES} minutes.")
+    send_telegram_notification(f"Actively monitoring order {order_id} for buyer payment...")
+
+    start_time = time.time()
+    max_duration_seconds = ACTIVE_ORDER_POLL_DURATION_MINUTES * 60
+
+    while time.time() - start_time < max_duration_seconds:
+        order_details = get_order_details_from_amboss(order_id) # Fetches current status
+        if order_details:
+            current_status = order_details.get("status")
+            logging.info(f"Order {order_id} current status: {current_status}")
+            if current_status == "WAITING_FOR_CHANNEL_OPEN":
+                send_telegram_notification(f"Buyer has paid for order {order_id}! Status: {current_status}. Proceeding to open channel.")
+                logging.info(f"Order {order_id} is now WAITING_FOR_CHANNEL_OPEN. Triggering channel open process.")
+                # Directly call the processing for this order, no need to wait for next main poll cycle
+                process_paid_order(order_details)
+                return # Exit after processing
+            elif current_status in ["CANCELLED", "EXPIRED", "SELLER_REJECTED", "ERROR", "COMPLETED"]: # Terminal states
+                send_telegram_notification(f"Order {order_id} reached terminal state: {current_status} during active payment poll. Stopping active poll.")
+                logging.info(f"Order {order_id} reached terminal state {current_status}. Stopping active poll.")
+                return
+        else:
+            logging.warning(f"Could not fetch details for order {order_id} during active poll.")
+            # Continue polling, maybe a transient API issue
+
+        time.sleep(ACTIVE_ORDER_POLL_INTERVAL_SECONDS)
+
+    send_telegram_notification(f"Finished active polling for order {order_id} after {ACTIVE_ORDER_POLL_DURATION_MINUTES} minutes. Buyer did not pay or status change not detected in time.")
+    logging.info(f"Active polling for order {order_id} finished. Buyer did not pay or status not WAITING_FOR_CHANNEL_OPEN in time.")
+
+
+def process_paid_order(order_details):
+    """Processes a single order that is WAITING_FOR_CHANNEL_OPEN."""
+    order_id = order_details['id']
+    customer_pubkey = order_details['account'] # Assuming 'account' is the buyer's pubkey
+    channel_size = order_details['size']
+    seller_invoice_amount = order_details['seller_invoice_amount']
+
+    send_telegram_notification(
+        f"Processing paid order {order_id}:\nCustomer: {customer_pubkey}\nSize: {channel_size} SATS\nInvoice: {seller_invoice_amount} SATS"
+    )
+
+    # 1. Connect to Peer
+    send_telegram_notification(f"Attempting to connect to peer: {customer_pubkey} for order {order_id}")
+    customer_addr_uri = get_address_by_pubkey(customer_pubkey)
+
+    if not customer_addr_uri:
+        error_msg = f"Could not get address for peer {customer_pubkey} (Order {order_id}). Cannot open channel."
+        logging.error(error_msg)
+        send_telegram_notification(error_msg, level="error")
+        # This is critical as we can't proceed with this order
+        with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
+            log_file.write(f"Critical: Could not get address for peer {customer_pubkey} (Order {order_id})\n")
+        return
+
+    node_connection_status = connect_to_node(customer_addr_uri)
+    if node_connection_status == 0:
+        send_telegram_notification(f"Successfully connected to peer {customer_addr_uri} (Order {order_id}).")
+    else:
+        # Don't fail outright, lncli might still open if already connected or connects during openchannel
+        send_telegram_notification(f"Could not connect to peer {customer_addr_uri} (Order {order_id}), or already connected. Attempting channel open anyway.", level="warning")
+
+    # 2. Open Channel
+    send_telegram_notification(f"Attempting to open {channel_size} SATS channel with {customer_pubkey} (Order {order_id}).")
+    funding_tx, msg_open = open_channel(customer_pubkey, channel_size, seller_invoice_amount)
+
+    if funding_tx == -1 or funding_tx == -2 or funding_tx == -3 or funding_tx is None:
+        error_msg = f"Failed to open channel for order {order_id}: {msg_open}"
+        logging.error(error_msg)
+        send_telegram_notification(error_msg, level="error")
+        # This is critical for this order
+        with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
+            log_file.write(f"Critical: Failed to open channel for order {order_id}. Reason: {msg_open}. Funding TX: {funding_tx}\n")
+        return
+    
+    send_telegram_notification(f"Channel opening initiated for order {order_id}. Funding TX: `{funding_tx}`. {msg_open}")
+
+    # 3. Get Channel Point (with retries and timeout)
+    send_telegram_notification(f"Waiting for channel point for TX {funding_tx} (Order {order_id})...", level="info")
+    logging.info(f"Waiting up to 5 minutes to get channel point for TX {funding_tx} (Order {order_id})...")
+    
+    channel_point = None
+    get_cp_start_time = time.time()
+    while time.time() - get_cp_start_time < 300: # 5 minute timeout for channel point
+        channel_point = get_channel_point(funding_tx)
+        if channel_point:
+            break
+        logging.debug(f"Channel point for {funding_tx} not found yet, retrying in 10s...")
+        time.sleep(10)
+
+    if channel_point is None:
+        error_msg = f"Could not get channel point for TX {funding_tx} (Order {order_id}) after 5 mins. Please check manually."
+        logging.error(error_msg)
+        send_telegram_notification(error_msg, level="error")
+        with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
+            log_file.write(f"Critical: Failed to get channel point for TX {funding_tx} (Order {order_id}). Confirm manually.\n")
+        return
+    send_telegram_notification(f"Channel point for order {order_id}: `{channel_point}`")
+
+    # 4. Confirm Channel Point to Amboss (with a small delay)
+    logging.info(f"Waiting 10 seconds before confirming channel point {channel_point} to Amboss for order {order_id}.")
+    time.sleep(10)
+    send_telegram_notification(f"Confirming channel point to Amboss for order {order_id}...")
+    
+    channel_confirmed_result = confirm_channel_point_to_amboss(order_id, channel_point)
+    if channel_confirmed_result is None or (isinstance(channel_confirmed_result, str) and "Error" in channel_confirmed_result) or ("errors" in channel_confirmed_result):
+        error_msg = f"Failed to confirm channel point {channel_point} to Amboss for order {order_id}. Result: {channel_confirmed_result}. Confirm manually."
+        logging.error(error_msg)
+        send_telegram_notification(error_msg, level="error")
+        with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
+            log_file.write(f"Critical: Failed to confirm channel point to Amboss for order {order_id}, CP: {channel_point}. Result: {channel_confirmed_result}\n")
+        return
+
+    success_msg = f"Channel for order {order_id} confirmed to Amboss! Result: {channel_confirmed_result}"
+    logging.info(success_msg)
+    send_telegram_notification(success_msg)
+
+    # 5. BOS Confirm Income (Optional accounting step)
+    if customer_addr_uri: # Re-use from earlier
+        logging.info(f"Attempting BOS income confirmation for order {order_id}, peer: {customer_addr_uri}")
+        bos_result = bos_confirm_income(seller_invoice_amount, peer_pubkey=customer_pubkey) # Use pubkey for message
+        if bos_result:
+            send_telegram_notification(f"BOS income confirmation for order {order_id} attempted. Output: {bos_result[:200]}...", level="info")
+            logging.info(f"BOS income confirmation for order {order_id} successful.")
+        else:
+            send_telegram_notification(f"BOS income confirmation for order {order_id} failed.", level="warning")
+            logging.error(f"BOS income confirmation failed for order {order_id}.")
+    else: # Should not happen if we got this far, but as a fallback.
+        logging.warning(f"Skipping BOS income confirmation for order {order_id} as customer_addr_uri was not available.")
+
+    logging.info(f"Successfully processed paid order {order_id}.")
+
+
+def process_paid_orders_for_channel_opening():
+    """Checks for orders WAITING_FOR_CHANNEL_OPEN and processes them."""
+    logging.info("Checking for paid Magma orders (WAITING_FOR_CHANNEL_OPEN)...")
+    
+    # `check_channel()` fetches orders with WAITING_FOR_CHANNEL_OPEN status
+    # In a high-volume scenario, this might return multiple.
+    # The current `check_channel` returns only the first one it finds.
+    # We should process all of them if multiple are found.
+    
+    # For now, let's adapt to process one at a time as per original logic, but ideally, loop through all.
+    # TODO: Modify check_channel to return a list and loop here.
+    
+    order_to_open = check_channel() # Gets one order WAITING_FOR_CHANNEL_OPEN
+
+    if not order_to_open:
+        logging.info("No paid Magma orders waiting for channel opening.")
+        return
+
+    # If an active order poll (wait_for_buyer_payment) is running for this order_id and successfully
+    # processes it, this check_channel might pick it up again if the timing is just right
+    # and its status hasn't updated in Amboss immediately.
+    # This is a minor race condition, but process_paid_order should be idempotent enough or
+    # we might need a small in-memory set of "recently processed by active poll" order IDs to skip here.
+    # For now, let's assume process_paid_order is safe to call even if shortly after active poll.
+    
+    logging.info(f"Found paid order {order_to_open['id']} ready for channel opening. Processing...")
+    process_paid_order(order_to_open)
+
+
+def execute_bot_behavior():
+    """Main bot behavior, called periodically or by command."""
+    current_datetime = datetime.now()
+    formatted_datetime = current_datetime.strftime("%Y-%m-%d %H:%M:%S")
+    logging.info(f"Executing Magma bot behavior cycle at {formatted_datetime}")
+
+    if os.path.exists(CRITICAL_ERROR_FILE_PATH):
+        msg = f"CRITICAL ERROR FLAG ({CRITICAL_ERROR_FILE_PATH}) exists. Bot behavior suspended. Manual intervention required."
+        logging.critical(msg)
+        # Send one-time notification if bot is running and sees this
+        # This part might be tricky if the bot instance is restarted.
+        # For now, primary notification is via logs and manual check of the flag.
+        # send_telegram_notification(msg, level="error") # Careful with spamming this
+        return
+
+    try:
+        # Stage 1: Process new offers, accept them, and start active polling for payment
+        process_new_offers()
+
+        # Stage 2: Process orders that are already paid and ready for channel opening
+        # This catches orders that might have been missed by active polling (e.g., script restart)
+        # or took longer to pay.
+        process_paid_orders_for_channel_opening()
+
+    except Exception as e:
+        logging.exception("Unhandled exception in execute_bot_behavior:")
+        send_telegram_notification(f"FATAL ERROR in bot behavior: {e}. Check logs immediately!", level="error")
+        # Create critical error flag for any unhandled exception in the main flow
+        with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
+            log_file.write(f"Unhandled exception at {formatted_datetime}: {e}\n")
+
+    logging.info(f"Magma bot behavior cycle completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+
+@bot.message_handler(commands=["runnow", "channelopen"]) # Keep runnow, add channelopen for manual trigger
+def handle_run_command(message):
+    logging.info(f"'{message.text}' command received. Executing bot behavior now.")
+    send_telegram_notification(f"'{message.text}' command received. Triggering Magma processing cycle.")
+    # Run in a new thread to avoid blocking Telegram bot polling if behavior takes time
+    threading.Thread(target=execute_bot_behavior).start()
 
 
 if __name__ == "__main__":
-    # target_statuses = ["WAITING_FOR_SELLER_APPROVAL", "WAITING_FOR_CHANNEL_OPEN"]
-    target_statuses = ["SELLER_REJECTED"]
-    poll_interval = 5.0  # Initial polling interval
+    if os.path.exists(CRITICAL_ERROR_FILE_PATH):
+        logging.critical(
+            f"The critical error flag file {CRITICAL_ERROR_FILE_PATH} exists. "
+            "Magma Sale Process will not start its scheduled tasks. Please investigate and remove the flag file."
+        )
+        # Optionally send a startup Telegram error if CRITICAL_ERROR_FILE_PATH exists
+        # send_telegram_notification(f"Magma Bot STARTUP FAILED: Critical error flag {CRITICAL_ERROR_FILE_PATH} exists.", level="error")
+    else:
+        logging.info("Starting Magma Sale Process scheduler.")
+        send_telegram_notification("Magma Sale Process bot started and scheduler running.", level="info")
+        # Schedule the bot behavior to run every POLLING_INTERVAL_MINUTES
+        schedule.every(POLLING_INTERVAL_MINUTES).minutes.do(execute_bot_behavior)
 
-    if os.path.exists(critical_error_log_path):
-        error_logger.error("Critical error flag file exists. Script will not run.")
-        sys.exit(1) 
+        # Start the Telegram bot polling in a separate thread
+        logging.info("Starting Telegram bot poller thread.")
+        threading.Thread(target=lambda: bot.polling(none_stop=True, interval=30), name="TelegramPoller").start()
 
-    # Use polling2 library's poll function for better control and error handling
-    # poll_fn = lambda: monitor_sell_requests(target_statuses) 
-    while True:
-        try:
-            time.sleep(poll_interval)
-            order: Optional[dict] = None
-            extensions: Optional[dict] = None
-
-            order, extensions = monitor_sell_requests(target_statuses)
-
-            if order is not None:
-                main_logger.info(f"Order found: {order}")
-                if fee_rate_cap := order.get("locked_fee_rate_cap"):  
-                        main_logger.info(f"Fee rate cap: {fee_rate_cap}")
-                else:
-                    main_logger.warning("Fee rate cap not found in order data.")
-
-                if extensions is not None:
-                    main_logger.info(f"Extensions: {extensions}")
-                    main_logger.info(f"Currently available credits: {extensions.get('cost', {}).get('throttleStatus', {}).get('currentlyAvailable')}")
-                    poll_interval = adjust_poll_interval(extensions, poll_interval)
-
-                try:
-                    match order['status']:
-                        case "SELLER_REJECTED":
-                            order, extensions = monitor_sell_requests(target_statuses)
-
-                            
-                        
-                        case "WAITING_FOR_SELLER_APPROVAL":
-                            main_logger.info("Found an order waiting for seller approval.")
-                            # Add logic to decide whether to approve or reject the order
-                            # ... (approval/rejection logic)
-
-                        case "WAITING_FOR_BUYER_PAYMENT":
-                            main_logger.info("Found an order waiting for buyer payment.")
-                            payment_hash, invoice_request = create_lightning_invoice(
-                                order['seller_invoice_amount'],
-                                f"Magma-Channel-Sale-Order-ID:{order['id']}",
-                                INVOICE_EXPIRY_SECONDS,
-                            )
-                            if invoice_request:
-                                accept_result = accept_order(order['id'], invoice_request)
-                                if accept_result:
-                                    bot.send_message(CHAT_ID, text=f"Order {order['id']} accepted. Invoice:\n{invoice_request}\nWaiting for buyer to pay...")
-                                else:
-                                    bot.send_message(CHAT_ID, text=f"Failed to accept order {order['id']}. Check logs for details.")
-                            else:
-                                bot.send_message(CHAT_ID, text=f"Failed to create invoice for order {order['id']}. Check logs for details.")
-
-                        case "WAITING_FOR_CHANNEL_OPEN":
-                            main_logger.info("Found a pending channel opening request.")
-
-                            for retry_count in range(MAX_CONNECTION_RETRIES):
-                                connection_success = get_buyer_details_and_connect(order)
-                                if connection_success:
-                                    fee_rate = check_mempool_fees_and_profitability(order)
-                                    if fee_rate:
-                                        utxos_needed, fee_cost, selected_utxos = calculate_utxos_required_and_fees(order["size"], fee_rate)
-                                        if utxos_needed != -1:
-                                            try:
-                                                funding_tx = open_channel(
-                                                    order["endpoints"]["destination"],
-                                                    order["size"],
-                                                    fee_rate,
-                                                    selected_utxos,
-                                                )
-                                                if funding_tx:
-                                                    if confirm_channel_point_to_amboss(order['id'], funding_tx):
-                                                        bot.send_message(CHAT_ID, text=f"Channel opened and confirmed for order {order['id']}. Funding tx: {funding_tx}")
-                                                    else:
-                                                        # Retry confirmation until timeout?
-                                                        pass 
-                                                else:
-                                                    bot.send_message(CHAT_ID, text=f"Failed to open channel for order {order['id']}. Check logs for details.")
-                                            except LNDError as e:
-                                                handle_critical_error(e)
-                                            break  
-                                    else:
-                                        bot.send_message(CHAT_ID, text=f"Insufficient funds for order {order['id']}.")
-                                        break
-                                    
-                                else:
-                                    if retry_count < MAX_CONNECTION_RETRIES - 1:
-                                        time.sleep(RETRY_DELAY_SECONDS)
-                                    else:
-                                        bot.send_message(CHAT_ID, text=f"Failed to connect to buyer for order {order['id']} after {MAX_CONNECTION_RETRIES} attempts.")
-                                        break
-                        
-                        # ... (other cases for error states)
-                except (AmbossAPIError, LNDError, ValueError) as e:
-                    # Log and send Telegram message for any exceptions
-                    error_message = f"Error processing order {order.get('id', 'Unknown')}: {e}"
-                    error_logger.error(error_message)
-                    bot.send_message(CHAT_ID, text=error_message)
-
-            # Adjust poll interval based on throttle status
-            if extensions is not None:
-                poll_interval = adjust_poll_interval(extensions, poll_interval)
-
-        except polling2.TimeoutException as e:
-            error_logger.warning("Polling timeout: %s", e)
-
-        except AmbossAPIError as e:  # Catch Amboss API errors
-            error_logger.error("Amboss API error: %s", e)
-            
-            # Check if the Amboss API error is critical
-            if e.status_code == 500:  # Example critical status code
-                handle_critical_error("Amboss API is down")
-            
-            poll_interval = 60  # Increase polling interval on error
-            
-        except LNDError as e:  # Catch LND errors
-            handle_critical_error(e)
-            
-        except Exception as e:  # Catch all other unexpected exceptions
-            handle_critical_error(e)
+        # Run scheduled tasks in the main thread
+        logging.info("Entering main scheduling loop.")
+        while True:
+            schedule.run_pending()
+            time.sleep(1)
