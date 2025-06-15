@@ -45,15 +45,33 @@ full_path_bos = /usr/bin/bos
 BCK_SOURCE_PATH = /home/elements/.elements/liquidv1/wallets
 BCK_DEST_PATH = /mnt/backup/liquid
 path_command = /usr/local/bin/
+# Desired logging level for scripts. Options: DEBUG, INFO, WARNING, ERROR, CRITICAL
+log_level = INFO
 
 [urls]
 mempool_tx = https://mempool.space/tx/
 liquid_tx = https://liquid.network/tx/
+mempool_fees_api = https://mempool.space/api/v1/fees/recommended
 
 [parameters]
 fee_updated_hours_ago = 3
 capped_ceiling = 3100
 agg_liquidity_threshold = 10
+
+[magma]
+# Invoice expiry in seconds
+invoice_expiry_seconds = 180000
+# Maximum percentage of the invoice amount that can be consumed by on-chain fees for channel opening
+# e.g., 0.90 means 90% of the invoice can be fees.
+max_fee_percentage_of_invoice = 0.90
+# Default fee rate in parts per million for the new channel
+channel_fee_rate_ppm = 350
+# How long to wait in seconds before retrying to connect to a buyer's node
+connect_retry_delay_seconds = 60
+# Maximum number of times to retry connecting to a buyer's node
+max_connect_retries = 30
+# Polling interval in minutes to check for new orders
+polling_interval_minutes = 10
 
 ## LNBits Pocket Money Settings
 [LNBits]

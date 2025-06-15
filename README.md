@@ -15,7 +15,9 @@ Below is a list of available scripts and their primary functions. Scripts marked
 - `disabled_fee-accelerator.py`: [cronjob] LNDg's AutoFees feature increases fees based on incoming HTLCs. This script helps manage channels that LNDg might suggest disabling due to low outbound liquidity by automatically increasing their fees.
 
 **Magma (Amboss):**
-- `magma-auto-sale2.py`: [systemd service] Provides automated monitoring of channel sales on Amboss Magma. It handles order clearance, channel opening, fee management, and writes relevant information into LNDg notes.
+- 🆕 `magma-sale.py`: [systemd service] Provides automated monitoring of channel sales on Amboss Magma. It handles order clearance, channel opening, fee management, and writes relevant information into LNDg notes. Refactored and documented in `magma-sale.MD`.
+
+
 
 **Peerswap:**
 - `peerswap-lndg_push.py`: [command-line output, cronjob] Gathers information about your existing PeerSwap peers, including the sum of satoshis swapped and the number of swaps, and writes this data to the LNDg Dashboard and relevant Channel Cards.
