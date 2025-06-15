@@ -143,6 +143,31 @@ Create a systemd service file to manage the script.
     sudo systemctl restart magma-sale.service
     ```
 
+## Troubleshooting
+
+### Critical Error Flag Halts Bot
+
+The script uses a critical error flag file (`logs/magma_sale_process-critical-error.flag` relative to `WorkingDirectory`) to halt operations if a systemic or unrecoverable error occurs. This requires manual intervention.
+
+**Symptoms:**
+*   The bot sends a Telegram message like "☠️ Magma Bot STARTUP FAILED: Critical error flag found..."
+*   The `magma-sale.service` status or logs (via `journalctl -u magma-sale.service`) will indicate that the flag file exists and the bot has suspended operations.
+
+**Resolution:**
+1.  **Investigate the Logs:** Check the script's log file (`logs/magma-sale-process.log`) and the systemd journal (`journalctl -u magma-sale.service`) for details about the error that caused the flag to be created.
+2.  **Resolve the Underlying Issue:** Address the root cause of the error. This might involve code changes, configuration updates, or fixing external dependencies.
+3.  **Delete the Flag File:** Once the issue is believed to be resolved, manually delete the flag file.
+    ```bash
+    # Example, adjust path if your WorkingDirectory is different
+    rm /opt/lightning-tools/logs/magma_sale_process-critical-error.flag
+    # Or from within the WorkingDirectory:
+    # rm logs/magma_sale_process-critical-error.flag
+    ```
+4.  **Restart the Service:**
+    ```bash
+    sudo systemctl restart magma-sale.service
+    ```
+
 This setup provides a robust way to run your Magma auto-sale script using best practices for Python environments. Remember to adjust paths and usernames in the example service file to match your specific environment.
 
 ## Telegram Bot Setup

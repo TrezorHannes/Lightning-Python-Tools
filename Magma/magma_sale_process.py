@@ -18,8 +18,10 @@
 # - Confirms channel opening (channel point) back to Amboss.
 # - Provides detailed logging to a rotating log file (`logs/magma-sale-process.log`).
 # - Sends Telegram notifications for important events, successes, and errors.
-# - Uses a critical error flag file (`logs/magma_sale_process-critical-error.flag`) to halt
-#   operations if a systemic or unrecoverable error occurs, requiring manual intervention.
+# - Uses a critical error flag file (`logs/magma_sale_process-critical-error.flag` located in the
+#   `logs` directory relative to the script's parent directory) to halt
+#   operations if a systemic or unrecoverable error occurs. This flag must be manually
+#   deleted after investigating and resolving the underlying issue to allow the bot to resume.
 # - Supports a list of banned pubkeys to automatically reject offers from.
 # - (Optional) Attempts to record income via BOS `send` command after successful channel open.
 #
