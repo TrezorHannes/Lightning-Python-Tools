@@ -287,6 +287,59 @@ def get_node_alias(pubkey: str) -> str:
         logging.warning(f"No alias returned in getNodeAlias data for {pubkey}.")
         return "AliasNotFound"
 
+def get_node_extended_details(pubkey: str) -> dict:
+    """Fetches extended details for a given node pubkey from Amboss."""
+    if not pubkey:
+        return {} # Return empty dict if no pubkey
+
+    logging.info(f"Fetching extended details for pubkey: {pubkey}")
+    payload = {
+        "query": """
+            query GetNodeExtendedInfo($pubkey: String!) {
+              getNode(pubkey: $pubkey) {
+                # alias # Alias is already fetched by get_node_alias, or can be added if we consolidate
+                amboss {
+                  is_claimed
+                }
+                graph_info {
+                  channels {
+                    num_channels
+                    total_capacity
+                  }
+                }
+                socials {
+                  info {
+                    email
+                    nostr_username
+                    telegram
+                    twitter
+                    message
+                  }
+                  lightning_labs {
+                    terminal_web {
+                      position
+                    }
+                  }
+                  ln_plus {
+                    rankings {
+                      rank_name
+                    }
+                  }
+                }
+              }
+            }
+        """,
+        "variables": {"pubkey": pubkey}
+    }
+
+    data = _execute_amboss_graphql_request(payload, f"GetNodeExtendedInfo-{pubkey[:10]}")
+
+    if not data or not data.get("getNode"):
+        logging.warning(f"No extended details returned for pubkey {pubkey} from Amboss.")
+        return {} # Return empty dict on error or no data
+
+    return data.get("getNode") # Return the 'getNode' part of the data
+
 
 def execute_lncli_addinvoice(amt, memo, expiry):
     # Command to be executed
@@ -1183,20 +1236,80 @@ def process_new_offers():
     else:
         logging.warning(f"Could not determine destination pubkey for order {order_id} to fetch alias.")
 
+# Fetch extended buyer details
+    extended_details_parts = []
+    if destination_pubkey:
+        node_details = get_node_extended_details(destination_pubkey)
+        if node_details:
+            # Amboss specific
+            amboss_info = node_details.get("amboss")
+            if amboss_info and amboss_info.get("is_claimed") is not None:
+                extended_details_parts.append(f"Claimed: {'Yes' if amboss_info['is_claimed'] else 'No'}")
 
-    # Ask user for confirmation
+            # Graph Info
+            graph_info = node_details.get("graph_info")
+            if graph_info:
+                channels_info = graph_info.get("channels")
+                if channels_info:
+                    if channels_info.get("num_channels") is not None:
+                        extended_details_parts.append(f"Channels: {channels_info['num_channels']}")
+                    if channels_info.get("total_capacity"):
+                        try:
+                            capacity_sats = int(channels_info['total_capacity'])
+                            extended_details_parts.append(f"Capacity: {capacity_sats:,} sats")
+                        except ValueError:
+                            logging.warning(f"Could not parse total_capacity: {channels_info['total_capacity']}")
+
+
+            # Socials
+            socials = node_details.get("socials")
+            if socials:
+                social_info = socials.get("info")
+                if social_info:
+                    for key, label in [
+                        ("email", "Email"), ("nostr_username", "Nostr"),
+                        ("telegram", "Telegram"), ("twitter", "Twitter"),
+                        ("message", "Msg") # Keep "Msg" short
+                    ]:
+                        value = social_info.get(key)
+                        if value and str(value).strip(): # Ensure it's not None or empty string
+                            # Truncate long messages
+                            if key == "message" and len(str(value)) > 70:
+                                value_display = str(value)[:67] + "..."
+                            else:
+                                value_display = str(value)
+                            extended_details_parts.append(f"{label}: `{value_display}`")
+                
+                ll_info = socials.get("lightning_labs", {}).get("terminal_web")
+                if ll_info and ll_info.get("position") is not None:
+                    extended_details_parts.append(f"TermRank: {ll_info['position']}")
+                
+                lnplus_info = socials.get("ln_plus", {}).get("rankings")
+                if lnplus_info and lnplus_info.get("rank_name"):
+                    extended_details_parts.append(f"LN+Rank: {lnplus_info['rank_name']}")
+    
+    # Construct the prompt message
+    prompt_lines = [
+        f"🔔 New Magma Offer:",
+        f"ID: `{order_id}`",
+        f"💰 Amount: {seller_invoice_amount} sats",
+        f"👤 Buyer: `{buyer_alias}` ({destination_pubkey[:10]}...)",
+    ]
+
+    if extended_details_parts:
+        prompt_lines.append("Buyer Details:")
+        for part in extended_details_parts:
+            prompt_lines.append(f"  • {part}")
+    
+    prompt_lines.append(f"⏳ Please Approve/Reject within 5 min.")
+    prompt_message = "\n".join(prompt_lines)
+
+    # Define the inline keyboard markup
     markup = types.InlineKeyboardMarkup()
     approve_button = types.InlineKeyboardButton("✅ Approve Offer", callback_data=f"decide_order:approve:{order_id}")
     reject_button = types.InlineKeyboardButton("❌ Reject Offer", callback_data=f"decide_order:reject:{order_id}")
     markup.add(approve_button, reject_button)
-
-    prompt_message = (
-        f"🔔 New Magma Offer:\n"
-        f"ID: `{order_id}`\n"
-        f"💰 Amount: {seller_invoice_amount} sats\n"
-        f"👤 Buyer: `{buyer_alias}` ({destination_pubkey[:10]}...)\n"
-        f"⏳ Please Approve/Reject within 5 min."
-    )
+    
     sent_message = send_telegram_notification(prompt_message, reply_markup=markup, parse_mode="Markdown")
 
     if sent_message:
