@@ -254,17 +254,15 @@ def get_order_details_from_amboss(order_id):
 
 
 def get_node_alias(pubkey: str) -> str:
-    """Fetches the alias for a given node pubkey using the getNode query."""
+    """Fetches the alias for a given node pubkey using the getNodeAlias query."""
     if not pubkey:
         return "N/A"
     
     logging.info(f"Fetching alias for pubkey: {pubkey}")
     payload = {
         "query": """
-            query GetSingleNodeAlias($pubkey: String!) {
-              getNode(pubkey: $pubkey) {
-                alias
-              }
+            query GetNodeAlias($pubkey: String!) {
+              getNodeAlias(pubkey: $pubkey)
             }
         """,
         "variables": {"pubkey": pubkey}
@@ -275,16 +273,16 @@ def get_node_alias(pubkey: str) -> str:
     if not data:
         return "ErrorFetchingAlias" # Error already logged by helper
 
-    node_data = data.get("getNode")
-    if node_data:
-        alias = node_data.get("alias")
-        if alias is None or alias == "": # Handle empty alias string from Amboss as "N/A"
-            logging.info(f"Alias for {pubkey} is empty or null, returning 'N/A'.")
+    alias = data.get("getNodeAlias") # Direct access to alias from the specific query
+    if alias is not None:
+        if alias == "": # Handle empty alias string from Amboss as "N/A"
+            logging.info(f"Alias for {pubkey} is empty, returning 'N/A'.")
             return "N/A"
         logging.info(f"Alias for {pubkey}: {alias}")
         return alias
     else:
-        logging.warning(f"No node data returned for {pubkey} in getNode query.")
+        # This case implies 'getNodeAlias' field was null or missing, though data itself was present.
+        logging.warning(f"No alias returned in getNodeAlias data for {pubkey}.")
         return "AliasNotFound"
 
 
@@ -357,7 +355,7 @@ def accept_order(order_id, payment_request):
         "Authorization": f"Bearer {AMBOSS_TOKEN}",
     }
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=30) # Longer timeout for mutations
+        response = requests.post(url, json=payload, headers=headers, timeout=60) # Increased timeout
         response.raise_for_status()
         response_json = response.json()
         logging.info(f"Amboss sellerAcceptOrder response for {order_id}: {response_json}")
@@ -394,7 +392,7 @@ def reject_order(order_id):
         "Authorization": f"Bearer {AMBOSS_TOKEN}",
     }
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        response = requests.post(url, json=payload, headers=headers, timeout=60) # Increased timeout
         response.raise_for_status()
         response_json = response.json()
         logging.info(f"Amboss sellerRejectOrder response for {order_id}: {response_json}")
@@ -431,7 +429,7 @@ def confirm_channel_point_to_amboss(order_id, transaction):
         "Authorization": f"Bearer {AMBOSS_TOKEN}",
     }
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response = requests.post(url, headers=headers, json=payload, timeout=60) # Increased timeout
         response.raise_for_status()
         response_json = response.json()
         logging.info(f"Amboss sellerAddTransaction response for {order_id}: {response_json}")
@@ -948,11 +946,11 @@ def bos_confirm_income(amount, peer_pubkey):
             command, shell=True, check=True, capture_output=True, text=True
         )
         logging.info(f"BOS Command Output: {result.stdout}")
-        bot.send_message(CHAT_ID, text=f"BOS Command Output: {result.stdout}")
+        # bot.send_message(CHAT_ID, text=f"BOS Command Output: {result.stdout}") # Removed
         return result.stdout
     except subprocess.CalledProcessError as e:
         logging.error(f"Error executing BOS command: {e}")
-        bot.send_message(CHAT_ID, text=f"Error executing BOS command: {e}")
+        # bot.send_message(CHAT_ID, text=f"Error executing BOS command: {e}") # Removed
         return None
 
 
@@ -989,13 +987,27 @@ def _complete_offer_approval_process(order_id, order_details):
         logging.info(success_message)
         wait_for_buyer_payment(order_id) # Start active polling
     else:
-        errors = accept_result.get('errors', 'Unknown error')
-        failure_message = f"🔥 Failed to accept approved order `{order_id}` on Amboss. Response: {errors}"
+        errors_list = accept_result.get('errors', [])
+        error_message_detail = "Unknown error"
+        is_timeout_error = False
+
+        if errors_list and isinstance(errors_list, list) and len(errors_list) > 0:
+            first_error = errors_list[0]
+            if isinstance(first_error, dict):
+                error_message_detail = first_error.get('message', 'Unknown error structure in error list')
+                if "Timeout during Amboss API call" in error_message_detail:
+                    is_timeout_error = True
+        
+        failure_message = f"🔥 Failed to accept approved order `{order_id}` on Amboss. Details: `{error_message_detail}`"
         logging.error(failure_message)
         send_telegram_notification(failure_message, level="error", parse_mode="Markdown")
-        if "errors" in accept_result:
+
+        if not is_timeout_error and errors_list: # Create critical flag only if it's not a timeout but some other Amboss error
+            logging.warning(f"Creating critical error flag for order {order_id} due to non-timeout Amboss error during accept: {errors_list}")
             with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
-                log_file.write(f"Failed to accept Amboss order {order_id} after approval. Response: {accept_result.get('errors')}\n")
+                log_file.write(f"{datetime.now()}: Failed to accept Amboss order {order_id} after approval. Response: {errors_list}\n")
+        elif is_timeout_error:
+            logging.info(f"Order {order_id} acceptance timed out. Not creating critical error flag. Amboss may need to be checked manually for this order or it might be re-processed if applicable.")
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('decide_order:'))
@@ -1351,13 +1363,14 @@ def process_paid_order(order_details):
 
     # 5. BOS Confirm Income (Optional accounting step)
     if customer_addr_uri: 
-        logging.info(f"Attempting BOS income confirmation for order {order_id}, peer: {customer_addr_uri}")
+        logging.info(f"Attempting BOS income confirmation for order {order_id}, peer pubkey: {customer_pubkey}")
         bos_result = bos_confirm_income(seller_invoice_amount, peer_pubkey=customer_pubkey) 
         if bos_result:
-            send_telegram_notification(f"ℹ️ BOS income confirmation for order `{order_id}` attempted. Output: {bos_result[:150]}...", level="info", parse_mode="Markdown")
-            logging.info(f"BOS income confirmation for order {order_id} successful.")
+            # The full output is in the logs. Send a concise notification.
+            send_telegram_notification(f"✅ BOS income confirmation for order `{order_id}` initiated. Check logs for details.", level="info", parse_mode="Markdown")
+            logging.info(f"BOS income confirmation for order {order_id} processed. Full output in logs.")
         else:
-            send_telegram_notification(f"⚠️ BOS income confirmation for order `{order_id}` failed.", level="warning", parse_mode="Markdown")
+            send_telegram_notification(f"⚠️ BOS income confirmation for order `{order_id}` failed. Check logs.", level="warning", parse_mode="Markdown")
             logging.error(f"BOS income confirmation failed for order {order_id}.")
     else: 
         logging.warning(f"Skipping BOS income confirmation for order {order_id} as customer_addr_uri was not available.")
