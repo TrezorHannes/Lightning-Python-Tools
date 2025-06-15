@@ -1341,12 +1341,15 @@ def wait_for_buyer_payment(order_id):
             current_status = order_details.get("status")
             logging.info(f"Order {order_id} current status: {current_status}")
             if current_status == "WAITING_FOR_CHANNEL_OPEN":
-                send_telegram_notification(f"💰 Buyer paid for order `{order_id}`! Status: {current_status}.\nProceeding to open channel.", parse_mode="Markdown")
+                send_telegram_notification(
+                    f"💰 Buyer paid for order `{order_id}`! Status: `{current_status}`.\nProceeding to open channel.", 
+                    parse_mode="Markdown"
+                )
                 logging.info(f"Order {order_id} is now WAITING_FOR_CHANNEL_OPEN. Triggering channel open process.")
                 process_paid_order(order_details)
                 return 
             elif current_status in ["CANCELLED", "EXPIRED", "SELLER_REJECTED", "ERROR", "COMPLETED"]: 
-                send_telegram_notification(f"ℹ️ Order `{order_id}` is now {current_status}. Stopped active payment monitoring.", parse_mode="Markdown")
+                send_telegram_notification(f"ℹ️ Order `{order_id}` is now `{current_status}`. Stopped active payment monitoring.", parse_mode="Markdown")
                 logging.info(f"Order {order_id} reached terminal state {current_status}. Stopping active poll.")
                 return
         else:
@@ -1360,137 +1363,153 @@ def wait_for_buyer_payment(order_id):
 
 def process_paid_order(order_details):
     """Processes a single order that is WAITING_FOR_CHANNEL_OPEN."""
-    order_id = order_details['id']
-    customer_pubkey = order_details['account'] 
-    channel_size = order_details['size']
-    seller_invoice_amount = order_details['seller_invoice_amount']
-    
-    buyer_alias = get_node_alias(customer_pubkey)
+    order_id = "UNKNOWN_ORDER_ID" # Default for logging in case order_details is not as expected
+    try:
+        if not isinstance(order_details, dict):
+            logging.error(f"process_paid_order called with invalid order_details type: {type(order_details)}. Details: {order_details}")
+            send_telegram_notification("🔥 Critical internal error: Invalid data for processing paid order. Check logs.", level="error")
+            return
 
-    send_telegram_notification(
-        f"⚡️ Processing paid order `{order_id}`:\n"
-        f"👤 Buyer: `{buyer_alias}` ({customer_pubkey[:10]}...)\n"
-        f"📦 Size: {channel_size} sats\n"
-        f"🧾 Invoice: {seller_invoice_amount} sats",
-        parse_mode="Markdown"
-    )
+        order_id = order_details.get('id', 'MISSING_ID')
+        customer_pubkey = order_details.get('account')
+        channel_size_str = order_details.get('size')
+        seller_invoice_amount_str = order_details.get('seller_invoice_amount')
 
-    # 1. Connect to Peer
-    send_telegram_notification(f"🔗 Attempting to connect to peer `{buyer_alias}` ({customer_pubkey[:10]}...) for order `{order_id}`.", parse_mode="Markdown")
-    customer_addr_uri = get_address_by_pubkey(customer_pubkey)
-
-    if not customer_addr_uri:
-        error_msg = f"🔥 Could not get address for peer `{buyer_alias}` ({customer_pubkey[:10]}...) (Order `{order_id}`). Cannot open channel."
-        logging.error(error_msg)
-        send_telegram_notification(error_msg, level="error", parse_mode="Markdown")
-        with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
-            log_file.write(f"Critical: Could not get address for peer {customer_pubkey} (Order {order_id})\n")
-        return
-
-    node_connection_status, conn_error_msg = connect_to_node(customer_addr_uri) # Modified to return error message
-    if node_connection_status == 0:
-        send_telegram_notification(f"✅ Successfully connected to `{buyer_alias}` ({customer_addr_uri}).", parse_mode="Markdown")
-    else:
-        # conn_error_msg contains the detailed error from connect_to_node
-        tg_error_msg = (
-            f"⚠️ Could not connect to `{buyer_alias}` ({customer_addr_uri}) for order `{order_id}`.\n"
-            f"`lncli` error: `{conn_error_msg}`\n"
-            f"Will attempt channel open anyway."
-        )
-        send_telegram_notification(tg_error_msg, level="warning", parse_mode="Markdown")
-
-
-    # 2. Open Channel
-    send_telegram_notification(f"🛠️ Attempting to open {channel_size} sats channel with `{buyer_alias}` ({customer_pubkey[:10]}...) for order `{order_id}`.", parse_mode="Markdown")
-    # open_channel now returns (funding_tx_or_None, error_message_or_None)
-    # The second element (msg_open_or_error) will contain detailed lncli error if funding_tx is None
-    funding_tx, msg_open_or_error = open_channel(customer_pubkey, channel_size, seller_invoice_amount)
-
-
-    if funding_tx is None: # Indicates an error occurred
-        # msg_open_or_error now contains the detailed error from execute_lnd_command (via open_channel)
-        error_msg = f"🔥 Failed to open channel for order `{order_id}`.\n`lncli` error: `{msg_open_or_error}`"
-        logging.error(error_msg) 
-        send_telegram_notification(error_msg, level="error", parse_mode="Markdown")
-        # Do NOT create CRITICAL_ERROR_FILE_PATH here, this is an order-specific failure.
-        # Log to a separate file for critical ORDER issues if desired, or just rely on main log and Telegram.
-        # with open(CRITICAL_ORDER_FAILURES_LOG , "a") as log_file:
-        # log_file.write(f"Critical: Failed to open channel for order {order_id}. Reason: {msg_open_or_error}.\n")
-        return
-    
-    # If successful, msg_open_or_error is the success message
-    send_telegram_notification(f"✅ Channel opening initiated for order `{order_id}`.\nFunding TX: `{funding_tx}`\nDetails: {msg_open_or_error}", parse_mode="Markdown")
-
-    # 3. Get Channel Point (with retries and timeout)
-    send_telegram_notification(f"⏳ Waiting for channel point for TX `{funding_tx}` (Order `{order_id}`)...", level="info", parse_mode="Markdown")
-    logging.info(f"Waiting up to 5 minutes to get channel point for TX {funding_tx} (Order {order_id})...")
-    
-    channel_point = None
-    get_cp_start_time = time.time()
-    while time.time() - get_cp_start_time < 300: 
-        channel_point = get_channel_point(funding_tx)
-        if channel_point:
-            break  
-        logging.debug(f"Channel point for {funding_tx} not found yet, retrying in 10s...")
-        time.sleep(10)
-
-    if channel_point is None:
-        error_msg = f"🔥 Could not get channel point for TX `{funding_tx}` (Order `{order_id}`) after 5 mins. Please check manually."
-        logging.error(error_msg)
-        send_telegram_notification(error_msg, level="error", parse_mode="Markdown")
-        # Do NOT create CRITICAL_ERROR_FILE_PATH here. Manual check for this order.
-        return
-    send_telegram_notification(f"✅ Channel point for order `{order_id}`: `{channel_point}`", parse_mode="Markdown")
-
-    # 4. Confirm Channel Point to Amboss (with a small delay)
-    logging.info(f"Waiting 10 seconds before confirming channel point {channel_point} to Amboss for order {order_id}.")
-    time.sleep(10)
-    send_telegram_notification(f"📡 Confirming channel point to Amboss for order `{order_id}`...", parse_mode="Markdown")
-    
-    channel_confirmed_result = confirm_channel_point_to_amboss(order_id, channel_point)
-    # Check for various error indications in channel_confirmed_result
-    has_errors = False
-    if channel_confirmed_result is None: # This means _execute_amboss_graphql_request had a fundamental issue
-        has_errors = True
-        # Error message would have been logged by the helper or confirm_channel_point_to_amboss for specific Amboss GQL errors
-        # If confirm_channel_point_to_amboss returned None without specific errors, it means network/request level issue
-        if not (isinstance(channel_confirmed_result, dict) and "errors" in channel_confirmed_result) : # if not already an error dict
-             channel_confirmed_result = {"errors": [{"message": "Network/request level error during Amboss confirmation or helper returned None."}]}
-
-    elif isinstance(channel_confirmed_result, dict) and "errors" in channel_confirmed_result:
-        # This means Amboss returned a GraphQL error. confirm_channel_point_to_amboss handles CRITICAL_ERROR_FILE_PATH for these.
-        has_errors = True
+        if not all([order_id != 'MISSING_ID', customer_pubkey, channel_size_str, seller_invoice_amount_str]):
+            logging.error(f"Missing critical fields in order_details for order {order_id}: Pubkey={customer_pubkey}, Size={channel_size_str}, InvoiceAmount={seller_invoice_amount_str}")
+            send_telegram_notification(f"🔥 Critical internal error: Incomplete data for processing paid order `{order_id}`. Check logs.", level="error", parse_mode="Markdown")
+            return
         
-    if has_errors:
-        # The CRITICAL_ERROR_FILE_PATH is created by confirm_channel_point_to_amboss if Amboss returns a GQL error.
-        # For other errors (like timeout from the wrapper), we just notify and log.
-        err_detail = channel_confirmed_result.get("errors", [{"message": "Unknown confirmation failure"}])[0].get("message", "details unavailable")
-        error_msg = f"🔥 Failed to confirm channel point `{channel_point}` to Amboss for order `{order_id}`. Result: `{err_detail}`. Confirm manually."
-        logging.error(error_msg) # Full error already logged by confirm_channel_point_to_amboss or helper
-        send_telegram_notification(error_msg, level="error", parse_mode="Markdown")
-        # No CRITICAL_ERROR_FILE_PATH creation here unless confirm_channel_point_to_amboss did it for a direct Amboss API error.
-        return
+        # Ensure numeric types are correctly handled, Amboss provides strings.
+        try:
+            channel_size = int(channel_size_str)
+            seller_invoice_amount = int(seller_invoice_amount_str)
+        except ValueError as ve:
+            logging.error(f"Could not convert size or seller_invoice_amount to int for order {order_id}. Size='{channel_size_str}', Amount='{seller_invoice_amount_str}'. Error: {ve}")
+            send_telegram_notification(f"🔥 Error: Invalid numeric data (size/amount) for order `{order_id}`.", level="error", parse_mode="Markdown")
+            return
 
-    success_msg = f"✅ Channel for order `{order_id}` confirmed to Amboss!"
-    logging.info(f"{success_msg} Result: {channel_confirmed_result}") # Log full result
-    send_telegram_notification(success_msg, parse_mode="Markdown")
+        buyer_alias = get_node_alias(customer_pubkey)
 
+        send_telegram_notification(
+            f"⚡️ Processing paid order `{order_id}`:\n"
+            f"👤 Buyer: `{buyer_alias}` ({customer_pubkey[:10]}...)\n"
+            f"📦 Size: {channel_size:,} sats\n"
+            f"🧾 Invoice: {seller_invoice_amount:,} sats",
+            parse_mode="Markdown"
+        )
 
-    # 5. BOS Confirm Income (Optional accounting step)
-    if customer_addr_uri: 
-        logging.info(f"Attempting BOS income confirmation for order {order_id}, peer pubkey: {customer_pubkey}")
-        bos_result = bos_confirm_income(seller_invoice_amount, peer_pubkey=customer_pubkey) 
-        if bos_result:
-            # The full output is in the logs. Send a concise notification.
-            send_telegram_notification(f"✅ BOS income confirmation for order `{order_id}` initiated. Check logs for details.", level="info", parse_mode="Markdown")
-            logging.info(f"BOS income confirmation for order {order_id} processed. Full output in logs.")
+        # 1. Connect to Peer
+        send_telegram_notification(f"🔗 Attempting to connect to peer `{buyer_alias}` ({customer_pubkey[:10]}...) for order `{order_id}`.", parse_mode="Markdown")
+        customer_addr_uri = get_address_by_pubkey(customer_pubkey)
+
+        if not customer_addr_uri:
+            error_msg = f"🔥 Could not get address for peer `{buyer_alias}` ({customer_pubkey[:10]}...) (Order `{order_id}`). Cannot open channel."
+            logging.error(error_msg)
+            send_telegram_notification(error_msg, level="error", parse_mode="Markdown")
+            # Consider if CRITICAL_ERROR_FILE_PATH should be created here.
+            # For now, let's assume it's an order-specific issue unless it becomes persistent.
+            return
+
+        node_connection_status, conn_error_msg = connect_to_node(customer_addr_uri)
+        if node_connection_status == 0:
+            send_telegram_notification(f"✅ Successfully connected to `{buyer_alias}` ({customer_addr_uri}).", parse_mode="Markdown")
         else:
-            send_telegram_notification(f"⚠️ BOS income confirmation for order `{order_id}` failed. Check logs.", level="warning", parse_mode="Markdown")
-            logging.error(f"BOS income confirmation failed for order {order_id}.")
-    else: 
-        logging.warning(f"Skipping BOS income confirmation for order {order_id} as customer_addr_uri was not available.")
+            tg_error_msg = (
+                f"⚠️ Could not connect to `{buyer_alias}` ({customer_addr_uri}) for order `{order_id}`.\n"
+                f"`lncli` error: `{conn_error_msg}`\n"
+                f"Will attempt channel open anyway."
+            )
+            send_telegram_notification(tg_error_msg, level="warning", parse_mode="Markdown")
 
-    logging.info(f"Successfully processed paid order {order_id}.")
+        # 2. Open Channel
+        send_telegram_notification(f"🛠️ Attempting to open {channel_size:,} sats channel with `{buyer_alias}` ({customer_pubkey[:10]}...) for order `{order_id}`.", parse_mode="Markdown")
+        funding_tx, msg_open_or_error = open_channel(customer_pubkey, channel_size, seller_invoice_amount)
+
+        if funding_tx is None:
+            error_msg = f"🔥 Failed to open channel for order `{order_id}`.\n`lncli` error: `{msg_open_or_error}`"
+            logging.error(error_msg) 
+            send_telegram_notification(error_msg, level="error", parse_mode="Markdown")
+            return
+        
+        send_telegram_notification(
+            f"✅ Channel opening initiated for order `{order_id}`.\nFunding TX: `{funding_tx}`\nDetails: `{msg_open_or_error}`", 
+            parse_mode="Markdown"
+        )
+
+        # 3. Get Channel Point (with retries and timeout)
+        send_telegram_notification(f"⏳ Waiting for channel point for TX `{funding_tx}` (Order `{order_id}`)...", level="info", parse_mode="Markdown")
+        logging.info(f"Waiting up to 5 minutes to get channel point for TX {funding_tx} (Order {order_id})...")
+        
+        channel_point = None
+        get_cp_start_time = time.time()
+        while time.time() - get_cp_start_time < 300: 
+            channel_point = get_channel_point(funding_tx)
+            if channel_point:
+                break  
+            logging.debug(f"Channel point for {funding_tx} not found yet, retrying in 10s...")
+            time.sleep(10)
+
+        if channel_point is None:
+            error_msg = f"🔥 Could not get channel point for TX `{funding_tx}` (Order `{order_id}`) after 5 mins. Please check manually."
+            logging.error(error_msg)
+            send_telegram_notification(error_msg, level="error", parse_mode="Markdown")
+            return
+        send_telegram_notification(f"✅ Channel point for order `{order_id}`: `{channel_point}`", parse_mode="Markdown")
+
+        # 4. Confirm Channel Point to Amboss (with a small delay)
+        logging.info(f"Waiting 10 seconds before confirming channel point {channel_point} to Amboss for order {order_id}.")
+        time.sleep(10)
+        send_telegram_notification(f"📡 Confirming channel point to Amboss for order `{order_id}`...", parse_mode="Markdown")
+        
+        channel_confirmed_result = confirm_channel_point_to_amboss(order_id, channel_point)
+        has_errors = False
+        if channel_confirmed_result is None:
+            has_errors = True
+            if not (isinstance(channel_confirmed_result, dict) and "errors" in channel_confirmed_result):
+                 channel_confirmed_result = {"errors": [{"message": "Network/request level error during Amboss confirmation or helper returned None."}]}
+        elif isinstance(channel_confirmed_result, dict) and "errors" in channel_confirmed_result:
+            has_errors = True
+            
+        if has_errors:
+            err_detail = channel_confirmed_result.get("errors", [{"message": "Unknown confirmation failure"}])[0].get("message", "details unavailable")
+            error_msg = f"🔥 Failed to confirm channel point `{channel_point}` to Amboss for order `{order_id}`. Result: `{err_detail}`. Confirm manually."
+            logging.error(f"{error_msg} Full Amboss response: {channel_confirmed_result}")
+            send_telegram_notification(error_msg, level="error", parse_mode="Markdown")
+            return
+
+        success_msg = f"✅ Channel for order `{order_id}` confirmed to Amboss!"
+        logging.info(f"{success_msg} Result: {channel_confirmed_result}")
+        send_telegram_notification(success_msg, parse_mode="Markdown")
+
+        # 5. BOS Confirm Income (Optional accounting step)
+        if FULL_PATH_BOS and config.has_option('info', 'NODE') and config.get('info', 'NODE'): # Check if BOS configured
+            logging.info(f"Attempting BOS income confirmation for order {order_id}, peer pubkey: {customer_pubkey}")
+            bos_result = bos_confirm_income(seller_invoice_amount, peer_pubkey=customer_pubkey) 
+            if bos_result:
+                send_telegram_notification(f"✅ BOS income confirmation for order `{order_id}` initiated. Check logs for details.", level="info", parse_mode="Markdown")
+                logging.info(f"BOS income confirmation for order {order_id} processed. Full output in logs.")
+            else:
+                send_telegram_notification(f"⚠️ BOS income confirmation for order `{order_id}` failed. Check logs.", level="warning", parse_mode="Markdown")
+                logging.error(f"BOS income confirmation failed for order {order_id}.")
+        else: 
+            logging.info(f"Skipping BOS income confirmation for order {order_id} as BOS path or node info is not configured.")
+
+        logging.info(f"Successfully processed paid order {order_id}.")
+
+    except Exception as e:
+        # If order_id was not determinable early, use the default
+        logging.exception(f"Unhandled exception in process_paid_order for order_id '{order_id}':")
+        # Ensure order_id in message is the best effort
+        safe_order_id_msg = order_id if order_id not in ['UNKNOWN_ORDER_ID', 'MISSING_ID'] else 'an order'
+        send_telegram_notification(
+            f"🔥 Critical internal error processing paid order `{safe_order_id_msg}`. Check logs. Error: `{str(e)}`", 
+            level="error", 
+            parse_mode="Markdown"
+        )
+        # Do not create CRITICAL_ERROR_FILE_PATH here, let the main loop's catch-all handle systemic issues.
+        # This function should return to allow the bot to continue processing other tasks if possible.
+        return
 
 
 def process_paid_orders_for_channel_opening():
