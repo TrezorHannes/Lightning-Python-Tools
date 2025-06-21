@@ -556,7 +556,12 @@ def calculate_inbound_fee_discount_ppm(
 
 # Write to LNDg
 def update_lndg_fee(
-    chan_id, new_outgoing_fee_rate, new_inbound_fee_rate_ppm, channel_data, config
+    chan_id,
+    new_outgoing_fee_rate,
+    new_inbound_fee_rate_ppm,
+    channel_data,
+    config,
+    log_api_response=False,
 ):
     lndg_api_url = config["lndg"]["lndg_api_url"]
     username = config["credentials"]["lndg_username"]
@@ -588,16 +593,32 @@ def update_lndg_fee(
     }
 
     try:
+        # ADDED: Log the exact payload being sent
+        logging.debug(
+            f"{timestamp}: Sending LNDg fee update payload for {chan_id}: {json.dumps(fee_payload)}"
+        )
+
         response = requests.post(
             fee_update_url, json=fee_payload, auth=(username, password)
         )
-        response.raise_for_status()
+
+        if log_api_response:  # Only log verbose response if specifically requested
+            logging.debug(
+                f"{timestamp}: LNDg fee update response for {chan_id}: Status={response.status_code}, Text={response.text}"
+            )
+
+        response.raise_for_status()  # This will raise an exception for 4xx/5xx responses
         logging.info(
             f"{timestamp}: API confirmed changing outgoing fee to {new_outgoing_fee_rate} ppm "
             f"and inbound fee discount to {new_inbound_fee_rate_ppm} ppm for channel {chan_id}"
         )
     except requests.exceptions.RequestException as e:
         logging.error(f"Error updating LNDg fee policy for channel {chan_id}: {e}")
+        # If response was available but an error occurred, log its details
+        if hasattr(e, "response") and e.response is not None:
+            logging.error(
+                f"LNDg API Error Response Details: Status={e.response.status_code}, Text={e.response.text}"
+            )
         raise LNDGAPIError(f"Error updating LNDg fee policy for channel {chan_id}: {e}")
 
 
@@ -1252,6 +1273,7 @@ def main():
                             current_chan_calculated_inbound_ppm
                             - current_inbound_fee_on_channel
                         )
+
                         if inbound_fee_delta > fee_delta_threshold:
                             should_update_lndg_for_this_channel = True
 
@@ -1263,6 +1285,7 @@ def main():
                                 current_chan_calculated_inbound_ppm,
                                 channel_data,
                                 config,
+                                log_api_response=True,
                             )
                             updated_any_channel = True
                         except LNDGAPIError as api_err:
