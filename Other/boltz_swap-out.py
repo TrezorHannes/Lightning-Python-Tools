@@ -86,7 +86,11 @@ import requests  # Added for LNDg API calls
 import math
 import re
 import signal
+import logging
+from logging.handlers import RotatingFileHandler
 
+# --- Global Logger ---
+script_logger = logging.getLogger(__name__)
 
 # --- ANSI Color Codes ---
 class Colors:
@@ -99,6 +103,31 @@ class Colors:
     ENDC = "\033[0m"
     BOLD = "\033[1m"
     UNDERLINE = "\033[4m"
+
+
+def setup_logging():
+    """Sets up a rotating file logger."""
+    # Calculate log file path relative to the script's location
+    script_file_path = os.path.abspath(__file__)
+    project_root_dir = os.path.dirname(os.path.dirname(script_file_path))
+    logs_dir = os.path.join(project_root_dir, "logs")
+    if not os.path.exists(logs_dir):
+        os.makedirs(logs_dir, exist_ok=True)
+    
+    log_file_path = os.path.join(logs_dir, "boltz_swap-out.log")
+
+    handler = RotatingFileHandler(
+        log_file_path, maxBytes=10 * 1024 * 1024, backupCount=5  # 10 MB
+    )
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    handler.setFormatter(formatter)
+
+    script_logger.addHandler(handler)
+    script_logger.setLevel(logging.INFO) # Default to INFO, can be changed if needed
+
+    # Optionally, reduce verbosity of third-party libraries for the file log
+    logging.getLogger("requests").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
 def print_color(text, color_code, bold=False):
@@ -271,6 +300,7 @@ def parse_arguments():
 
     if args.debug:
         print("DEBUG MODE ENABLED: No actual transactions.")
+        script_logger.setLevel(logging.DEBUG) # More verbose logging in debug mode
     print(f"Swap Amount (LN): {args.amount} sats")
     print(f"Min Local Balance (candidates): {args.capacity} sats")
     print(f"Max Local Fee (LNDg candidates): {args.local_fee_limit} ppm")
@@ -304,9 +334,9 @@ def load_config(config_file_path):
     config = configparser.ConfigParser()
 
     if not os.path.exists(config_file_path):
-        print_color(
-            f"Error: Configuration file not found at {config_file_path}", Colors.FAIL
-        )
+        err_msg = f"Error: Configuration file not found at {config_file_path}"
+        print_color(err_msg, Colors.FAIL)
+        script_logger.error(err_msg)
         print_color(
             f"Please ensure the configuration file exists at the specified path: {config_file_path}",
             Colors.FAIL,
@@ -344,14 +374,18 @@ def load_config(config_file_path):
             app_config["lnd_macaroonpath"] = None
 
     except KeyError as e:
-        print_color(f"Error: Missing key {e} in config.ini.", Colors.FAIL)
+        err_msg = f"Error: Missing key {e} in config.ini."
+        print_color(err_msg, Colors.FAIL)
+        script_logger.error(err_msg)
         print_color(
             f"Please ensure your `config.ini` contains all required LNDg credentials, paths, and boltzd RPC details.",
             Colors.FAIL,
         )
         sys.exit(1)
     except configparser.NoSectionError as e:
-        print_color(f"Error: Missing section {e.section} in config.ini.", Colors.FAIL)
+        err_msg = f"Error: Missing section {e.section} in config.ini."
+        print_color(err_msg, Colors.FAIL)
+        script_logger.error(err_msg)
         print_color(
             "Please ensure your `config.ini` has [lndg], [credentials], and [paths] sections.",
             Colors.FAIL,
@@ -387,10 +421,13 @@ def run_command(
     )
 
     print_color(f"Executing: {string_to_print}", Colors.OKCYAN)
+    script_logger.debug(f"Executing command: {actual_command_str}")
+
 
     if debug:
         # The [DEBUG] {dry_run_output}: line should show the *actual* command
         print_color(f"[DEBUG] {dry_run_output}: {actual_command_str}", Colors.WARNING)
+        script_logger.debug(f"[DEBUG] Dry Run: {actual_command_str}")
         if expect_json:
             # Check for pscli lbtc-getaddress
             if "lbtc-getaddress" in command_parts and "pscli" in command_parts[0]:
@@ -449,28 +486,34 @@ def run_command(
         return_code = process.returncode
 
         if return_code in success_codes:
+            script_logger.debug(f"Command successful (exit code {return_code}): {actual_command_str}")
             if expect_json:
                 try:
                     return True, json.loads(stdout), ""
                 except json.JSONDecodeError as e:
+                    err_msg = f"Failed to decode JSON from command output: {e}\nOutput: {stdout}"
+                    script_logger.error(f"{err_msg} for command: {actual_command_str}")
                     return (
                         False,
                         stdout,
-                        f"Failed to decode JSON from command output: {e}\nOutput: {stdout}",
+                        err_msg,
                     )
             return True, stdout.strip(), ""
         else:
             error_msg = f"Command failed with exit code {return_code}.\nStderr: {stderr.strip()}\nStdout: {stdout.strip()}"
             print_color(error_msg, Colors.FAIL)
+            script_logger.error(f"{error_msg} for command: {actual_command_str}")
             return False, stdout.strip(), stderr.strip()
 
     except FileNotFoundError:
         error_msg = f"Error: Command not found: {command_parts[0]}. Please check the path in your config.ini."
         print_color(error_msg, Colors.FAIL)
+        script_logger.error(error_msg)
         return False, "", error_msg
     except subprocess.TimeoutExpired:
         error_msg = f"Command timed out after {timeout} seconds: {actual_command_str}"
         print_color(error_msg, Colors.FAIL)
+        script_logger.warning(error_msg)
         if process.poll() is None:  # Check if process is still running
             if attempt_graceful_terminate_on_timeout:
                 print_color(
@@ -505,11 +548,12 @@ def run_command(
                 error_msg += (
                     f"\nProcess terminated. Error getting additional output: {e}"
                 )
-
+        script_logger.error(f"Command timeout details: {error_msg}")
         return False, "", error_msg
     except Exception as e:
         error_msg = f"An unexpected error occurred while running command: {actual_command_str}\nError: {e}"
         print_color(error_msg, Colors.FAIL)
+        script_logger.exception(f"Unexpected error running command: {actual_command_str}")
         return False, "", error_msg
 
 
@@ -524,9 +568,11 @@ def get_lbtc_address(pscli_path, debug):
     if success and isinstance(output, dict) and "address" in output:
         address = output["address"]
         print_color(f"Successfully fetched L-BTC address: {address}", Colors.OKGREEN)
+        script_logger.info(f"Fetched L-BTC address: {address}")
         return address
     else:
         print_color("Failed to get L-BTC address.", Colors.FAIL)
+        script_logger.error(f"Failed to get L-BTC address. Error: {error}, Output: {output}")
         if error:
             print_color(f"Error details: {error}", Colors.FAIL)
         if isinstance(output, str) and output:
@@ -564,6 +610,7 @@ def get_swap_candidate_channels(
             "[DEBUG] Skipping LNDg API call in debug mode. Using mock channel data.",
             Colors.WARNING,
         )
+        script_logger.debug("Using mock channel data for LNDg.")
         # Returning richer mock data
         return [
             {
@@ -649,31 +696,41 @@ def get_swap_candidate_channels(
                     "No suitable swap candidate channels found based on individual criteria.",
                     Colors.WARNING,
                 )
+                script_logger.warning("No suitable swap candidate channels found via LNDg.")
             else:
                 print_color(
                     f"Found {len(candidate_channels_info)} candidate channels (sorted by local balance).",
                     Colors.OKGREEN,
                 )
+                script_logger.info(f"Found {len(candidate_channels_info)} LNDg candidate channels.")
         else:
             print_color("LNDg API response missing 'results'.", Colors.FAIL)
+            script_logger.error(f"LNDg API response missing 'results'. Response: {data}")
             print_color(f"Response: {data}", Colors.FAIL)
     except requests.exceptions.Timeout:
-        print_color(f"Timeout connecting to LNDg API at {api_url}", Colors.FAIL)
+        err_msg = f"Timeout connecting to LNDg API at {api_url}"
+        print_color(err_msg, Colors.FAIL)
+        script_logger.error(err_msg)
     except requests.exceptions.HTTPError as e:
-        print_color(f"HTTP error connecting to LNDg API: {e}", Colors.FAIL)
+        err_msg = f"HTTP error connecting to LNDg API: {e}"
+        print_color(err_msg, Colors.FAIL)
         if e.response is not None:
             print_color(f"Response content: {e.response.text}", Colors.FAIL)
+            script_logger.error(f"{err_msg}. Response: {e.response.text}")
+        else:
+            script_logger.error(err_msg)
     except requests.exceptions.RequestException as e:
-        print_color(f"Error connecting to LNDg API: {e}", Colors.FAIL)
+        err_msg = f"Error connecting to LNDg API: {e}"
+        print_color(err_msg, Colors.FAIL)
+        script_logger.error(err_msg)
     except json.JSONDecodeError:
-        print_color(
-            f"Error decoding JSON from LNDg API response: {response.text if 'response' in locals() else 'N/A'}",
-            Colors.FAIL,
-        )
+        err_msg = f"Error decoding JSON from LNDg API response: {response.text if 'response' in locals() else 'N/A'}"
+        print_color(err_msg, Colors.FAIL)
+        script_logger.error(err_msg)
     except Exception as e:
-        print_color(
-            f"An unexpected error occurred while fetching channels: {e}", Colors.FAIL
-        )
+        err_msg = f"An unexpected error occurred while fetching channels: {e}"
+        print_color(err_msg, Colors.FAIL)
+        script_logger.exception(err_msg)
     return candidate_channels_info
 
 
@@ -727,19 +784,19 @@ def create_boltz_swap(
         timeout_block = output.get("timeoutBlockHeight")
 
         if not invoice:
-            print_color(
-                "Boltz response missing 'invoice'. Cannot proceed.", Colors.FAIL
-            )
+            err_msg = "Boltz response missing 'invoice'. Cannot proceed."
+            print_color(err_msg, Colors.FAIL)
+            script_logger.error(f"{err_msg} Full Boltz response: {json.dumps(output, indent=2)}")
             print_color(f"Full response: {json.dumps(output, indent=2)}", Colors.FAIL)
             return None, None, output
         if not swap_id:
-            print_color(
-                "Warning: Boltz response missing 'id'. Using 'unknown_swap_id'.",
-                Colors.WARNING,
-            )
+            warn_msg = "Warning: Boltz response missing 'id'. Using 'unknown_swap_id'."
+            print_color(warn_msg, Colors.WARNING)
+            script_logger.warning(warn_msg)
             swap_id = "unknown_swap_id"
 
         print_color(f"Boltz reverse swap created successfully!", Colors.OKGREEN)
+        script_logger.info(f"Boltz reverse swap created. ID: {swap_id}, Amount: {swap_amount_sats}, L-BTC Dest: {lbtc_address}, Invoice: {invoice[:40]}...")
         print_color(f"  Swap ID: {swap_id}", Colors.OKGREEN)
         print_color(
             f"  Lightning Invoice (to pay Boltz): {invoice[:40]}...{invoice[-40:]}",
@@ -758,7 +815,9 @@ def create_boltz_swap(
             print_color(f"  Swap Timeout Block Height: {timeout_block}", Colors.OKGREEN)
         return swap_id, invoice, output
     else:
-        print_color("Failed to create Boltz reverse swap.", Colors.FAIL)
+        err_msg = "Failed to create Boltz reverse swap."
+        print_color(err_msg, Colors.FAIL)
+        script_logger.error(f"{err_msg} Error: {error}, Output: {json.dumps(output, indent=2) if isinstance(output, dict) else output}")
         if error:
             print_color(f"Error details: {error}", Colors.FAIL)
         if isinstance(output, str) and output:
@@ -815,26 +874,31 @@ def pay_lightning_invoice(
     decoded_invoice = decode_payreq(config, args, invoice_str)
     if not decoded_invoice:
         print_color("Failed to decode Boltz invoice, cannot proceed.", Colors.FAIL)
-        return False
+        script_logger.error(f"Failed to decode Boltz invoice: {invoice_str[:40]}...")
+        return False, None # Return payment_preimage as None
 
     invoice_destination_pubkey = decoded_invoice.get("destination")
-    payment_hash = decoded_invoice.get("payment_hash")  # <--- Get payment hash here
-    if (
-        not invoice_destination_pubkey or not payment_hash
-    ):  # <--- Add check for payment_hash
+    payment_hash = decoded_invoice.get("payment_hash")
+    payment_preimage = None # Initialize
+
+    if not invoice_destination_pubkey or not payment_hash:
         print_color(
             "Decoded invoice missing destination pubkey or payment hash.", Colors.FAIL
         )
-        return False
+        script_logger.error(f"Decoded invoice {invoice_str[:40]}... missing destination or payment_hash. Decoded: {decoded_invoice}")
+        return False, None
     print_color(
         f"Invoice destination for QueryRoutes: {invoice_destination_pubkey}",
         Colors.OKCYAN,
     )
     print_color(f"Payment hash for tracking: {payment_hash}", Colors.OKCYAN)
+    script_logger.info(f"Attempting payment for hash: {payment_hash}, destination: {invoice_destination_pubkey}")
+
 
     if not candidate_channels_info:
         print_color("No candidate channels for payment. Aborting.", Colors.FAIL)
-        return False
+        script_logger.warning("No candidate channels for LN payment.")
+        return False, None
 
     swap_amount_sats = args.amount
     min_chunk = max(1, swap_amount_sats // max(1, len(candidate_channels_info)))
@@ -1009,12 +1073,15 @@ def pay_lightning_invoice(
                 "No more candidate channels available to form any payment batch.",
                 Colors.FAIL,
             )
-            return False
+            script_logger.warning("No more candidate channels to form a payment batch for LN payment.")
+            return False, None
 
         print_color(
             f"Formed batch with {len(selected_channels)} channels, total probed liquidity: {current_batch_accumulated_liquidity} sats.",
             Colors.OKCYAN,
         )
+        script_logger.info(f"Formed payment batch with {len(selected_channels)} channels, liquidity: {current_batch_accumulated_liquidity} sats.")
+
 
         # --- Inner loop for payment attempts and enrichment of the current primary batch ---
         while True:
@@ -1024,6 +1091,7 @@ def pay_lightning_invoice(
                 print_color(
                     "Error: Inner loop started with no selected channels.", Colors.FAIL
                 )
+                script_logger.error("Pay_lightning_invoice: Inner loop started with no selected channels.")
                 break  # Break inner to re-evaluate in outer
 
             outgoing_chan_ids = [ch["id"] for ch in selected_channels]
@@ -1043,9 +1111,11 @@ def pay_lightning_invoice(
                     lncli_timeout_val = int(args.payment_timeout)
             except ValueError:
                 print_color(
-                    f"Invalid payment timeout format: {args.payment_timeout}",
+                    f"Invalid payment timeout format: {args.payment_timeout}. Using default {lncli_timeout_val}s.",
                     Colors.WARNING,
                 )
+                script_logger.warning(f"Invalid payment timeout format: {args.payment_timeout}. Using default {lncli_timeout_val}s.")
+
 
             script_subprocess_timeout = (
                 lncli_timeout_val + SUBPROCESS_TIMEOUT_BUFFER_SECONDS
@@ -1055,8 +1125,10 @@ def pay_lightning_invoice(
                 f"\nAttempting payment with {len(outgoing_chan_ids)} channels (batch liquidity {current_batch_accumulated_liquidity} sats): {', '.join(outgoing_chan_ids)}",
                 Colors.OKBLUE,
             )
+            script_logger.info(f"Attempting LN payment via channels: {', '.join(outgoing_chan_ids)}")
 
-            command_success, output, error_stderr = run_command(
+
+            payinvoice_success, payinvoice_output_json, payinvoice_error_stderr = run_command(
                 actual_command_list,
                 timeout=script_subprocess_timeout,
                 debug=args.debug,
@@ -1067,40 +1139,67 @@ def pay_lightning_invoice(
                 attempt_graceful_terminate_on_timeout=True,
             )
 
-            was_script_timeout = (
-                "Command timed out after" in str(error_stderr)
-                and "lncli payinvoice" in display_command_str.lower()
-            )
-            if was_script_timeout:
-                print_color(
-                    f"lncli payinvoice command timed out in script. Waiting {POST_LNCLI_TIMEOUT_CLEANUP_DELAY_SECONDS}s for LND to process cancellation...",
-                    Colors.WARNING,
+            payment_resolved_by_payinvoice = False
+            payment_needs_tracking = False
+
+            if payinvoice_success and isinstance(payinvoice_output_json, dict):
+                payment_error = payinvoice_output_json.get("payment_error", "")
+                temp_preimage = payinvoice_output_json.get("payment_preimage", "")
+
+                if not payment_error and temp_preimage:
+                    print_color(f"lncli payinvoice reported IMMEDIATE SUCCESS. Preimage: {temp_preimage[:10]}...", Colors.OKGREEN, bold=True)
+                    script_logger.info(f"LN Payment SUCCEEDED (via payinvoice). Hash: {payment_hash}, Preimage: {temp_preimage}")
+                    payment_preimage = temp_preimage
+                    return True, payment_preimage # Overall success for pay_lightning_invoice
+                elif "payment is in transition" in payment_error.lower() or \
+                     "htlc propagation" in payment_error.lower() or \
+                     (payment_error and "Unknown" in payment_error and not temp_preimage): # LND can return Unknown on long-running ones
+                    print_color(f"lncli payinvoice reports payment in transition or status ambiguous: '{payment_error}'. Will track.", Colors.WARNING)
+                    script_logger.warning(f"LN Payment in transition (via payinvoice output: {payment_error}). Hash: {payment_hash}. Proceeding to track.")
+                    payment_needs_tracking = True
+                else: # Some other error from payinvoice or no preimage
+                    print_color(f"lncli payinvoice reported failure: {payment_error if payment_error else 'No preimage and no specific error'}", Colors.FAIL)
+                    script_logger.warning(f"LN Payment FAILED (via payinvoice). Hash: {payment_hash}. Error: '{payment_error}', Output: {payinvoice_output_json}")
+                    payment_resolved_by_payinvoice = True # Failed
+            elif "Command timed out after" in str(payinvoice_error_stderr):
+                print_color("lncli payinvoice command timed out in script. Payment status unknown. Will track.", Colors.WARNING)
+                script_logger.warning(f"lncli payinvoice command timed out in script for hash {payment_hash}. Proceeding to track.")
+                payment_needs_tracking = True
+                if args.debug: # Simulate payinvoice timeout for debug tracking path
+                    print_color("[DEBUG] Simulating payinvoice timeout, forcing trackpayment path.", Colors.WARNING)
+            else: # payinvoice_success was False, or output wasn't expected JSON
+                print_color(f"lncli payinvoice command failed or produced unexpected output. Stderr: {payinvoice_error_stderr}", Colors.FAIL)
+                script_logger.warning(f"LN Payment FAILED (payinvoice command failed). Hash: {payment_hash}. Stderr: {payinvoice_error_stderr}, Output: {payinvoice_output_json}")
+                payment_resolved_by_payinvoice = True # Failed
+
+            if payment_resolved_by_payinvoice: # This means it definitively failed based on payinvoice output
+                 # Proceed to enrichment / next batch logic directly
+                print_color("Payment attempt FAILED based on direct payinvoice output. Evaluating enrichment.", Colors.WARNING)
+                # Fall through to enrichment logic below this block
+            
+            if payment_needs_tracking:
+                print_color("\n--- Payment Status Ambiguous or In-Flight, Initiating Tracking ---", Colors.HEADER)
+                # Use a tracking timeout based on the payment timeout plus a buffer
+                tracking_timeout_for_attempt = lncli_timeout_val + 60
+                payment_succeeded_via_tracking, tracked_preimage = track_payment_until_settled(
+                    config, args, payment_hash, tracking_timeout_for_attempt, debug
                 )
-                time.sleep(POST_LNCLI_TIMEOUT_CLEANUP_DELAY_SECONDS)
 
-            print_color(
-                "\n--- Payment Attempt Concluded, Tracking Status ---", Colors.HEADER
-            )
-            # Use a tracking timeout based on the payment timeout plus a buffer
-            tracking_timeout_for_attempt = lncli_timeout_val + 60  # 60 seconds buffer
-            payment_really_succeeded = track_payment_until_settled(
-                config, args, payment_hash, tracking_timeout_for_attempt, debug
-            )
+                if payment_succeeded_via_tracking:
+                    print_color("Payment confirmed SUCCEEDED by trackpayment.", Colors.OKGREEN, bold=True)
+                    script_logger.info(f"LN Payment SUCCEEDED (via trackpayment). Hash: {payment_hash}, Preimage: {tracked_preimage}")
+                    payment_preimage = tracked_preimage
+                    return True, payment_preimage  # Overall success
+                else:
+                    print_color("Payment did NOT SUCCEED via trackpayment (or tracking timed out). Evaluating enrichment.", Colors.WARNING)
+                    script_logger.warning(f"LN Payment FAILED or timed out (via trackpayment). Hash: {payment_hash}.")
+                    # Fall through to enrichment logic
 
-            if payment_really_succeeded:
-                print_color(
-                    "Payment confirmed SUCCEEDED by trackpayment.",
-                    Colors.OKGREEN,
-                    bold=True,
-                )
-                return True  # Overall success
-
-            # If not succeeded, then it's a confirmed FAILED payment (or tracking timed out, which implies failure to confirm success)
-            print_color(
-                "Payment did NOT SUCCEED via trackpayment. Evaluating retry strategy.",
-                Colors.WARNING,
-            )
-
+            # --- Enrichment or move to next batch ---
+            # This block is reached if:
+            # 1. payinvoice failed definitively.
+            # 2. payinvoice needed tracking, and tracking failed or timed out.
+            
             newly_added_channels_in_enrich_pass = 0
             if len(selected_channels) < MAX_CHANNELS_IN_BATCH and channel_idx < len(
                 candidate_channels_info
@@ -1261,19 +1360,21 @@ def pay_lightning_invoice(
                     channels_actually_added_this_enrich
                 )
 
-            # Decision Logic after tracking and enrichment attempt
+            # Decision Logic after payment attempt (direct or tracked) and optional enrichment
             if newly_added_channels_in_enrich_pass > 0:
                 print_color(
-                    f"Batch was enriched with {newly_added_channels_in_enrich_pass} new channel(s) after failure. Retrying payment shortly.",
+                    f"Batch was enriched with {newly_added_channels_in_enrich_pass} new channel(s). Retrying payment with this enriched batch shortly.",
                     Colors.OKCYAN,
                 )
+                script_logger.info(f"Batch enriched with {newly_added_channels_in_enrich_pass} channels. Retrying payment.")
                 time.sleep(2)  # Short delay before retry
                 continue  # Continue inner payment loop with enriched batch
             else:
                 print_color(
-                    "Batch could not be enriched further after failure. This payment route is exhausted.",
+                    "Batch could not be enriched further after failure / no new channels added. This payment route is exhausted.",
                     Colors.FAIL,
                 )
+                script_logger.warning("Batch could not be enriched. Route exhausted for this set of primary channels.")
                 print_color(
                     "Breaking from inner payment loop to try a new primary batch if candidates remain.",
                     Colors.FAIL,
@@ -1286,19 +1387,22 @@ def pay_lightning_invoice(
 
     # Should be unreachable if logic is correct, as inner success returns, and outer exhaustion returns.
     print_color("All payment strategies exhausted.", Colors.FAIL)
-    return False
+    script_logger.error(f"All payment strategies exhausted for invoice {invoice_str[:40]}..., hash {payment_hash}")
+    return False, None
 
 
 def track_payment_until_settled(config, args, payment_hash, timeout_seconds, debug):
     """
     Tracks an ongoing LND payment using lncli trackpayment until it settles (SUCCEEDED or FAILED)
     or the timeout is reached.
-    Returns True if the payment SUCCEEDED, False otherwise.
+    Returns a tuple (succeeded: bool, preimage: str or None).
     """
     print_color(
         f"\nTracking payment {payment_hash[:10]}... using lncli trackpayment for up to {timeout_seconds} seconds...",
         Colors.OKBLUE,
     )
+    script_logger.info(f"Tracking payment {payment_hash} for up to {timeout_seconds}s.")
+
 
     lncli_path = config.get("lncli_path", "/usr/local/bin/lncli")
     lnd_rpcserver = config.get("lnd_rpcserver") or "localhost:10009"
@@ -1324,17 +1428,20 @@ def track_payment_until_settled(config, args, payment_hash, timeout_seconds, deb
             f"[DEBUG] lncli trackpayment command: {' '.join(command_parts)}",
             Colors.WARNING,
         )
+        script_logger.debug(f"[DEBUG] Skipping trackpayment for {payment_hash} (debug mode).")
         # Simulate quick success or failure in debug mode
         if "sim_success_hash" in payment_hash:  # Example debug condition
             print_color("[DEBUG] Simulated trackpayment success.", Colors.OKGREEN)
-            return True
+            return True, "debug_simulated_preimage_trackpayment"
         else:
             print_color("[DEBUG] Simulated trackpayment failure.", Colors.FAIL)
-            return False
+            return False, None
 
     start_time = time.time()
     last_status = None
     last_failure_reason = None
+    payment_preimage = None
+
 
     try:
         process = subprocess.Popen(
@@ -1349,9 +1456,10 @@ def track_payment_until_settled(config, args, payment_hash, timeout_seconds, deb
         for line in iter(process.stdout.readline, ""):
             if time.time() - start_time > timeout_seconds:
                 print_color(
-                    f"Trackpayment timed out after {timeout_seconds} seconds. Attempting to terminate.",
+                    f"Trackpayment timed out after {timeout_seconds} seconds for hash {payment_hash[:10]}... Attempting to terminate.",
                     Colors.WARNING,
                 )
+                script_logger.warning(f"Trackpayment timed out for {payment_hash} after {timeout_seconds}s.")
                 if process.poll() is None:  # Still running
                     print_color(
                         "  Attempting graceful termination (SIGINT)...", Colors.WARNING
@@ -1376,40 +1484,59 @@ def track_payment_until_settled(config, args, payment_hash, timeout_seconds, deb
                 break  # Exit the loop after attempting termination
 
             try:
+                if args.verbose:
+                    print_color(f"  Trackpayment raw line: '{line.strip()}'", Colors.OKBLUE)
+                
                 payment_update = json.loads(line)
+                
+                if args.verbose:
+                    print_color(f"  Parsed payment_update: {json.dumps(payment_update)}", Colors.OKBLUE)
+
+
                 status = payment_update.get("status")
                 failure_reason = payment_update.get("failure_reason")
 
+                if args.verbose and not status and line.strip(): # Log if status key is missing but line wasn't empty
+                     print_color(f"  WARNING: 'status' key missing in trackpayment update: {json.dumps(payment_update)}", Colors.WARNING)
+                     script_logger.debug(f"Trackpayment update for {payment_hash} missing 'status' key: {payment_update}")
+
+
                 if status:
                     last_status = status
-                    if failure_reason:
+                    if failure_reason and failure_reason != "FAILURE_REASON_NONE":
                         last_failure_reason = failure_reason
 
-                    if args.verbose:  # Made conditional on verbose flag
-                        print_color(f"  Payment status update: {status}", Colors.OKCYAN)
-                        if failure_reason and failure_reason != "FAILURE_REASON_NONE":
-                            print_color(
-                                f"  Failure reason: {failure_reason}", Colors.FAIL
-                            )
+                    if args.verbose:
+                        print_color(f"  Payment status update for {payment_hash[:10]}...: {status}", Colors.OKCYAN)
+                        if last_failure_reason:
+                            print_color(f"  Failure reason: {last_failure_reason}", Colors.FAIL)
+                    
+                    script_logger.debug(f"Trackpayment update for {payment_hash}: Status={status}, FailureReason={last_failure_reason}")
+
 
                     if status == "SUCCEEDED":
-                        print_color(
-                            "Payment SUCCEEDED during tracking.", Colors.OKGREEN
-                        )
-                        process.terminate()  # Payment settled, stop tracking
-                        return True
+                        payment_preimage = payment_update.get("preimage")
+                        print_color(f"Payment {payment_hash[:10]}... SUCCEEDED during tracking. Preimage: {payment_preimage[:10] if payment_preimage else 'N/A'}...", Colors.OKGREEN)
+                        script_logger.info(f"Trackpayment: Payment {payment_hash} SUCCEEDED. Preimage: {payment_preimage}")
+                        process.terminate()
+                        return True, payment_preimage
                     elif status == "FAILED":
-                        print_color("Payment FAILED during tracking.", Colors.FAIL)
-                        process.terminate()  # Payment settled, stop tracking
-                        return False
+                        print_color(f"Payment {payment_hash[:10]}... FAILED during tracking. Reason: {last_failure_reason}", Colors.FAIL)
+                        script_logger.warning(f"Trackpayment: Payment {payment_hash} FAILED. Reason: {last_failure_reason}")
+                        process.terminate()
+                        return False, None
             except json.JSONDecodeError:
-                # print_color(f"  Non-JSON output from trackpayment: {line.strip()}", Colors.WARNING) # Suppress verbose debug
-                pass  # Ignore non-JSON lines (e.g., progress messages from lncli)
+                if args.verbose and line.strip(): # Only print if verbose and line is not just whitespace
+                    print_color(f"  Warning: Non-JSON or malformed line from trackpayment: '{line.strip()}'", Colors.WARNING)
+                    script_logger.debug(f"Trackpayment non-JSON line for {payment_hash}: '{line.strip()}'")
+                pass
             except Exception as e:
                 print_color(
-                    f"Error processing trackpayment output: {e}, line: {line.strip()}",
+                    f"Error processing trackpayment output for {payment_hash[:10]}...: {e}, line: {line.strip()}",
                     Colors.FAIL,
                 )
+                script_logger.exception(f"Error processing trackpayment output for {payment_hash}")
+
 
         # After loop, if process is still running (e.g., due to timeout but break was hit)
         if process.poll() is None:
@@ -1420,29 +1547,43 @@ def track_payment_until_settled(config, args, payment_hash, timeout_seconds, deb
 
         # Check any remaining output after termination (stderr or final stdout)
         # This is a non-blocking communicate call with a short timeout
-        stdout_after, stderr_after = process.communicate(timeout=5)
+        stdout_after, stderr_after = "", ""
+        try:
+            stdout_after, stderr_after = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            script_logger.warning(f"Timeout getting final output from trackpayment process for {payment_hash}")
+        except Exception as e_comm:
+            script_logger.warning(f"Error getting final output from trackpayment process for {payment_hash}: {e_comm}")
+
+
         if stderr_after.strip():
-            print_color(f"Trackpayment stderr: {stderr_after.strip()}", Colors.FAIL)
+            print_color(f"Trackpayment for {payment_hash[:10]}... stderr: {stderr_after.strip()}", Colors.FAIL)
+            script_logger.error(f"Trackpayment stderr for {payment_hash}: {stderr_after.strip()}")
+
 
     except FileNotFoundError:
-        print_color(
-            f"Error: lncli not found at {lncli_path}. Check config.ini.", Colors.FAIL
-        )
+        err_msg = f"Error: lncli not found at {lncli_path}. Check config.ini."
+        print_color(err_msg, Colors.FAIL)
+        script_logger.error(err_msg)
+        return False, None # Critical error, assume failure
     except Exception as e:
-        print_color(
-            f"An unexpected error occurred during trackpayment: {e}", Colors.FAIL
-        )
+        err_msg = f"An unexpected error occurred during trackpayment for {payment_hash[:10]}...: {e}"
+        print_color(err_msg, Colors.FAIL)
+        script_logger.exception(f"Unexpected error during trackpayment for {payment_hash}")
+        return False, None # Assume failure
 
     # If we reached here, payment did not SUCCEED explicitly during tracking or timed out.
     # Check the last known status if any.
-    if last_status == "SUCCEEDED":
-        return True  # Should have returned earlier, but as a safeguard
+    if last_status == "SUCCEEDED": # Should have returned earlier
+        script_logger.info(f"Trackpayment for {payment_hash} concluded with last_status SUCCEEDED (post-loop check). Preimage: {payment_preimage}")
+        return True, payment_preimage 
 
     print_color(
-        f"Payment tracking finished without clear success. Last status: {last_status}, Last failure reason: {last_failure_reason if last_failure_reason else 'N/A'}",
+        f"Payment tracking for {payment_hash[:10]}... finished without clear success. Last status: {last_status}, Last failure reason: {last_failure_reason if last_failure_reason else 'N/A'}",
         Colors.WARNING,
     )
-    return False  # Assume failed or inconclusive if not explicitly succeeded
+    script_logger.warning(f"Trackpayment for {payment_hash} finished inconclusive. LastStatus: {last_status}, LastReason: {last_failure_reason}")
+    return False, None
 
 
 def construct_lncli_command(config, args, invoice, outgoing_chan_ids_batch):
@@ -1575,7 +1716,7 @@ def decode_payreq(config, args, invoice_str):
         # For simplicity in mock, using args.amount
         mock_decoded_data = {
             "destination": "debug_destination_pubkey_from_decode",
-            "payment_hash": "debug_payment_hash_from_decode",
+            "payment_hash": "debug_payment_hash_from_decode_" + str(args.amount), # Make it unique for debug
             "num_satoshis": str(args.amount),  # Ensure it's a string like lncli output
             "description": "debug_description",
             "cltv_expiry": "40",  # Example CLTV expiry
@@ -1590,26 +1731,26 @@ def decode_payreq(config, args, invoice_str):
 
     if success and isinstance(output, dict):
         # Validate essential fields
-        if not output.get("destination") or not output.get("num_satoshis"):
-            print_color(
-                f"Decoded invoice missing 'destination' or 'num_satoshis'. Response: {json.dumps(output)}",
-                Colors.FAIL,
-            )
+        if not output.get("destination") or not output.get("num_satoshis") or not output.get("payment_hash"):
+            err_msg = f"Decoded invoice missing 'destination', 'num_satoshis', or 'payment_hash'. Response: {json.dumps(output)}"
+            print_color(err_msg, Colors.FAIL)
+            script_logger.error(f"decode_payreq: {err_msg}")
             return None
 
         # Verify amount if possible (num_satoshis can be 0 for "any amount" invoices, but Boltz will specify)
         decoded_amount = int(output.get("num_satoshis", 0))
         if decoded_amount != args.amount:
-            print_color(
-                f"Warning: Decoded invoice amount ({decoded_amount} sats) differs from requested swap amount ({args.amount} sats).",
-                Colors.WARNING,
-            )
+            warn_msg = f"Warning: Decoded invoice amount ({decoded_amount} sats) differs from requested swap amount ({args.amount} sats)."
+            print_color(warn_msg, Colors.WARNING)
+            script_logger.warning(f"decode_payreq: {warn_msg}")
             # Decide if this is a critical error or just a warning. For Boltz, it should match.
             # If this check is too strict for some invoices, it can be relaxed or made conditional.
 
         print_color("Payment request decoded successfully.", Colors.OKGREEN)
+        script_logger.info(f"Payment request {invoice_str[:40]}... decoded. Hash: {output.get('payment_hash')}, Amount: {output.get('num_satoshis')}")
         if args.verbose:
             print_color(f"  Destination: {output.get('destination')}", Colors.OKCYAN)
+            print_color(f"  Payment Hash: {output.get('payment_hash')}", Colors.OKCYAN)
             print_color(f"  Amount: {output.get('num_satoshis')} sats", Colors.OKCYAN)
             print_color(
                 f"  CLTV Expiry (delta from current block): {output.get('cltv_expiry')}",
@@ -1617,7 +1758,9 @@ def decode_payreq(config, args, invoice_str):
             )
         return output
     else:
-        print_color("Failed to decode payment request.", Colors.FAIL)
+        err_msg = "Failed to decode payment request."
+        print_color(err_msg, Colors.FAIL)
+        script_logger.error(f"decode_payreq: {err_msg} Stderr: {error_stderr}, Output: {json.dumps(output) if isinstance(output,dict) else output}")
         if error_stderr:
             print_color(f"  Stderr: {error_stderr.strip()}", Colors.FAIL)
         if (
@@ -1633,8 +1776,11 @@ def decode_payreq(config, args, invoice_str):
 
 def main():
     """Main execution flow."""
+    setup_logging() # Initialize logging system
     args, parser = parse_arguments()
     config = load_config(args.config)
+    script_logger.info(f"Starting boltz_swap-out.py with arguments: {vars(args)}")
+
 
     # Override args with config values if args are at their defaults
     default_lndg_api = parser.get_default("lndg_api")
@@ -1643,6 +1789,8 @@ def main():
             f"[INFO] Overriding default LNDg API '{args.lndg_api}' with config value '{config['lndg_api_url']}'."
         )
         args.lndg_api = config["lndg_api_url"]
+        script_logger.info(f"Overridden LNDg API with config value: {args.lndg_api}")
+
 
     # Then print effective settings
     print_color(
@@ -1674,6 +1822,8 @@ def main():
 
     if args.description:
         print_color(f"Swap Description: {args.description}", Colors.OKCYAN)
+    
+    payment_preimage_final = None # To store preimage for logging
 
     try:  # Start of try block for KeyboardInterrupt
         lbtc_address = None
@@ -1683,6 +1833,8 @@ def main():
                 f"\nUsing custom L-BTC destination address: {lbtc_address}",
                 Colors.WARNING,
             )
+            script_logger.info(f"Using custom L-BTC destination address: {lbtc_address}")
+
 
             if not args.force:
                 print_color(
@@ -1737,25 +1889,26 @@ def main():
                         Colors.FAIL,
                         bold=True,
                     )
+                    script_logger.info("Swap aborted by user confirmation for custom address.")
                     sys.exit(1)
                 print_color(
                     "Confirmation received. Proceeding with custom address.",
                     Colors.OKGREEN,
                 )
+                script_logger.info("User confirmed custom address. Proceeding.")
             else:
                 print_color(
                     "Confirmation for custom address skipped due to --force flag.",
                     Colors.OKBLUE,
                 )
+                script_logger.info("Custom address confirmation skipped due to --force.")
         else:
             lbtc_address = get_lbtc_address(config["pscli_path"], args.debug)
 
         if not lbtc_address:
-            print_color(
-                "\nExiting: L-BTC address not available or confirmed.",
-                Colors.FAIL,
-                bold=True,
-            )
+            err_msg = "\nExiting: L-BTC address not available or confirmed."
+            print_color(err_msg, Colors.FAIL, bold=True)
+            script_logger.error(err_msg.strip())
             sys.exit(1)
 
         candidate_channels_info = get_swap_candidate_channels(
@@ -1767,11 +1920,9 @@ def main():
             args.debug,
         )
         if not candidate_channels_info:
-            print_color(
-                "\nExiting: No suitable swap candidate channels found.",
-                Colors.FAIL,
-                bold=True,
-            )
+            err_msg = "\nExiting: No suitable swap candidate channels found."
+            print_color(err_msg, Colors.FAIL, bold=True)
+            script_logger.error(err_msg.strip())
             sys.exit(1)
         print_color(
             f"Total candidate channels for payment: {len(candidate_channels_info)}",
@@ -1788,14 +1939,13 @@ def main():
             args.debug,
         )
         if not lightning_invoice:
-            print_color(
-                "\nExiting: Failed to create Boltz swap or get invoice.",
-                Colors.FAIL,
-                bold=True,
-            )
+            err_msg = "\nExiting: Failed to create Boltz swap or get invoice."
+            print_color(err_msg, Colors.FAIL, bold=True)
+            # Specific error already logged by create_boltz_swap
+            script_logger.error(f"Main: {err_msg.strip()} Amount: {args.amount}, L-BTC Addr: {lbtc_address}")
             sys.exit(1)
 
-        payment_successful = pay_lightning_invoice(
+        payment_successful, payment_preimage_final = pay_lightning_invoice(
             config,
             args,
             lightning_invoice,
@@ -1807,28 +1957,29 @@ def main():
         print_color(f"L-BTC Destination Address: {lbtc_address}", Colors.OKCYAN)
         print_color(f"Boltz Swap ID: {swap_id if swap_id else 'N/A'}", Colors.OKCYAN)
 
+        log_details = {
+            "SwapID": swap_id if swap_id else 'N/A',
+            "AmountSats": args.amount,
+            "LBTCDestAddress": lbtc_address,
+            "PaymentPreimage": payment_preimage_final if payment_preimage_final else 'N/A'
+        }
+
         if boltz_response_dict and isinstance(boltz_response_dict, dict):
             b_expected_amount = boltz_response_dict.get("expectedAmount")
-            # Assuming invoiceAmount is the LN invoice amount Boltz expects to be paid
-            b_invoice_amount = None
-            if "invoice" in boltz_response_dict:
-                # Attempt to decode the invoice to get its amount (more robust)
-                # This is a placeholder for actual invoice decoding if needed,
-                # for now, we rely on what Boltz might provide directly.
-                # For simplicity, let's assume boltz_response_dict might have an "invoiceAmount" key
-                # or we could parse it from the invoice string if necessary.
-                b_invoice_amount = boltz_response_dict.get(
-                    "invoiceAmount"
-                )  # Check if Boltz provides this
-
+            b_invoice_amount = boltz_response_dict.get("invoiceAmount") # May not be present directly
             b_lockup_addr = boltz_response_dict.get("lockupAddress")
 
-            if b_invoice_amount:  # This is the LN invoice amount
+            log_details["BoltzExpectedLBTCSent"] = b_expected_amount if b_expected_amount is not None else 'N/A'
+            log_details["BoltzLockupAddress"] = b_lockup_addr if b_lockup_addr else 'N/A'
+            log_details["BoltzInvoiceAmountFromResp"] = b_invoice_amount if b_invoice_amount is not None else 'N/A'
+
+
+            if b_invoice_amount:
                 print_color(
-                    f"Boltz Expected LN Payment Amount: {b_invoice_amount} sats",  # Clarified label
+                    f"Boltz Expected LN Payment Amount (from response, if available): {b_invoice_amount} sats",
                     Colors.OKCYAN,
                 )
-            if b_expected_amount:  # This is what Boltz should send on-chain (L-BTC)
+            if b_expected_amount is not None:
                 print_color(
                     f"Boltz Est. L-BTC Sent (onchain): {b_expected_amount} sats",
                     Colors.OKCYAN,
@@ -1839,32 +1990,37 @@ def main():
                 )
 
         if payment_successful:
-            print_color("Swap Initiated & LN Invoice Paid!", Colors.OKGREEN, bold=True)
+            success_msg = "Swap Initiated & LN Invoice Paid!"
+            print_color(success_msg, Colors.OKGREEN, bold=True)
             print_color("Monitor your Liquid wallet for L-BTC.", Colors.OKGREEN)
+            log_message = f"Boltz Swap SUCCESS: {json.dumps(log_details)}"
+            script_logger.info(log_message)
             if swap_id and swap_id != "unknown_swap_id":
                 print_color(
                     f"Check status: {config['boltzcli_path']} --tlscert {config['boltzd_tlscert_path']} --macaroon {config['boltzd_admin_macaroon_path']} swapinfo {swap_id}",
                     Colors.OKCYAN,
                 )
         else:
-            print_color("Swap Failed: LN invoice not paid.", Colors.FAIL, bold=True)
+            failure_msg = "Swap Failed: LN invoice not paid."
+            print_color(failure_msg, Colors.FAIL, bold=True)
             print_color(
                 "No funds should have left LN wallet if all attempts failed.",
                 Colors.WARNING,
             )
+            log_message = f"Boltz Swap FAILED: {json.dumps(log_details)}"
+            script_logger.error(log_message)
             if swap_id and swap_id != "unknown_swap_id":
                 print_color(
                     f"Check status: {config['boltzcli_path']} --tlscert {config['boltzd_tlscert_path']} --macaroon {config['boltzd_admin_macaroon_path']} swapinfo {swap_id}",
                     Colors.WARNING,
                 )
-        sys.exit(0 if payment_successful else 1)  # Exit with 0 on success, 1 on failure
+        sys.exit(0 if payment_successful else 1)
 
     except KeyboardInterrupt:
         print_color(
             "\n\nScript aborted by user (CTRL-C). Exiting.", Colors.WARNING, bold=True
         )
-        # Attempt to provide Boltz swap ID if available, for manual checking
-        # Check if swap_id was defined before interruption
+        script_logger.warning("Script aborted by user (KeyboardInterrupt).")
         current_swap_id = locals().get("swap_id")
         if current_swap_id and current_swap_id != "unknown_swap_id":
             print_color(
@@ -1875,15 +2031,15 @@ def main():
                 f"You may need to check its status manually using boltzcli swapinfo {current_swap_id}",
                 Colors.WARNING,
             )
-        sys.exit(130)  # Standard exit code for CTRL+C
+            script_logger.warning(f"Swap ID at interruption (if any): {current_swap_id}")
+        sys.exit(130)
     except Exception as e:
-        print_color(f"\nAn unexpected error occurred: {e}", Colors.FAIL, bold=True)
+        print_color(f"\nAn unexpected error occurred in main: {e}", Colors.FAIL, bold=True)
         import traceback
-
-        print_color(
-            traceback.format_exc(), Colors.FAIL
-        )  # Print full traceback for unexpected errors
-        sys.exit(2)  # General error exit code
+        tb_str = traceback.format_exc()
+        print_color(tb_str, Colors.FAIL)
+        script_logger.critical(f"Unhandled critical error in main: {e}\n{tb_str}")
+        sys.exit(2)
 
 
 if __name__ == "__main__":
