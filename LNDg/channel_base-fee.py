@@ -52,11 +52,12 @@ def get_channels_to_modify():
                             f"Ignoring channel {chan_id} with remote_pubkey {remote_pubkey}"
                         )
                     else:
-                        print(
-                            f"Processing channel {chan_id} - local_base_fee: {local_base_fee}, local_fee_rate: {local_fee_rate}, is_open: {is_open}"
-                        )
                         if local_base_fee > 0 and local_fee_rate > 0 and is_open:
+                            print(
+                                f"Processing channel {chan_id} - local_base_fee: {local_base_fee}, local_fee_rate: {local_fee_rate}, is_open: {is_open}"
+                            )
                             channels_to_modify.append((chan_id, local_base_fee))
+
         else:
             print(f"API request failed with status code: {response.status_code}")
 
