@@ -39,6 +39,7 @@ import os
 import requests
 import subprocess
 import telebot
+import math
 
 # --- Global Configuration ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -57,46 +58,60 @@ TELEGRAM_BOT_TOKEN = None
 TELEGRAM_CHAT_ID = None
 LNCLI_PATH = "lncli"
 DRY_RUN_MODE = False
-
+MY_NODE_PUBKEY = None # Loaded from general_config [info] NODE
 
 # --- GraphQL Queries/Mutations ---
 GET_PUBLIC_MAGMA_OFFERS_QUERY = """
-query ListMarketOffers($filter: MarketOfferFilterInput, $limit: Int, $nextToken: String, $sort: MarketOfferSortInput) {
-  listMarketOffers(filter: $filter, limit: $limit, next_token: $nextToken, sort: $sort) {
-    offers {
-      offer_id
-      apr_percent
+query GetPublicOffers($filter: OfferFilter, $sort: OfferSort, $first: Int, $after: String) {
+  getOffers(filter: $filter, sort: $sort, first: $first, after: $after) {
+    list {
+      id
+      offer_type
       base_fee
       fee_rate
-      min_channel_size
-      max_channel_size
-      min_channel_duration
-      node_details { pubkey alias }
-      status # Important for filtering if possible (e.g. only ACTIVE offers)
+      max_size
+      min_block_length
+      min_size
+      seller_score
+      status
+      side
+      total_size
+      account # Pubkey of seller
+      # orders { locked_size } # Not currently used in analysis
+      # tags { name } # Not currently used in analysis
     }
+    # pageInfo { hasNextPage endCursor } # For pagination if needed later
   }
 }
 """
 
 GET_MY_MAGMA_OFFERS_QUERY = """
-query GetUserOffers {
-  getUserOffers {
-    list {
-      id
-      status # e.g., ACTIVE, USER_DISABLED
-      type
-      offer_details {
-        base_fee
-        base_fee_cap
-        fee_rate
-        fee_rate_cap
-        max_size
-        min_block_length
-        min_size
-        total_size
-        node_public_key
-        created_at
-        updated_at
+query MyOffers {
+  getUser {
+    market {
+      offers {
+        list {
+          id
+          status
+          offer_type
+          base_fee
+          # base_fee_cap # Not directly used by script logic for now
+          fee_rate
+          # fee_rate_cap # Not directly used by script logic for now
+          max_size
+          min_block_length
+          min_size
+          total_size
+          # conditions { condition } # Not used
+          # orders { locked_size } # Not used for own offer state decision
+          # seller_score # Not relevant for own offers in this context
+          side
+          account # Our own pubkey
+          # amboss_fee_rate # Not used
+          # onchain_multiplier # Not used
+          # onchain_priority # Not used
+          # created_at and updated_at were in old query, not in new user provided one, and not used by script.
+        }
       }
     }
   }
@@ -301,24 +316,69 @@ def get_lnd_onchain_balance(current_general_config):
     return confirmed_balance
 
 # --- Market Analysis & Pricing Logic --- (analyze_and_price_offer and calculate_apr remain largely the same)
-def fetch_public_magma_offers():
+def fetch_public_magma_offers(node_pubkey_to_exclude, current_magma_config):
     logging.info("Fetching public Magma sell offers...")
-    variables = {"limit": 100, "filter": {"type": "SELL"}} # Added type: SELL filter
-    # Ideally, we'd also filter by status: ACTIVE if the API supports it robustly here
-    # Check Amboss schema for MarketOfferFilterInput for "status" field.
-    # variables["filter"]["status"] = "ACTIVE" # If status filter exists
+    # Server-side filtering
+    filters = {"type": "CHANNEL", "status": "ENABLED", "side": "SELL"}
+    # Sort by seller_score descending to potentially get higher quality offers first, though primary sort for pricing is APR.
+    # The API might not support complex sorts or specific fields like seller_score for sorting.
+    # For now, let's not specify sort and do it client-side if needed for the initial seller_score percentile.
+    # sort_by = {"field": "SELLER_SCORE", "direction": "DESC"} # Example if API supported
+    
+    variables = {"filter": filters, "first": 200} # Fetch a decent number for analysis, max 200-500 usually reasonable
+    
     payload = {"query": GET_PUBLIC_MAGMA_OFFERS_QUERY, "variables": variables}
-    data = _execute_amboss_graphql_request(payload, "ListMarketOffers")
-    if data and data.get("listMarketOffers", {}).get("offers"):
-        offers = data["listMarketOffers"]["offers"]
-        # Further filter out non-active offers if not done by API
-        active_offers = [o for o in offers if o.get('status', 'ACTIVE').upper() == 'ACTIVE'] # Assuming 'ACTIVE' is the status
-        logging.info(f"Fetched {len(offers)} public Magma offers, {len(active_offers)} are active.")
-        return active_offers
+    data = _execute_amboss_graphql_request(payload, "GetPublicOffers")
+    
+    processed_offers = []
+    if data and data.get("getOffers", {}).get("list"):
+        raw_offers = data["getOffers"]["list"]
+        min_seller_score_filter = current_magma_config.getfloat("magma_autoprice", "min_seller_score_filter", fallback=0.0)
+
+        for offer in raw_offers:
+            try:
+                # Basic filtering already done by API, but double check and add client-side ones
+                if offer.get("status") != "ENABLED" or offer.get("side") != "SELL" or offer.get("offer_type") != "CHANNEL":
+                    continue
+                if node_pubkey_to_exclude and offer.get("account") == node_pubkey_to_exclude:
+                    logging.debug(f"Excluding own offer (Account: {offer.get('account')}) from market analysis.")
+                    continue
+
+                parsed_offer = {
+                    "id": offer.get("id"), # Assuming 'id' is present for public offers too
+                    "offer_type": offer.get("offer_type"),
+                    "base_fee": int(offer.get("base_fee", 0)),
+                    "fee_rate": int(offer.get("fee_rate", 0)),
+                    "max_size": int(offer.get("max_size", 0)),
+                    "min_block_length": int(offer.get("min_block_length", 0)),
+                    "min_size": int(offer.get("min_size", 0)),
+                    "seller_score": float(offer.get("seller_score", 0.0)),
+                    "status": offer.get("status"),
+                    "side": offer.get("side"),
+                    "total_size": int(offer.get("total_size", 0)),
+                    "account": offer.get("account"), # Seller's pubkey
+                    "node_alias": offer.get("account") # Use account as alias placeholder if no direct alias
+                }
+
+                if parsed_offer["seller_score"] < min_seller_score_filter:
+                    logging.debug(f"Excluding market offer {parsed_offer['id']} due to seller_score {parsed_offer['seller_score']} < {min_seller_score_filter}")
+                    continue
+                
+                # Ensure essential fields for APR calculation are valid
+                if not (parsed_offer["min_size"] > 0 and parsed_offer["min_block_length"] > 0 and parsed_offer["base_fee"] >= 0 and parsed_offer["fee_rate"] >= 0):
+                    logging.debug(f"Skipping market offer {parsed_offer.get('id', 'N/A')} due to invalid numeric values for APR calc.")
+                    continue
+
+                processed_offers.append(parsed_offer)
+            except (ValueError, TypeError) as e:
+                logging.warning(f"Skipping market offer due to parsing error: {offer.get('id', 'N/A')}. Error: {e}")
+                continue
+        
+        logging.info(f"Fetched and processed {len(processed_offers)} relevant public Magma CHANNEL/SELL/ENABLED offers (excluding own, score >= {min_seller_score_filter}).")
+        return processed_offers
     else:
         logging.warning("No public Magma offers found or error in fetching.")
         return []
-
 def calculate_apr(fixed_fee_sats, ppm_fee_rate, channel_size_sats, duration_days_float):
     if channel_size_sats == 0 or duration_days_float == 0: return 0.0
     variable_fee_sats = (ppm_fee_rate / 1_000_000) * channel_size_sats
@@ -327,38 +387,48 @@ def calculate_apr(fixed_fee_sats, ppm_fee_rate, channel_size_sats, duration_days
     return round(apr, 2)
 
 def analyze_and_price_offer(market_offers, our_offer_template_config_proxy, current_magma_config):
-    logging.info(f"Analyzing market for offer template: {our_offer_template_config_proxy.name}") # .name from section
+    logging.info(f"Analyzing market for offer template: {our_offer_template_config_proxy.name}")
     our_size_template = our_offer_template_config_proxy.getint('channel_size_sats')
     our_duration_days_template = our_offer_template_config_proxy.getint('duration_days')
 
     relevant_offers = []
-    for offer in market_offers: # Assumes market_offers are already filtered for active ones
+    for offer in market_offers: # Market offers are already pre-filtered (CHANNEL, ENABLED, SELL, not own, min_seller_score)
         try:
-            size = int(offer.get('min_channel_size', 0))
-            if offer.get('max_channel_size') != size and offer.get('max_channel_size') is not None: continue # Focus on fixed-size offers
-            duration_blocks = int(offer.get('min_channel_duration', 0))
-            fixed_fee = int(offer.get('base_fee', 0))
-            ppm_fee = int(offer.get('fee_rate', 0))
+            # Fields directly from pre-processed market_offers
+            size = offer['min_size'] 
+            # Assuming we only compete with offers that are fixed size (min_size == max_size)
+            if offer['max_size'] != size:
+                 logging.debug(f"Skipping variable size market offer {offer.get('id')} for template {our_offer_template_config_proxy.name}")
+                 continue
+            
+            duration_blocks = offer['min_block_length']
+            fixed_fee = offer['base_fee']
+            ppm_fee = offer['fee_rate']
             duration_days_market = duration_blocks / BLOCKS_PER_DAY if BLOCKS_PER_DAY > 0 else 0
-            size_similarity_threshold = 0.50 
-            duration_similarity_threshold = 0.50
+            
+            size_similarity_threshold = current_magma_config.getfloat("magma_autoprice", "size_similarity_threshold", fallback=0.50)
+            duration_similarity_threshold = current_magma_config.getfloat("magma_autoprice", "duration_similarity_threshold", fallback=0.50)
 
-            if (abs(size - our_size_template) / our_size_template < size_similarity_threshold if our_size_template > 0 else True) and \
-               (abs(duration_days_market - our_duration_days_template) / our_duration_days_template < duration_similarity_threshold if our_duration_days_template > 0 else True) and \
-               (fixed_fee >= 0 and ppm_fee >= 0 and size > 0 and duration_blocks > 0):
-                apr = offer.get('apr_percent')
-                if apr is None and duration_days_market > 0: apr = calculate_apr(fixed_fee, ppm_fee, size, duration_days_market)
-                elif apr is None: apr = 0
+            # Check if market offer is comparable to our template
+            size_matches = (abs(size - our_size_template) / our_size_template < size_similarity_threshold if our_size_template > 0 else True)
+            duration_matches = (abs(duration_days_market - our_duration_days_template) / our_duration_days_template < duration_similarity_threshold if our_duration_days_template > 0 else True)
+
+            if size_matches and duration_matches:
+                # APR calculation should use the market offer's actual size
+                apr = calculate_apr(fixed_fee, ppm_fee, size, duration_days_market)
                 relevant_offers.append({
-                    "id": offer.get("offer_id"), "size": size, "duration_blocks": duration_blocks,
+                    "id": offer.get("id"), "size": size, "duration_blocks": duration_blocks,
                     "duration_days": duration_days_market, "base_fee": fixed_fee, "fee_rate": ppm_fee,
-                    "apr": apr, "node_alias": offer.get("node_details", {}).get("alias", "N/A")})
-        except (ValueError, TypeError, ZeroDivisionError) as e:
-            logging.warning(f"Skipping market offer due to data issue or zero division: {offer.get('offer_id', 'N/A')}, Error: {e}")
+                    "apr": apr, 
+                    "seller_score": offer.get("seller_score", 0.0), # Keep seller_score
+                    "node_alias": offer.get("node_alias", offer.get("account", "N/A")) # 'node_alias' is 'account' here
+                })
+        except (ValueError, TypeError, ZeroDivisionError, KeyError) as e:
+            logging.warning(f"Skipping market offer during analysis due to data issue: {offer.get('id', 'N/A')}, Error: {e}")
             continue
             
     if not relevant_offers:
-        logging.warning(f"No relevant market offers found for comparison against template '{our_offer_template_config_proxy.name}'. Using fallback.")
+        logging.warning(f"No relevant market offers found for comparison against template '{our_offer_template_config_proxy.name}'. Using fallback pricing.")
         new_fixed_fee = our_offer_template_config_proxy.getint('min_fixed_fee_sats', 0)
         new_ppm_fee = our_offer_template_config_proxy.getint('min_ppm_fee', 0)
         global_min_ppm = current_magma_config.getint("magma_autoprice", "global_min_ppm_fee", fallback=0)
@@ -368,54 +438,103 @@ def analyze_and_price_offer(market_offers, our_offer_template_config_proxy, curr
         return {"channel_size_sats": our_size_template, "duration_days": our_duration_days_template,
                 "fixed_fee_sats": new_fixed_fee, "ppm_fee_rate": new_ppm_fee, "calculated_apr": our_fallback_apr}
 
-    relevant_offers.sort(key=lambda x: x['apr'] if x['apr'] is not None else float('inf'))
-    logging.debug(f"Relevant sorted offers for {our_offer_template_config_proxy.name}: {json.dumps(relevant_offers, indent=2)}")
+    # Dual Percentile Logic
+    # 1. Filter by seller_score percentile
+    seller_score_percentile = current_magma_config.getfloat("magma_autoprice", "seller_score_percentile_target", fallback=10.0) / 100.0
+    relevant_offers.sort(key=lambda x: x['seller_score'], reverse=True) # Sort by score descending
+    
+    num_top_score_sellers = math.ceil(len(relevant_offers) * seller_score_percentile)
+    if num_top_score_sellers == 0 and len(relevant_offers) > 0 : # ensure at least one if relevant_offers exist
+        num_top_score_sellers = 1 
+        
+    high_score_offers = relevant_offers[:num_top_score_sellers]
 
-    percentile_target = current_magma_config.getfloat("magma_autoprice", "pricing_strategy_percentile", fallback=10) / 100.0
-    target_index = int(len(relevant_offers) * percentile_target)
-    target_index = max(0, min(target_index, len(relevant_offers) - 1))
-    benchmark_offer = relevant_offers[target_index]
-    logging.info(f"Initial benchmark for '{our_offer_template_config_proxy.name}' ({percentile_target*100:.0f}th percentile): ID {benchmark_offer['id']}, Alias {benchmark_offer['node_alias']}, APR {benchmark_offer['apr']}%")
+    if not high_score_offers: # If percentile resulted in empty or no relevant offers to begin with
+        logging.warning(f"No high-score sellers found for template '{our_offer_template_config_proxy.name}' after score percentile. Using all relevant_offers for price benchmark or fallback if still none.")
+        # If relevant_offers was populated but high_score_offers is empty due to percentile cut-off,
+        # consider using all relevant_offers for pricing, or stick to the initial fallback logic if relevant_offers itself was empty.
+        # The existing code path will handle if relevant_offers was empty.
+        # If relevant_offers was not empty, but high_score_offers became empty (e.g. percentile too small for the count)
+        # using 'relevant_offers' instead of 'high_score_offers' for price sort might be an option.
+        # For now, if high_score_offers is empty, it means the earlier check for `if not relevant_offers` would trigger fallback.
+        # If relevant_offers had items, but num_top_score_sellers became 0 (e.g. 0.05 percentile on 10 items), we made it pick at least 1.
+        # So high_score_offers should not be empty if relevant_offers was not.
+        # The case of empty relevant_offers is handled above.
+        pass # Fallback logic is already triggered if relevant_offers is empty.
+
+    offers_for_price_benchmark = high_score_offers if high_score_offers else relevant_offers # Fallback to all relevant if high_score subset is somehow empty
+
+    if not offers_for_price_benchmark: # Should be caught by the first `if not relevant_offers`
+        logging.error(f"Critical: No offers available for price benchmark for template {our_offer_template_config_proxy.name} even after fallbacks. Using template mins.")
+        # This is a duplicate of the initial fallback, but as a safeguard.
+        new_fixed_fee = our_offer_template_config_proxy.getint('min_fixed_fee_sats', 0)
+        new_ppm_fee = our_offer_template_config_proxy.getint('min_ppm_fee', 0)
+        global_min_ppm = current_magma_config.getint("magma_autoprice", "global_min_ppm_fee", fallback=0)
+        new_ppm_fee = max(new_ppm_fee, global_min_ppm)
+        our_fallback_apr = calculate_apr(new_fixed_fee, new_ppm_fee, our_size_template, float(our_duration_days_template))
+        return {"channel_size_sats": our_size_template, "duration_days": our_duration_days_template,
+                "fixed_fee_sats": new_fixed_fee, "ppm_fee_rate": new_ppm_fee, "calculated_apr": our_fallback_apr}
+
+    # 2. Sort this (high-score or all relevant) group by APR for price percentile
+    offers_for_price_benchmark.sort(key=lambda x: x['apr'] if x['apr'] is not None else float('inf'))
+    logging.debug(f"Offers for price benchmark (post score filter) for {our_offer_template_config_proxy.name} (count: {len(offers_for_price_benchmark)}): {json.dumps(offers_for_price_benchmark, indent=2 if logging.getLogger().getEffectiveLevel() == logging.DEBUG else None)}")
+
+    price_percentile_target = current_magma_config.getfloat("magma_autoprice", "pricing_strategy_percentile", fallback=10.0) / 100.0
+    target_index = math.floor(len(offers_for_price_benchmark) * price_percentile_target) # floor to be less aggressive initially
+    target_index = max(0, min(target_index, len(offers_for_price_benchmark) - 1))
+    
+    benchmark_offer_initial = offers_for_price_benchmark[target_index]
+    logging.info(f"Initial price benchmark for '{our_offer_template_config_proxy.name}' (from {len(offers_for_price_benchmark)} offers, at {price_percentile_target*100:.0f}th percentile of APR): Score {benchmark_offer_initial['seller_score']}, APR {benchmark_offer_initial['apr']}% by '{benchmark_offer_initial['node_alias']}'")
 
     position_offset = current_magma_config.getint("magma_autoprice", "pricing_strategy_position_offset", fallback=1)
-    final_benchmark_index = min(target_index + position_offset, len(relevant_offers) - 1)
-    final_benchmark_offer = relevant_offers[final_benchmark_index]
-    logging.info(f"Final benchmark for '{our_offer_template_config_proxy.name}' (index {final_benchmark_index}): ID {final_benchmark_offer['id']}, Alias {final_benchmark_offer['node_alias']}, APR {final_benchmark_offer['apr']}%")
+    # Ensure final_benchmark_index is within bounds of the offers_for_price_benchmark list
+    final_benchmark_index = min(target_index + position_offset, len(offers_for_price_benchmark) - 1)
+    final_benchmark_index = max(0, final_benchmark_index) # ensure it's not negative if offset is negative
 
-    new_fixed_fee = final_benchmark_offer['base_fee']
-    new_ppm_fee = final_benchmark_offer['fee_rate']
-    new_fixed_fee = max(our_offer_template_config_proxy.getint('min_fixed_fee_sats', 0),
-                        min(our_offer_template_config_proxy.getint('max_fixed_fee_sats', 1000000), new_fixed_fee))
-    new_ppm_fee = max(our_offer_template_config_proxy.getint('min_ppm_fee', 0),
-                      min(our_offer_template_config_proxy.getint('max_ppm_fee', 10000), new_ppm_fee))
-    global_min_ppm = current_magma_config.getint("magma_autoprice", "global_min_ppm_fee", fallback=0)
-    new_ppm_fee = max(new_ppm_fee, global_min_ppm)
-    our_new_apr = calculate_apr(new_fixed_fee, new_ppm_fee, our_size_template, float(our_duration_days_template))
-    target_apr_min = our_offer_template_config_proxy.getfloat('target_apr_min', 0)
-    target_apr_max = our_offer_template_config_proxy.getfloat('target_apr_max', 100)
-
-    if not (target_apr_min <= our_new_apr <= target_apr_max):
-        logging.warning(f"Calculated APR {our_new_apr}% for template '{our_offer_template_config_proxy.name}' is outside its target range ({target_apr_min}% - {target_apr_max}%). Offer values: Fixed={new_fixed_fee}, PPM={new_ppm_fee}.")
-        
-    final_pricing = {"channel_size_sats": our_size_template, "duration_days": our_duration_days_template,
-                     "fixed_fee_sats": new_fixed_fee, "ppm_fee_rate": new_ppm_fee, "calculated_apr": our_new_apr}
-    logging.info(f"Determined pricing for {our_offer_template_config_proxy.name}: {final_pricing}")
-    return final_pricing
+    final_benchmark_offer = offers_for_price_benchmark[final_benchmark_index]
+    logging.info(f"Final price benchmark for '{our_offer_template_config_proxy.name}' (index {final_benchmark_index}): Score {final_benchmark_offer['seller_score']}, APR {final_benchmark_offer['apr']}% by '{final_benchmark_offer['node_alias']}'")
 
 # --- Manage Our Offers on Amboss ---
 def fetch_my_current_offers():
     logging.info("Fetching my current Magma sell offers...")
     payload = {"query": GET_MY_MAGMA_OFFERS_QUERY}
-    data = _execute_amboss_graphql_request(payload, "GetUserOffers")
-    if data and data.get("getUserOffers", {}).get("list"):
-        my_raw_offers = data["getUserOffers"]["list"]
-        processed_offers = []
+    data = _execute_amboss_graphql_request(payload, "MyOffers") # Changed operation name for clarity
+    
+    processed_offers = []
+    if data and data.get("getUser", {}).get("market", {}).get("offers", {}).get("list"):
+        my_raw_offers = data["getUser"]["market"]["offers"]["list"]
         for offer_item in my_raw_offers:
-            if offer_item and 'offer_details' in offer_item and offer_item['offer_details']:
-                combined_details = {"id": offer_item.get("id"), "status": offer_item.get("status"), **offer_item["offer_details"]}
-                processed_offers.append(combined_details)
-            else: logging.warning(f"Found user offer item without full details: {offer_item.get('id')}")
-        logging.info(f"Found {len(processed_offers)} existing Magma sell offers with details.")
+            try:
+                if not offer_item: continue
+                # Filter for CHANNEL sell offers only
+                if offer_item.get("offer_type") != "CHANNEL" or offer_item.get("side") != "SELL":
+                    logging.debug(f"Skipping own offer {offer_item.get('id')} - not a CHANNEL sell offer. Type: {offer_item.get('offer_type')}, Side: {offer_item.get('side')}")
+                    continue
+
+                # Parse numbers, API returns them as strings or direct numbers sometimes
+                details = {
+                    "id": offer_item.get("id"),
+                    "status": offer_item.get("status", "UNKNOWN").upper(), # Ensure upper for consistency e.g. ENABLED
+                    "offer_type": offer_item.get("offer_type"),
+                    "base_fee": int(offer_item.get("base_fee", 0)),
+                    "fee_rate": int(offer_item.get("fee_rate", 0)),
+                    "max_size": int(offer_item.get("max_size", 0)),
+                    "min_block_length": int(offer_item.get("min_block_length", 0)),
+                    "min_size": int(offer_item.get("min_size", 0)),
+                    "total_size": int(offer_item.get("total_size", 0)),
+                    "side": offer_item.get("side"),
+                    "account": offer_item.get("account")
+                }
+                # Validate essential fields for matching
+                if not (details["id"] and details["status"] != "UNKNOWN" and \
+                        details["min_size"] is not None and details["min_block_length"] is not None):
+                    logging.warning(f"Own offer {offer_item.get('id')} missing essential fields for processing. Skipping. Data: {offer_item}")
+                    continue
+                processed_offers.append(details)
+            except (ValueError, TypeError, KeyError) as e:
+                logging.warning(f"Error parsing own offer {offer_item.get('id', 'N/A')}: {e}. Offer data: {offer_item}")
+                continue
+        logging.info(f"Found and processed {len(processed_offers)} existing Magma CHANNEL sell offers.")
         return processed_offers
     logging.warning("No existing Magma sell offers found or error fetching.")
     return []
@@ -449,15 +568,18 @@ def update_magma_offer(offer_id_to_update, pricing_details, template_capital_for
     duration_blocks = pricing_details["duration_days"] * BLOCKS_PER_DAY
     amboss_offer_input = {
         "base_fee": pricing_details["fixed_fee_sats"], "fee_rate": pricing_details["ppm_fee_rate"],
-        "min_size": pricing_details["channel_size_sats"], "max_size": pricing_details["channel_size_sats"],
-        "min_block_length": duration_blocks, "total_size": template_capital_for_total_size,
-        "base_fee_cap": pricing_details["fixed_fee_sats"], "fee_rate_cap": pricing_details["ppm_fee_rate"],
+        "min_size": pricing_details["channel_size_sats"], "max_size": pricing_details["channel_size_sats"], # Assuming fixed size for our offers
+        "min_block_length": duration_blocks, 
+        "total_size": template_capital_for_total_size
+        # base_fee_cap and fee_rate_cap are part of CreateOfferInput but optional in UpdateOfferDetailsInput
+        # If you want to update them, add them here. For now, matching previous behavior.
     }
     log_prefix = "DRY RUN: Would update" if DRY_RUN_MODE else "Updating"
     logging.info(f"{log_prefix} Magma offer ID {offer_id_to_update} for template '{template_name}' with: {amboss_offer_input}")
 
     if DRY_RUN_MODE:
-        return {"id": offer_id_to_update, **amboss_offer_input, "status_after_update": "DRY_RUN_UNCHANGED_STATUS"}
+        # Simulate the structure of the returned Offer object after update
+        return {"id": offer_id_to_update, **amboss_offer_input, "status": "DRY_RUN_STATUS_POST_UPDATE"}
 
     payload = {"query": UPDATE_MAGMA_OFFER_MUTATION, "variables": {"id": offer_id_to_update, "input": amboss_offer_input}}
     data = _execute_amboss_graphql_request(payload, f"UpdateMagmaOffer-{offer_id_to_update}")
@@ -468,9 +590,10 @@ def update_magma_offer(offer_id_to_update, pricing_details, template_capital_for
         logging.error(f"Failed to update Magma offer ID {offer_id_to_update}. Response: {data}")
         return None
 
-def toggle_magma_offer_status(offer_id, template_name_logging_info, target_status_str):
+def toggle_magma_offer_status(offer_id, template_name_logging_info, target_log_status_str):
     log_prefix = "DRY RUN: Would toggle" if DRY_RUN_MODE else "Toggling"
-    logging.info(f"{log_prefix} Magma offer ID {offer_id} (info: '{template_name_logging_info}') towards {target_status_str} status.")
+    # target_log_status_str is for logging the intent, actual toggle flips the state
+    logging.info(f"{log_prefix} Magma offer ID {offer_id} (info: '{template_name_logging_info}'). Intent from script: {target_log_status_str}.")
     
     if DRY_RUN_MODE:
         logging.info(f"DRY RUN: Simulating toggle for {offer_id} successful.")
@@ -518,7 +641,10 @@ def main():
     TELEGRAM_BOT_TOKEN = general_config.get("telegram", "magma_bot_token", fallback=general_config.get("telegram", "telegram_bot_token", fallback=None))
     TELEGRAM_CHAT_ID = general_config.get("telegram", "telegram_user_id", fallback=None)
     LNCLI_PATH = general_config.get("paths", "lncli_path", fallback="lncli")
+    MY_NODE_PUBKEY = general_config.get("info", "NODE", fallback=None)
 
+    if not MY_NODE_PUBKEY:
+        logging.warning("Node pubkey (info.NODE) not found in general config.ini. Cannot exclude own offers from market analysis. This is not critical for operation but recommended.")
 
     if not magma_specific_config.getboolean("magma_autoprice", "enabled", fallback=False):
         logging.info("Magma autopricing is disabled in Magma config.ini. Exiting.")
@@ -535,8 +661,10 @@ def main():
 
     if capital_for_magma_total_config == 0 and fraction_for_sale > 0:
         logging.warning("No capital available from LND balance for Magma offers based on current configuration.")
+         # We might still want to manage existing offers (e.g. disable them if their template share makes their capital 0)
     
-    market_offers = fetch_public_magma_offers()
+    
+    market_offers = fetch_public_magma_offers(MY_NODE_PUBKEY, magma_specific_config)
     if market_offers is None: market_offers = [] 
     
     my_existing_offers = fetch_my_current_offers()
@@ -564,7 +692,10 @@ def main():
         share = offer_template_proxy.getfloat("capital_allocation_share", fallback=0.0)
         template_capital_limit_for_total_size = int(capital_for_magma_total_config * share)
         
-        template_is_active_by_config = template_capital_limit_for_total_size >= template_channel_size and template_channel_size > 0
+        template_is_active_by_config = template_capital_limit_for_total_size >= template_channel_size and template_channel_size > 0 and \
+                                       magma_specific_config.getboolean(section_name, "template_enabled", fallback=True)
+
+        
 
         new_pricing = analyze_and_price_offer(market_offers, offer_template_proxy, magma_specific_config)
         if not new_pricing: 
@@ -582,7 +713,7 @@ def main():
         
         if found_matching_existing_offer:
             offer_id = found_matching_existing_offer['id']
-            current_status = found_matching_existing_offer.get("status", "UNKNOWN").upper()
+            current_status = found_matching_existing_offer.get("status", "UNKNOWN").upper() # API returns ENABLED/DISABLED
             needs_price_or_total_size_update = (
                 found_matching_existing_offer.get("base_fee") != new_pricing["fixed_fee_sats"] or
                 found_matching_existing_offer.get("fee_rate") != new_pricing["ppm_fee_rate"] or
@@ -590,49 +721,45 @@ def main():
             )
 
             if needs_price_or_total_size_update:
-                logging.info(f"Updating details for existing offer ID {offer_id} ('{template_name}'). New total_size: {template_capital_limit_for_total_size}")
+                logging.info(f"Updating details for existing offer ID {offer_id} ('{template_name}'). Current total_size: {found_matching_existing_offer.get('total_size')}, New total_size: {template_capital_limit_for_total_size}")
                 update_result = update_magma_offer(offer_id, new_pricing, template_capital_limit_for_total_size, template_name)
                 if update_result: actions_summary.append(f"🔄 Updated {template_name} (ID {offer_id}): APR {new_pricing['calculated_apr']}% (F:{new_pricing['fixed_fee_sats']},PPM:{new_pricing['ppm_fee_rate']},TS:{template_capital_limit_for_total_size})")
                 else: actions_summary.append(f"❌ Failed update {template_name} (ID {offer_id})")
             else:
                 logging.info(f"Offer for template '{template_name}' (ID {offer_id}) pricing and total_size are up-to-date.")
 
-            # Status management
-            if template_is_active_by_config and current_status == "USER_DISABLED":
-                if toggle_magma_offer_status(offer_id, template_name, "ACTIVE (enabling)"): actions_summary.append(f"▶️ Enabled {template_name} (ID {offer_id})")
+            # Status management: API uses ENABLED/DISABLED
+            if template_is_active_by_config and current_status == "DISABLED":
+                logging.info(f"Template '{template_name}' (ID {offer_id}) is configured to be active and is currently DISABLED. Attempting to enable.")
+                if toggle_magma_offer_status(offer_id, template_name, "ENABLED (enabling due to config/capital)"): actions_summary.append(f"▶️ Enabled {template_name} (ID {offer_id})")
                 else: actions_summary.append(f"❌ Failed enable {template_name} (ID {offer_id})")
-            elif not template_is_active_by_config and current_status == "ACTIVE":
-                if toggle_magma_offer_status(offer_id, template_name, "USER_DISABLED (disabling due to config/capital)"): actions_summary.append(f"⏸️ Disabled {template_name} (ID {offer_id}) - funding/config")
+            elif not template_is_active_by_config and current_status == "ENABLED":
+                logging.info(f"Template '{template_name}' (ID {offer_id}) is configured to be inactive (funding/config) and is currently ENABLED. Attempting to disable.")
+                if toggle_magma_offer_status(offer_id, template_name, "DISABLED (disabling due to config/capital)"): actions_summary.append(f"⏸️ Disabled {template_name} (ID {offer_id}) - funding/config")
                 else: actions_summary.append(f"❌ Failed disable {template_name} (ID {offer_id})")
-            elif not needs_price_or_total_size_update : # Only add this if no other action message for this offer.
+            elif not needs_price_or_total_size_update : 
                  actions_summary.append(f"ℹ️ No change for {template_name} (ID {offer_id}, Status: {current_status})")
 
         else: # No existing offer found for this template
             if template_is_active_by_config:
-                logging.info(f"Creating new (disabled) offer for template '{template_name}'. Total capital: {template_capital_limit_for_total_size}")
+                logging.info(f"Creating new offer for template '{template_name}'. Total capital for this offer: {template_capital_limit_for_total_size}")
                 create_result = create_magma_offer(new_pricing, template_capital_limit_for_total_size, template_name)
-                if create_result and create_result.get("id"): 
-                    new_id = create_result["id"]
-                    managed_offer_ids_this_run.add(new_id) # Add to managed set
-                    actions_summary.append(f"🚀 Created (disabled) {template_name} (New ID {new_id}): APR {new_pricing['calculated_apr']}% (F:{new_pricing['fixed_fee_sats']},PPM:{new_pricing['ppm_fee_rate']},TS:{template_capital_limit_for_total_size}). Needs manual review/enablement or will enable on next run if funded.")
-                    # Attempt to disable it immediately if Amboss creates it active
-                    # Assuming createOffer returns an ID and we need to check its status or just toggle.
-                    # For safety, let's assume it *might* be active and toggle it to ensure it's disabled.
-                    # This requires knowing the new offer's status post-creation or assuming toggle works.
-                    # The `toggleOffer` in Amboss API likely flips current state.
-                    # If `createOffer` always results in 'ACTIVE', then one toggle makes it 'USER_DISABLED'.
-                    # For now, we rely on the user to enable or the next script run to enable if conditions met.
-                    # No, the spec was: create as disabled. So, if createOffer makes it active, we toggle it.
-                    # The current dry run for createOffer returns a dummy ID.
-                    # A real `createOffer` returns just the ID string. We don't know its status immediately without another fetch.
-                    # Let's call toggle unconditionally after create to ensure USER_DISABLED state initially.
-                    # This means it will be disabled. User enables it or next run enables it if template_is_active_by_config is true.
-                    logging.info(f"Attempting to immediately toggle new offer {new_id} to ensure it is USER_DISABLED.")
-                    if toggle_magma_offer_status(new_id, f"{template_name} (post-create toggle to disable)", "USER_DISABLED (initial set)"):
-                        logging.info(f"Successfully toggled new offer {new_id} to ensure initial USER_DISABLED state.")
+                if create_result and create_result.get("createOffer"): # createOffer returns the new Offer ID string
+                    new_id = create_result["createOffer"]
+                    managed_offer_ids_this_run.add(new_id)
+                    actions_summary.append(f"🚀 Created {template_name} (New ID {new_id}): APR {new_pricing['calculated_apr']}% (F:{new_pricing['fixed_fee_sats']},PPM:{new_pricing['ppm_fee_rate']},TS:{template_capital_limit_for_total_size}). Attempting to set to DISABLED state.")
+                    
+                    # Ensure new offer is initially DISABLED as per requirement.
+                    # Amboss might create it ENABLED by default. A toggle will flip it.
+                    # This assumes createOffer results in ENABLED, so one toggle makes it DISABLED.
+                    # If createOffer could result in DISABLED, this logic needs a pre-check of status.
+                    logging.info(f"Attempting to immediately toggle new offer {new_id} to ensure it is initially DISABLED.")
+                    if toggle_magma_offer_status(new_id, f"{template_name} (post-create toggle to ensure DISABLED)", "DISABLED (initial set)"):
+                        logging.info(f"Successfully toggled new offer {new_id} to ensure initial DISABLED state.")
+                        actions_summary.append(f" राज्यातील Disabled new {template_name} (ID {new_id}) post-creation.") # A more direct summary
                     else:
-                        logging.warning(f"Could not ensure new offer {new_id} is in USER_DISABLED state post-creation via toggle.")
-
+                        logging.warning(f"Could not ensure new offer {new_id} is in DISABLED state post-creation via toggle.")
+                        actions_summary.append(f"⚠️ Failed to ensure {template_name} (ID {new_id}) is DISABLED post-creation.")
                 else: actions_summary.append(f"❌ Failed to create {template_name}")
             else:
                 logging.info(f"Skipping creation for '{template_name}': Template not active by config (e.g. capital limit {template_capital_limit_for_total_size} < channel size {template_channel_size}).")
@@ -641,14 +768,19 @@ def main():
     # Disable orphaned offers
     for existing_offer in my_existing_offers:
         if existing_offer['id'] not in managed_offer_ids_this_run:
-            if existing_offer.get("status", "").upper() == "ACTIVE":
-                logging.info(f"Disabling orphaned or unmanaged active offer ID {existing_offer['id']} (size {existing_offer.get('min_size')}).")
-                if toggle_magma_offer_status(existing_offer['id'], "Orphaned/Unmanaged", "USER_DISABLED (orphaned)"):
-                    actions_summary.append(f"👻 Disabled orphaned offer ID {existing_offer['id']}")
+            # Check if this orphaned offer is of type CHANNEL and side SELL before attempting to disable
+            if existing_offer.get("offer_type") == "CHANNEL" and existing_offer.get("side") == "SELL":
+                if existing_offer.get("status", "").upper() == "ENABLED":
+                    logging.info(f"Disabling orphaned or unmanaged active CHANNEL/SELL offer ID {existing_offer['id']} (size {existing_offer.get('min_size')}).")
+                    if toggle_magma_offer_status(existing_offer['id'], "Orphaned/Unmanaged", "DISABLED (orphaned)"):
+                        actions_summary.append(f"👻 Disabled orphaned offer ID {existing_offer['id']}")
+                    else:
+                        actions_summary.append(f"❌ Failed to disable orphaned offer ID {existing_offer['id']}")
                 else:
-                    actions_summary.append(f"❌ Failed to disable orphaned offer ID {existing_offer['id']}")
+                    logging.debug(f"Orphaned CHANNEL/SELL offer {existing_offer['id']} is already not ENABLED (Status: {existing_offer.get('status')}). No action needed.")
             else:
-                 logging.debug(f"Orphaned offer {existing_offer['id']} is already not ACTIVE (Status: {existing_offer.get('status')}). No action needed.")
+                logging.debug(f"Skipping orphaned offer {existing_offer['id']} as it's not a CHANNEL/SELL offer managed by this script (Type: {existing_offer.get('offer_type')}, Side: {existing_offer.get('side')}).")
+
 
 
     if actions_summary:
