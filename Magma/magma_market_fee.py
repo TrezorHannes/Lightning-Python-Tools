@@ -34,7 +34,7 @@
 import argparse
 import configparser
 import json
-import logging
+import logging.handlers
 import os
 import requests
 import subprocess
@@ -62,8 +62,8 @@ MY_NODE_PUBKEY = None # Loaded from general_config [info] NODE
 
 # --- GraphQL Queries/Mutations ---
 GET_PUBLIC_MAGMA_OFFERS_QUERY = """
-query GetPublicOffers($filter: OfferFilter, $sort: OfferSort, $first: Int, $after: String) {
-  getOffers(filter: $filter, sort: $sort, first: $first, after: $after) {
+query GetPublicOffers {
+  getOffers {
     list {
       id
       offer_type
@@ -145,12 +145,32 @@ def setup_logging():
         os.makedirs(LOG_DIR, exist_ok=True)
     log_level_str = general_config.get("system", "log_level", fallback="INFO").upper()
     numeric_level = getattr(logging, log_level_str, logging.INFO)
-    logging.basicConfig(
-        level=numeric_level,
-        format="%(asctime)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s",
-        handlers=[
-            logging.handlers.RotatingFileHandler(LOG_FILE_PATH, maxBytes=10*1024*1024, backupCount=5),
-            logging.StreamHandler()])
+    
+    # Get the root logger
+    logger = logging.getLogger()
+    logger.setLevel(numeric_level)
+    
+    # Create formatter
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s")
+    
+    # Create handlers
+    # Use logging.handlers.RotatingFileHandler
+    rfh = logging.handlers.RotatingFileHandler(
+        LOG_FILE_PATH, maxBytes=10*1024*1024, backupCount=5
+    )
+    rfh.setFormatter(formatter)
+    
+    sh = logging.StreamHandler()
+    sh.setFormatter(formatter)
+    
+    # Add handlers to the root logger
+    # Clear existing handlers if any, to avoid duplicate logs on re-runs in some environments
+    if logger.hasHandlers():
+        logger.handlers.clear()
+        
+    logger.addHandler(rfh)
+    logger.addHandler(sh)
+    
     logging.getLogger("requests").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("telebot").setLevel(logging.WARNING)
@@ -318,26 +338,22 @@ def get_lnd_onchain_balance(current_general_config):
 # --- Market Analysis & Pricing Logic --- (analyze_and_price_offer and calculate_apr remain largely the same)
 def fetch_public_magma_offers(node_pubkey_to_exclude, current_magma_config):
     logging.info("Fetching public Magma sell offers...")
-    # Server-side filtering
-    filters = {"type": "CHANNEL", "status": "ENABLED", "side": "SELL"}
-    # Sort by seller_score descending to potentially get higher quality offers first, though primary sort for pricing is APR.
-    # The API might not support complex sorts or specific fields like seller_score for sorting.
-    # For now, let's not specify sort and do it client-side if needed for the initial seller_score percentile.
-    # sort_by = {"field": "SELLER_SCORE", "direction": "DESC"} # Example if API supported
-    
-    variables = {"filter": filters, "first": 200} # Fetch a decent number for analysis, max 200-500 usually reasonable
-    
-    payload = {"query": GET_PUBLIC_MAGMA_OFFERS_QUERY, "variables": variables}
+    payload = {"query": GET_PUBLIC_MAGMA_OFFERS_QUERY} 
     data = _execute_amboss_graphql_request(payload, "GetPublicOffers")
     
     processed_offers = []
     if data and data.get("getOffers", {}).get("list"):
         raw_offers = data["getOffers"]["list"]
-        min_seller_score_filter = current_magma_config.getfloat("magma_autoprice", "min_seller_score_filter", fallback=0.0)
+        
+        # Correctly get min_seller_score_filter from the [magma_autoprice] section
+        min_seller_score_filter = get_config_float_with_comment_stripping(
+            current_magma_config["magma_autoprice"], 
+            "min_seller_score_filter", 
+            fallback=0.0
+        )
 
         for offer in raw_offers:
             try:
-                # Basic filtering already done by API, but double check and add client-side ones
                 if offer.get("status") != "ENABLED" or offer.get("side") != "SELL" or offer.get("offer_type") != "CHANNEL":
                     continue
                 if node_pubkey_to_exclude and offer.get("account") == node_pubkey_to_exclude:
@@ -345,7 +361,7 @@ def fetch_public_magma_offers(node_pubkey_to_exclude, current_magma_config):
                     continue
 
                 parsed_offer = {
-                    "id": offer.get("id"), # Assuming 'id' is present for public offers too
+                    "id": offer.get("id"),
                     "offer_type": offer.get("offer_type"),
                     "base_fee": int(offer.get("base_fee", 0)),
                     "fee_rate": int(offer.get("fee_rate", 0)),
@@ -356,22 +372,21 @@ def fetch_public_magma_offers(node_pubkey_to_exclude, current_magma_config):
                     "status": offer.get("status"),
                     "side": offer.get("side"),
                     "total_size": int(offer.get("total_size", 0)),
-                    "account": offer.get("account"), # Seller's pubkey
-                    "node_alias": offer.get("account") # Use account as alias placeholder if no direct alias
+                    "account": offer.get("account"), 
+                    "node_alias": offer.get("account") 
                 }
 
                 if parsed_offer["seller_score"] < min_seller_score_filter:
-                    logging.debug(f"Excluding market offer {parsed_offer['id']} due to seller_score {parsed_offer['seller_score']} < {min_seller_score_filter}")
+                    logging.debug(f"Excluding market offer {parsed_offer.get('id','N/A')} due to seller_score {parsed_offer['seller_score']} < {min_seller_score_filter}")
                     continue
                 
-                # Ensure essential fields for APR calculation are valid
                 if not (parsed_offer["min_size"] > 0 and parsed_offer["min_block_length"] > 0 and parsed_offer["base_fee"] >= 0 and parsed_offer["fee_rate"] >= 0):
                     logging.debug(f"Skipping market offer {parsed_offer.get('id', 'N/A')} due to invalid numeric values for APR calc.")
                     continue
 
                 processed_offers.append(parsed_offer)
-            except (ValueError, TypeError) as e:
-                logging.warning(f"Skipping market offer due to parsing error: {offer.get('id', 'N/A')}. Error: {e}")
+            except (ValueError, TypeError, KeyError) as e: # Added KeyError
+                logging.warning(f"Skipping market offer due to parsing error: {offer.get('id', 'N/A')}. Error: {e}. Offer data: {offer}")
                 continue
         
         logging.info(f"Fetched and processed {len(processed_offers)} relevant public Magma CHANNEL/SELL/ENABLED offers (excluding own, score >= {min_seller_score_filter}).")
@@ -379,6 +394,7 @@ def fetch_public_magma_offers(node_pubkey_to_exclude, current_magma_config):
     else:
         logging.warning("No public Magma offers found or error in fetching.")
         return []
+
 def calculate_apr(fixed_fee_sats, ppm_fee_rate, channel_size_sats, duration_days_float):
     if channel_size_sats == 0 or duration_days_float == 0: return 0.0
     variable_fee_sats = (ppm_fee_rate / 1_000_000) * channel_size_sats
@@ -388,15 +404,15 @@ def calculate_apr(fixed_fee_sats, ppm_fee_rate, channel_size_sats, duration_days
 
 def analyze_and_price_offer(market_offers, our_offer_template_config_proxy, current_magma_config):
     logging.info(f"Analyzing market for offer template: {our_offer_template_config_proxy.name}")
-    our_size_template = our_offer_template_config_proxy.getint('channel_size_sats')
-    our_duration_days_template = our_offer_template_config_proxy.getint('duration_days')
+    
+    # These use the SectionProxy directly, which is correct for the helper
+    our_size_template = get_config_int_with_comment_stripping(our_offer_template_config_proxy, 'channel_size_sats')
+    our_duration_days_template = get_config_int_with_comment_stripping(our_offer_template_config_proxy, 'duration_days')
 
     relevant_offers = []
-    for offer in market_offers: # Market offers are already pre-filtered (CHANNEL, ENABLED, SELL, not own, min_seller_score)
+    for offer in market_offers: 
         try:
-            # Fields directly from pre-processed market_offers
             size = offer['min_size'] 
-            # Assuming we only compete with offers that are fixed size (min_size == max_size)
             if offer['max_size'] != size:
                  logging.debug(f"Skipping variable size market offer {offer.get('id')} for template {our_offer_template_config_proxy.name}")
                  continue
@@ -406,22 +422,21 @@ def analyze_and_price_offer(market_offers, our_offer_template_config_proxy, curr
             ppm_fee = offer['fee_rate']
             duration_days_market = duration_blocks / BLOCKS_PER_DAY if BLOCKS_PER_DAY > 0 else 0
             
-            size_similarity_threshold = current_magma_config.getfloat("magma_autoprice", "size_similarity_threshold", fallback=0.50)
-            duration_similarity_threshold = current_magma_config.getfloat("magma_autoprice", "duration_similarity_threshold", fallback=0.50)
+            # These correctly use the [magma_autoprice] section proxy via current_magma_config["magma_autoprice"]
+            size_similarity_threshold = get_config_float_with_comment_stripping(current_magma_config["magma_autoprice"], "size_similarity_threshold", fallback=0.50)
+            duration_similarity_threshold = get_config_float_with_comment_stripping(current_magma_config["magma_autoprice"], "duration_similarity_threshold", fallback=0.50)
 
-            # Check if market offer is comparable to our template
             size_matches = (abs(size - our_size_template) / our_size_template < size_similarity_threshold if our_size_template > 0 else True)
             duration_matches = (abs(duration_days_market - our_duration_days_template) / our_duration_days_template < duration_similarity_threshold if our_duration_days_template > 0 else True)
 
             if size_matches and duration_matches:
-                # APR calculation should use the market offer's actual size
                 apr = calculate_apr(fixed_fee, ppm_fee, size, duration_days_market)
                 relevant_offers.append({
                     "id": offer.get("id"), "size": size, "duration_blocks": duration_blocks,
                     "duration_days": duration_days_market, "base_fee": fixed_fee, "fee_rate": ppm_fee,
                     "apr": apr, 
-                    "seller_score": offer.get("seller_score", 0.0), # Keep seller_score
-                    "node_alias": offer.get("node_alias", offer.get("account", "N/A")) # 'node_alias' is 'account' here
+                    "seller_score": offer.get("seller_score", 0.0), 
+                    "node_alias": offer.get("node_alias", offer.get("account", "N/A"))
                 })
         except (ValueError, TypeError, ZeroDivisionError, KeyError) as e:
             logging.warning(f"Skipping market offer during analysis due to data issue: {offer.get('id', 'N/A')}, Error: {e}")
@@ -429,70 +444,83 @@ def analyze_and_price_offer(market_offers, our_offer_template_config_proxy, curr
             
     if not relevant_offers:
         logging.warning(f"No relevant market offers found for comparison against template '{our_offer_template_config_proxy.name}'. Using fallback pricing.")
-        new_fixed_fee = our_offer_template_config_proxy.getint('min_fixed_fee_sats', 0)
-        new_ppm_fee = our_offer_template_config_proxy.getint('min_ppm_fee', 0)
-        global_min_ppm = current_magma_config.getint("magma_autoprice", "global_min_ppm_fee", fallback=0)
+        new_fixed_fee = get_config_int_with_comment_stripping(our_offer_template_config_proxy, 'min_fixed_fee_sats', fallback=0) # Added fallback for safety
+        new_ppm_fee = get_config_int_with_comment_stripping(our_offer_template_config_proxy, 'min_ppm_fee', fallback=0) # Added fallback for safety
+        global_min_ppm = get_config_int_with_comment_stripping(current_magma_config["magma_autoprice"], "global_min_ppm_fee", fallback=0)
         new_ppm_fee = max(new_ppm_fee, global_min_ppm)
         our_fallback_apr = calculate_apr(new_fixed_fee, new_ppm_fee, our_size_template, float(our_duration_days_template))
         logging.info(f"Using fallback pricing for {our_offer_template_config_proxy.name}: Fixed={new_fixed_fee}, PPM={new_ppm_fee}, APR={our_fallback_apr}%")
         return {"channel_size_sats": our_size_template, "duration_days": our_duration_days_template,
                 "fixed_fee_sats": new_fixed_fee, "ppm_fee_rate": new_ppm_fee, "calculated_apr": our_fallback_apr}
 
-    # Dual Percentile Logic
-    # 1. Filter by seller_score percentile
-    seller_score_percentile = current_magma_config.getfloat("magma_autoprice", "seller_score_percentile_target", fallback=10.0) / 100.0
-    relevant_offers.sort(key=lambda x: x['seller_score'], reverse=True) # Sort by score descending
+    seller_score_percentile = get_config_float_with_comment_stripping(current_magma_config["magma_autoprice"], "seller_score_percentile_target", fallback=10.0) / 100.0
+    relevant_offers.sort(key=lambda x: x['seller_score'], reverse=True) 
     
     num_top_score_sellers = math.ceil(len(relevant_offers) * seller_score_percentile)
-    if num_top_score_sellers == 0 and len(relevant_offers) > 0 : # ensure at least one if relevant_offers exist
+    if num_top_score_sellers == 0 and len(relevant_offers) > 0 : 
         num_top_score_sellers = 1 
         
     high_score_offers = relevant_offers[:num_top_score_sellers]
 
-    if not high_score_offers: # If percentile resulted in empty or no relevant offers to begin with
+    if not high_score_offers: 
         logging.warning(f"No high-score sellers found for template '{our_offer_template_config_proxy.name}' after score percentile. Using all relevant_offers for price benchmark or fallback if still none.")
-        # If relevant_offers was populated but high_score_offers is empty due to percentile cut-off,
-        # consider using all relevant_offers for pricing, or stick to the initial fallback logic if relevant_offers itself was empty.
-        # The existing code path will handle if relevant_offers was empty.
-        # If relevant_offers was not empty, but high_score_offers became empty (e.g. percentile too small for the count)
-        # using 'relevant_offers' instead of 'high_score_offers' for price sort might be an option.
-        # For now, if high_score_offers is empty, it means the earlier check for `if not relevant_offers` would trigger fallback.
-        # If relevant_offers had items, but num_top_score_sellers became 0 (e.g. 0.05 percentile on 10 items), we made it pick at least 1.
-        # So high_score_offers should not be empty if relevant_offers was not.
-        # The case of empty relevant_offers is handled above.
-        pass # Fallback logic is already triggered if relevant_offers is empty.
+        pass 
 
-    offers_for_price_benchmark = high_score_offers if high_score_offers else relevant_offers # Fallback to all relevant if high_score subset is somehow empty
+    offers_for_price_benchmark = high_score_offers if high_score_offers else relevant_offers 
 
-    if not offers_for_price_benchmark: # Should be caught by the first `if not relevant_offers`
+    if not offers_for_price_benchmark: 
         logging.error(f"Critical: No offers available for price benchmark for template {our_offer_template_config_proxy.name} even after fallbacks. Using template mins.")
-        # This is a duplicate of the initial fallback, but as a safeguard.
-        new_fixed_fee = our_offer_template_config_proxy.getint('min_fixed_fee_sats', 0)
-        new_ppm_fee = our_offer_template_config_proxy.getint('min_ppm_fee', 0)
-        global_min_ppm = current_magma_config.getint("magma_autoprice", "global_min_ppm_fee", fallback=0)
+        new_fixed_fee = get_config_int_with_comment_stripping(our_offer_template_config_proxy, 'min_fixed_fee_sats', fallback=0)
+        new_ppm_fee = get_config_int_with_comment_stripping(our_offer_template_config_proxy, 'min_ppm_fee', fallback=0)
+        global_min_ppm = get_config_int_with_comment_stripping(current_magma_config["magma_autoprice"], "global_min_ppm_fee", fallback=0)
         new_ppm_fee = max(new_ppm_fee, global_min_ppm)
         our_fallback_apr = calculate_apr(new_fixed_fee, new_ppm_fee, our_size_template, float(our_duration_days_template))
         return {"channel_size_sats": our_size_template, "duration_days": our_duration_days_template,
                 "fixed_fee_sats": new_fixed_fee, "ppm_fee_rate": new_ppm_fee, "calculated_apr": our_fallback_apr}
 
-    # 2. Sort this (high-score or all relevant) group by APR for price percentile
     offers_for_price_benchmark.sort(key=lambda x: x['apr'] if x['apr'] is not None else float('inf'))
     logging.debug(f"Offers for price benchmark (post score filter) for {our_offer_template_config_proxy.name} (count: {len(offers_for_price_benchmark)}): {json.dumps(offers_for_price_benchmark, indent=2 if logging.getLogger().getEffectiveLevel() == logging.DEBUG else None)}")
 
-    price_percentile_target = current_magma_config.getfloat("magma_autoprice", "pricing_strategy_percentile", fallback=10.0) / 100.0
-    target_index = math.floor(len(offers_for_price_benchmark) * price_percentile_target) # floor to be less aggressive initially
+    price_percentile_target = get_config_float_with_comment_stripping(current_magma_config["magma_autoprice"], "pricing_strategy_percentile", fallback=10.0) / 100.0
+    target_index = math.floor(len(offers_for_price_benchmark) * price_percentile_target) 
     target_index = max(0, min(target_index, len(offers_for_price_benchmark) - 1))
     
     benchmark_offer_initial = offers_for_price_benchmark[target_index]
     logging.info(f"Initial price benchmark for '{our_offer_template_config_proxy.name}' (from {len(offers_for_price_benchmark)} offers, at {price_percentile_target*100:.0f}th percentile of APR): Score {benchmark_offer_initial['seller_score']}, APR {benchmark_offer_initial['apr']}% by '{benchmark_offer_initial['node_alias']}'")
 
-    position_offset = current_magma_config.getint("magma_autoprice", "pricing_strategy_position_offset", fallback=1)
-    # Ensure final_benchmark_index is within bounds of the offers_for_price_benchmark list
+    position_offset = get_config_int_with_comment_stripping(current_magma_config["magma_autoprice"], "pricing_strategy_position_offset", fallback=1)
     final_benchmark_index = min(target_index + position_offset, len(offers_for_price_benchmark) - 1)
-    final_benchmark_index = max(0, final_benchmark_index) # ensure it's not negative if offset is negative
+    final_benchmark_index = max(0, final_benchmark_index) 
 
     final_benchmark_offer = offers_for_price_benchmark[final_benchmark_index]
     logging.info(f"Final price benchmark for '{our_offer_template_config_proxy.name}' (index {final_benchmark_index}): Score {final_benchmark_offer['seller_score']}, APR {final_benchmark_offer['apr']}% by '{final_benchmark_offer['node_alias']}'")
+
+    new_fixed_fee = final_benchmark_offer['base_fee']
+    new_ppm_fee = final_benchmark_offer['fee_rate']
+    
+    # These use the SectionProxy (our_offer_template_config_proxy), which is correct for the helper
+    new_fixed_fee = max(get_config_int_with_comment_stripping(our_offer_template_config_proxy, 'min_fixed_fee_sats', fallback=0),
+                        min(get_config_int_with_comment_stripping(our_offer_template_config_proxy, 'max_fixed_fee_sats', fallback=1000000), new_fixed_fee))
+    new_ppm_fee = max(get_config_int_with_comment_stripping(our_offer_template_config_proxy, 'min_ppm_fee', fallback=0),
+                      min(get_config_int_with_comment_stripping(our_offer_template_config_proxy, 'max_ppm_fee', fallback=10000), new_ppm_fee))
+    
+    # This uses the [magma_autoprice] section proxy
+    global_min_ppm = get_config_int_with_comment_stripping(current_magma_config["magma_autoprice"], "global_min_ppm_fee", fallback=0)
+    new_ppm_fee = max(new_ppm_fee, global_min_ppm)
+    
+    our_new_apr = calculate_apr(new_fixed_fee, new_ppm_fee, our_size_template, float(our_duration_days_template))
+    
+    # These use the SectionProxy (our_offer_template_config_proxy), which is correct for the helper
+    target_apr_min = get_config_float_with_comment_stripping(our_offer_template_config_proxy, 'target_apr_min', fallback=0.0) # Line 529
+    target_apr_max = get_config_float_with_comment_stripping(our_offer_template_config_proxy, 'target_apr_max', fallback=100.0)
+
+    if not (target_apr_min <= our_new_apr <= target_apr_max):
+        logging.warning(f"Calculated APR {our_new_apr}% for template '{our_offer_template_config_proxy.name}' is outside its target range ({target_apr_min}% - {target_apr_max}%). Offer values: Fixed={new_fixed_fee}, PPM={new_ppm_fee}.")
+        
+    final_pricing = {"channel_size_sats": our_size_template, "duration_days": our_duration_days_template,
+                     "fixed_fee_sats": new_fixed_fee, "ppm_fee_rate": new_ppm_fee, "calculated_apr": our_new_apr}
+    logging.info(f"Determined pricing for {our_offer_template_config_proxy.name}: {final_pricing}")
+    return final_pricing
 
 # --- Manage Our Offers on Amboss ---
 def fetch_my_current_offers():
@@ -610,30 +638,84 @@ def toggle_magma_offer_status(offer_id, template_name_logging_info, target_log_s
 
 # --- Main Application Logic ---
 def main():
-    global general_config, magma_specific_config, AMBOSS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DRY_RUN_MODE, LNCLI_PATH
+    global general_config, magma_specific_config, AMBOSS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DRY_RUN_MODE, LNCLI_PATH, MY_NODE_PUBKEY
 
-    parser = argparse.ArgumentParser(description="Amboss Magma Auto-Pricing Script")
-    parser.add_argument("--dry-run", action="store_true", help="Simulate actions without making live API changes.")
+    HELP_TEXT = """
+    Amboss Magma Auto-Pricing Script.
+    ---------------------------------
+    This script automates pricing for Amboss Magma channel sell offers.
+    It fetches market data, analyzes it based on your configuration,
+    and can create, update, enable, or disable your offers.
+
+    Features:
+    - Reads settings from ../config.ini and Magma/magma_config.ini.
+    - Dual percentile pricing: targets top sellers by score, then their prices.
+    - Excludes own offers from market analysis.
+    - Manages capital allocation based on LND balance and offer shares.
+    - Provides Telegram notifications and detailed logging.
+
+    Disclaimer:
+    ---------------------------------
+    USE THIS SCRIPT AT YOUR OWN RISK.
+    Automated trading and offer management involve financial risk.
+    The author(s) of this script hold NO RESPONSIBILITY for any financial
+    losses, incorrect offer placements, or any other issues that may arise
+    from its use.
+
+    ALWAYS run with --dry-run first to simulate actions and verify behavior
+    against your expectations and configuration. Review logs carefully.
+    Ensure your configuration files (../config.ini, Magma/magma_config.ini)
+    are correctly set up before running live.
+    """
+
+    parser = argparse.ArgumentParser(
+        description="Amboss Magma Auto-Pricing Script.",
+        formatter_class=argparse.RawDescriptionHelpFormatter, # Allows multi-line help
+        epilog=HELP_TEXT # Add disclaimer and detailed help to the --help output
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Simulate actions without making live API changes. Highly recommended for first runs.")
+    parser.add_argument("-f", "--force", action="store_true", help="Force execution without interactive confirmation. Use with caution, intended for automated execution (e.g., systemd).")
     args = parser.parse_args()
     DRY_RUN_MODE = args.dry_run
 
+    # Setup logging early so issues with config files or initial setup can be logged.
+    # General config needs to be read first as it might contain log_level.
     if not os.path.exists(GENERAL_CONFIG_FILE_PATH):
+        # Can't use logging here yet if it depends on general_config
         print(f"CRITICAL: General configuration file {GENERAL_CONFIG_FILE_PATH} not found. Exiting.")
         return
     general_config.read(GENERAL_CONFIG_FILE_PATH)
-    
-    # Setup logging early so issues with magma_config can be logged
-    setup_logging() 
+    setup_logging() # Now setup_logging can use general_config
 
     if not os.path.exists(MAGMA_CONFIG_FILE_PATH):
         logging.critical(f"CRITICAL: Magma-specific configuration file {MAGMA_CONFIG_FILE_PATH} not found. Exiting.")
-        # Try sending telegram if possible (tokens would be loaded after this block if file existed)
-        # For now, just log and exit. Telegram setup happens later.
         return
     magma_specific_config.read(MAGMA_CONFIG_FILE_PATH)
 
+
     if DRY_RUN_MODE:
         logging.info("DRY RUN MODE ENABLED. No actual changes will be made to the API.")
+    else:
+        logging.warning("LIVE MODE: Script will attempt to make actual changes to Amboss Magma offers.")
+        if not args.force:
+            print("\n" + "="*70)
+            print("CONFIRMATION REQUIRED TO PROCEED IN LIVE MODE")
+            print("="*70)
+            print("You are about to run the script in LIVE mode. This will interact")
+            print("with the Amboss API and may create, update, or change the status")
+            print("of your Magma offers, potentially involving real funds.")
+            print("\nEnsure you have reviewed your configuration and understand the risks.")
+            print("It is STRONGLY recommended to run with --dry-run first.")
+            print("="*70)
+            confirm = input("Type 'yes' to proceed with LIVE execution, or anything else to abort: ")
+            if confirm.lower() != 'yes':
+                logging.info("User aborted LIVE execution.")
+                print("Aborted by user.")
+                return
+            logging.info("User confirmed LIVE execution.")
+        else:
+            logging.info("--force flag used, proceeding with LIVE execution without interactive confirmation.")
+
 
     logging.info("Starting Magma Market Fee Updater script.")
 
@@ -655,7 +737,7 @@ def main():
         return
 
     total_lnd_balance_for_magma = get_lnd_onchain_balance(general_config)
-    fraction_for_sale = magma_specific_config.getfloat("magma_autoprice", "lnd_balance_fraction_for_sale", fallback=0.0)
+    fraction_for_sale = get_config_float_with_comment_stripping(magma_specific_config["magma_autoprice"], "lnd_balance_fraction_for_sale", fallback=0.0)
     capital_for_magma_total_config = int(total_lnd_balance_for_magma * fraction_for_sale)
     logging.info(f"LND Balance for Magma (Excl. Loop): {total_lnd_balance_for_magma} sats. Configured Fraction: {fraction_for_sale*100}%. Total Capital for Magma Offers: {capital_for_magma_total_config} sats.")
 
@@ -686,14 +768,20 @@ def main():
             continue
         
         offer_template_proxy = magma_specific_config[section_name]
-        template_channel_size = offer_template_proxy.getint("channel_size_sats")
-        template_duration_days = offer_template_proxy.getint("duration_days")
+        
+        template_channel_size = get_config_int_with_comment_stripping(offer_template_proxy, "channel_size_sats")
+        template_duration_days = get_config_int_with_comment_stripping(offer_template_proxy, "duration_days")
         template_duration_blocks = template_duration_days * BLOCKS_PER_DAY
-        share = offer_template_proxy.getfloat("capital_allocation_share", fallback=0.0)
+        share = get_config_float_with_comment_stripping(offer_template_proxy, "capital_allocation_share", fallback=0.0)
         template_capital_limit_for_total_size = int(capital_for_magma_total_config * share)
         
-        template_is_active_by_config = template_capital_limit_for_total_size >= template_channel_size and template_channel_size > 0 and \
-                                       magma_specific_config.getboolean(section_name, "template_enabled", fallback=True)
+        # getboolean is generally robust to "true # comment" but not "1 # comment" if expecting 1/0
+        # However, the standard values true/false, yes/no, on/off are fine.
+        template_enabled_by_config = magma_specific_config.getboolean(section_name, "template_enabled", fallback=True)
+
+        template_is_active_by_config = template_capital_limit_for_total_size >= template_channel_size and \
+                                       template_channel_size > 0 and \
+                                       template_enabled_by_config
 
         
 
@@ -756,7 +844,7 @@ def main():
                     logging.info(f"Attempting to immediately toggle new offer {new_id} to ensure it is initially DISABLED.")
                     if toggle_magma_offer_status(new_id, f"{template_name} (post-create toggle to ensure DISABLED)", "DISABLED (initial set)"):
                         logging.info(f"Successfully toggled new offer {new_id} to ensure initial DISABLED state.")
-                        actions_summary.append(f" राज्यातील Disabled new {template_name} (ID {new_id}) post-creation.") # A more direct summary
+                        actions_summary.append(f"✅ Disabled new {template_name} (ID {new_id}) post-creation.") # A more direct summary
                     else:
                         logging.warning(f"Could not ensure new offer {new_id} is in DISABLED state post-creation via toggle.")
                         actions_summary.append(f"⚠️ Failed to ensure {template_name} (ID {new_id}) is DISABLED post-creation.")
@@ -797,6 +885,45 @@ def main():
              send_telegram_notification("ℹ️ Magma AutoPrice: No changes made to offers in this run." + (" (DRY RUN)" if DRY_RUN_MODE else ""))
 
     logging.info("Magma Market Fee Updater script finished.")
+
+# Helper functions for config parsing to strip inline comments
+def get_config_int_with_comment_stripping(config_proxy_section, key, fallback=None):
+    """Reads an integer from config, stripping inline comments. Handles missing keys with fallback."""
+    try:
+        value_str = config_proxy_section.get(key)
+        if value_str is None: # Should not happen if key exists, but as a safeguard
+            if fallback is not None: return int(fallback)
+            raise ValueError(f"Config key '{key}' not found in section and no fallback provided.")
+        return int(value_str.split('#')[0].strip())
+    except (configparser.NoOptionError, configparser.NoSectionError):
+        if fallback is not None: return int(fallback)
+        logging.error(f"Config key '{key}' not found and no fallback provided.")
+        raise # Re-raise the original error if no fallback
+    except ValueError as e:
+        logging.error(f"Invalid integer value for config key '{key}': '{value_str}'. Error: {e}")
+        if fallback is not None:
+            logging.warning(f"Using fallback value {fallback} for key '{key}'.")
+            return int(fallback)
+        raise
+
+def get_config_float_with_comment_stripping(config_proxy_section, key, fallback=None):
+    """Reads a float from config, stripping inline comments. Handles missing keys with fallback."""
+    try:
+        value_str = config_proxy_section.get(key)
+        if value_str is None:
+            if fallback is not None: return float(fallback)
+            raise ValueError(f"Config key '{key}' not found in section and no fallback provided.")
+        return float(value_str.split('#')[0].strip())
+    except (configparser.NoOptionError, configparser.NoSectionError):
+        if fallback is not None: return float(fallback)
+        logging.error(f"Config key '{key}' not found and no fallback provided.")
+        raise
+    except ValueError as e:
+        logging.error(f"Invalid float value for config key '{key}': '{value_str}'. Error: {e}")
+        if fallback is not None:
+            logging.warning(f"Using fallback value {fallback} for key '{key}'.")
+            return float(fallback)
+        raise
 
 if __name__ == "__main__":
     main()
