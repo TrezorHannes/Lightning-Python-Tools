@@ -430,6 +430,10 @@ def fetch_public_magma_offers(node_pubkey_to_exclude, current_magma_config):
             fallback=0.0,
         )
 
+        # DEBUG: Log the raw data for verification
+        logging.debug(f"Raw offers count: {len(raw_offers)}")
+        logging.debug(f"Min seller score filter: {min_seller_score_filter}")
+
         for offer in raw_offers:
             try:
                 if (
@@ -463,6 +467,11 @@ def fetch_public_magma_offers(node_pubkey_to_exclude, current_magma_config):
                     "node_alias": offer.get("account"),
                 }
 
+                # DEBUG: Log each offer's score for verification
+                logging.debug(
+                    f"Offer {parsed_offer.get('id', 'N/A')}: score={parsed_offer['seller_score']}, base_fee={parsed_offer['base_fee']}, fee_rate={parsed_offer['fee_rate']}"
+                )
+
                 if parsed_offer["seller_score"] < min_seller_score_filter:
                     logging.debug(
                         f"Excluding market offer {parsed_offer.get('id','N/A')} due to seller_score {parsed_offer['seller_score']} < {min_seller_score_filter}"
@@ -481,11 +490,21 @@ def fetch_public_magma_offers(node_pubkey_to_exclude, current_magma_config):
                     continue
 
                 processed_offers.append(parsed_offer)
-            except (ValueError, TypeError, KeyError) as e:  # Added KeyError
+            except (ValueError, TypeError, KeyError) as e:
                 logging.warning(
                     f"Skipping market offer due to parsing error: {offer.get('id', 'N/A')}. Error: {e}. Offer data: {offer}"
                 )
                 continue
+
+        # DEBUG: Log final filtered results
+        logging.debug(f"Final processed offers count: {len(processed_offers)}")
+        if processed_offers:
+            scores = [offer["seller_score"] for offer in processed_offers]
+            fees = [offer["base_fee"] for offer in processed_offers]
+            ppm_rates = [offer["fee_rate"] for offer in processed_offers]
+            logging.debug(f"Score range: {min(scores)} - {max(scores)}")
+            logging.debug(f"Fee range: {min(fees)} - {max(fees)}")
+            logging.debug(f"PPM range: {min(ppm_rates)} - {max(ppm_rates)}")
 
         logging.info(
             f"Fetched and processed {len(processed_offers)} relevant public Magma CHANNEL/SELL/ENABLED offers (excluding own, score >= {min_seller_score_filter})."
@@ -1580,15 +1599,225 @@ def main():
 
     # --- Dry Run Console Output ---
     if DRY_RUN_MODE:
-        console_output_parts = ["\n--- Magma AutoPrice DRY RUN SUMMARY ---"]
-        log_output_for_file = ["\n--- Magma AutoPrice DRY RUN SUMMARY (Log File) ---"]
+        # Suppress console logging during dry run to show only the summary
+        console_handler = None
+        for handler in logging.getLogger().handlers:
+            if isinstance(handler, logging.StreamHandler) and not isinstance(
+                handler, logging.handlers.RotatingFileHandler
+            ):
+                console_handler = handler
+                console_handler.setLevel(logging.ERROR)  # Only show errors on console
 
-        try:
-            from prettytable import PrettyTable
+        print("\n" + "=" * 60)
+        print(" MAGMA AUTOPRICE DRY RUN SUMMARY 🔷")
+        print("=" * 60)
 
-            def generate_table_string(title, data, fields):
-                if data:
-                    table_string_parts = [f"\n--- {title} ---"]
+        # 1. CAPITAL OVERVIEW (Essential for business decisions)
+        print(f"\n💰 CAPITAL & FUNDING")
+        print(f"   Available Balance: {total_lnd_balance_for_magma:,} sats")
+        print(
+            f"   Allocated to Magma: {capital_for_magma_total_config:,} sats ({fraction_for_sale*100:.0f}%)"
+        )
+
+        # 2. MARKET CONDITIONS (What you need to know about competition)
+        print(f"\n📊 MARKET CONDITIONS")
+        print(
+            f"   Competitive Offers: {len(market_offers)} sellers (score ≥{magma_specific_config.get('magma_autoprice', 'min_seller_score_filter', fallback='85')})"
+        )
+
+        # Show market pricing insights - FIXED: Ensure we're using properly filtered data
+        if market_offers:
+            # Calculate market ranges for quick insight - ONLY from score-filtered offers
+            fixed_fees = [offer["base_fee"] for offer in market_offers]
+            ppm_rates = [offer["fee_rate"] for offer in market_offers]
+            fixed_fees.sort()
+            ppm_rates.sort()
+
+            print(f"   Fixed Fee Range: {fixed_fees[0]:,} - {fixed_fees[-1]:,} sats")
+            print(f"   PPM Rate Range: {ppm_rates[0]:,} - {ppm_rates[-1]:,} ppm")
+
+            # Show where we're positioning
+            target_percentile = magma_specific_config.getint(
+                "magma_autoprice", "pricing_strategy_percentile", fallback=10
+            )
+            target_idx = int(len(fixed_fees) * target_percentile / 100)
+            print(
+                f"   Target Position: Top {target_percentile}% (rank ~{target_idx+1} of {len(fixed_fees)})"
+            )
+
+        # 3. YOUR OFFERS STATUS (Current state) - FIXED: Use available_size instead of min_size
+        print(f"\n YOUR OFFERS STATUS")
+        active_offers = [o for o in my_existing_offers_raw if o["status"] == "ENABLED"]
+        disabled_offers = [
+            o for o in my_existing_offers_raw if o["status"] == "DISABLED"
+        ]
+
+        if active_offers:
+            print(f"   Active: {len(active_offers)} offers")
+            for offer in active_offers:
+                # Use available_size (total_size - locked_size) instead of min_size
+                available_size = offer.get("available_size", 0)
+                print(
+                    f"     • {available_size:,} sats × {offer['duration_days']:.0f}d: {offer['base_fee']:,} + {offer['fee_rate']:,}ppm ({offer['apr']:.1f}% APR)"
+                )
+        else:
+            print("   Active: None")
+
+        if disabled_offers:
+            print(f"   Disabled: {len(disabled_offers)} offers")
+
+        # 4. PROPOSED ACTIONS (What will happen)
+        print(f"\n🎯 PROPOSED ACTIONS")
+        if dry_run_proposed_actions_data:
+            for proposal in dry_run_proposed_actions_data:
+                template = proposal["Template"]
+                action = proposal["Action"]
+
+                if action == "CREATE":
+                    print(f"   ➕ CREATE {template}")
+                    print(f"      Size: {proposal.get('Prop Capital', 'N/A')} sats")
+                    print(
+                        f"      Pricing: {proposal.get('Prop Fixed', '-')} + {proposal.get('Prop PPM', '-')}ppm ({proposal.get('Prop APR', '-')}% APR)"
+                    )
+                    print(
+                        f"      Market: Based on {proposal.get('Benchmark Source', 'N/A')}"
+                    )
+
+                elif action == "UPDATE":
+                    print(f"   🔄 UPDATE {template}")
+                    print(
+                        f"      Current: {proposal.get('Cur Fixed', '-')} + {proposal.get('Cur PPM', '-')}ppm ({proposal.get('Cur APR', '-')}% APR)"
+                    )
+                    print(
+                        f"      Proposed: {proposal.get('Prop Fixed', '-')} + {proposal.get('Prop PPM', '-')}ppm ({proposal.get('Prop APR', '-')}% APR)"
+                    )
+
+                elif action == "NO_CHANGE":
+                    print(f"   ✅ {template}: No changes needed")
+
+                elif action.startswith("SKIP"):
+                    print(f"   ⏭️  {template}: {proposal.get('Reason', 'Skipped')}")
+
+                elif action.endswith("_FAIL"):
+                    print(
+                        f"   ❌ {template}: {action} - {proposal.get('Reason', 'Failed')}"
+                    )
+        else:
+            print("   No actions proposed")
+
+        # 5. ORPHANED OFFERS (Cleanup actions)
+        if dry_run_orphaned_actions_data:
+            print(f"\n CLEANUP ACTIONS")
+            for orphan in dry_run_orphaned_actions_data:
+                print(
+                    f"   🚫 Disable orphaned offer: {orphan['Offer ID'][:8]}... ({orphan['Available Size']} sats)"
+                )
+
+        # 6. KEY INSIGHTS (Business intelligence) - ENHANCED
+        print(f"\n💡 KEY INSIGHTS")
+
+        # APR warnings with actionable advice
+        apr_warnings = []
+        for proposal in dry_run_proposed_actions_data:
+            if proposal.get("Prop APR") and proposal.get("Prop APR") != "-":
+                try:
+                    apr = float(proposal["Prop APR"])
+                    template = proposal["Template"]
+                    if apr < 5.0:
+                        apr_warnings.append(f"   ⚠️  {template}: Low APR ({apr:.1f}%)")
+                        apr_warnings.append(
+                            f"      → Increase min_fixed_fee_sats or min_ppm_fee in [{template}]"
+                        )
+                        apr_warnings.append(
+                            f"      → Or lower target_apr_min in [{template}]"
+                        )
+                    elif apr > 20.0:
+                        apr_warnings.append(
+                            f"   ⚠️  {template}: High APR ({apr:.1f}%) - may be uncompetitive"
+                        )
+                        apr_warnings.append(
+                            f"      → Decrease max_fixed_fee_sats or max_ppm_fee in [{template}]"
+                        )
+                except (ValueError, TypeError):
+                    pass
+
+        if apr_warnings:
+            for warning in apr_warnings:
+                print(warning)
+        else:
+            print("   ✅ All proposed APRs are within reasonable ranges")
+
+        # Market positioning insight with actionable advice
+        if market_offers and dry_run_proposed_actions_data:
+            print(
+                f"   Market positioning: Targeting top {target_percentile}% of {len(market_offers)} competitive sellers"
+            )
+            if target_percentile <= 10:
+                print(
+                    f"      → For higher fees: increase pricing_strategy_percentile (currently {target_percentile})"
+                )
+            elif target_percentile >= 50:
+                print(
+                    f"      → For more competitive pricing: decrease pricing_strategy_percentile (currently {target_percentile})"
+                )
+
+        print("\n" + "=" * 60)
+
+        # Restore console logging level
+        if console_handler:
+            console_handler.setLevel(logging.INFO)
+
+        # Keep detailed logging for file but not console
+        detailed_log_parts = []
+        for title, data, fields in [
+            ("LND & Capital", dry_run_lnd_capital_summary_data, ["Metric", "Value"]),
+            ("Configuration", dry_run_key_config_summary_data, ["Setting", "Value"]),
+            (
+                "Existing Offers",
+                dry_run_existing_offers_summary_data,
+                [
+                    "Offer ID",
+                    "Status",
+                    "Min Size",
+                    "Total Size",
+                    "Avail. Size",
+                    "Duration (Days)",
+                    "Fixed",
+                    "PPM",
+                    "APR (%)",
+                ],
+            ),
+            (
+                "Proposed Actions",
+                dry_run_proposed_actions_data,
+                [
+                    "Template",
+                    "Action",
+                    "Reason",
+                    "Cur Fixed",
+                    "Cur PPM",
+                    "Cur APR",
+                    "Benchmark Source",
+                    "Mkt Fixed (Raw)",
+                    "Mkt PPM (Raw)",
+                    "Prop Fixed",
+                    "Prop PPM",
+                    "Prop APR",
+                    "Prop Capital",
+                    "Projected Status",
+                ],
+            ),
+            (
+                "Orphaned Actions",
+                dry_run_orphaned_actions_data,
+                ["Offer ID", "Action", "Reason", "Available Size"],
+            ),
+        ]:
+            if data:
+                detailed_log_parts.append(f"\n--- {title} ---")
+                try:
+                    from prettytable import PrettyTable
+
                     table = PrettyTable()
                     table.field_names = fields
                     for row_data in data:
@@ -1596,111 +1825,17 @@ def main():
                             [str(row_data.get(field, "-")) for field in fields]
                         )
                     table.align = "l"
-                    table_string_parts.append(table.get_string())
-                    return "\n".join(table_string_parts)
-                return None
+                    detailed_log_parts.append(table.get_string())
+                except ImportError:
+                    # Fallback to simple format for logging
+                    for row_data in data:
+                        row_str = " | ".join(
+                            [str(row_data.get(field, "-")) for field in fields]
+                        )
+                        detailed_log_parts.append(row_str)
 
-            table_titles_fields = [
-                (
-                    "LND & Capital",
-                    dry_run_lnd_capital_summary_data,
-                    ["Metric", "Value"],
-                ),
-                (
-                    "Key Configuration ([magma_autoprice])",
-                    dry_run_key_config_summary_data,
-                    ["Setting", "Value"],
-                ),
-                (
-                    "Your Existing Amboss Offers",
-                    dry_run_existing_offers_summary_data,
-                    [
-                        "Offer ID",
-                        "Status",
-                        "Min Size",
-                        "Total Size",
-                        "Avail. Size",
-                        "Duration (Days)",
-                        "Fixed",
-                        "PPM",
-                        "APR (%)",
-                    ],
-                ),
-                (
-                    "Market Analysis & Proposed Actions",
-                    dry_run_proposed_actions_data,
-                    [
-                        "Template",
-                        "Action",
-                        "Reason",
-                        "Cur Fixed",
-                        "Cur PPM",
-                        "Cur APR",
-                        "Benchmark Source",
-                        "Mkt Fixed (Raw)",
-                        "Mkt PPM (Raw)",
-                        "Prop Fixed",
-                        "Prop PPM",
-                        "Prop APR",
-                        "Prop Capital",
-                        "Projected Status",
-                    ],
-                ),
-                (
-                    "Orphaned Offers Actions",
-                    dry_run_orphaned_actions_data,
-                    ["Offer ID", "Action", "Reason", "Available Size"],
-                ),
-            ]
-
-            console_output_generated = False
-            for title, data, fields in table_titles_fields:
-                table_str = generate_table_string(title, data, fields)
-                if table_str:
-                    # Only print to console if not already part of the main dry run header
-                    if not console_output_generated:
-                        print("\n".join(console_output_parts))  # Print header once
-                    console_output_generated = True
-                    print(table_str)  # Print each table to console
-                    log_output_for_file.append(table_str)
-
-            if (
-                not console_output_generated and console_output_parts
-            ):  # If no tables were generated but header exists
-                print("\n".join(console_output_parts))
-
-            if (
-                log_output_for_file and len(log_output_for_file) > 1
-            ):  # Header + at least one table
-                logging.info("\n".join(log_output_for_file))
-            elif (
-                not console_output_generated
-            ):  # If nothing was printed to console yet (e.g. no data for any table)
-                print("\n".join(console_output_parts))  # Still print the main header
-                logging.info("\n".join(log_output_for_file))
-
-        except ImportError:
-            no_prettytable_msg = "PrettyTable library not found. Skipping detailed table summary for dry run. Install with: pip install prettytable"
-            logging.warning(no_prettytable_msg)
-            # Fallback console output
-            print(
-                f"\n{no_prettytable_msg}\n{console_output_parts[0]}\nDry Run Summary (basic):"
-            )
-            for item_list in [
-                dry_run_lnd_capital_summary_data,
-                dry_run_key_config_summary_data,
-                dry_run_existing_offers_summary_data,
-            ]:
-                for item in item_list:
-                    print(
-                        f"  {item.get('Metric', item.get('Setting', item.get('Offer ID', 'Item')))}: {item.get('Value', item.get('Status', 'Details'))}"
-                    )
-            for item in actions_summary_for_telegram:
-                print(f"  {item}")
-            logging.info(
-                "Dry Run Summary (basic due to no PrettyTable):\n"
-                + "\n".join(actions_summary_for_telegram)
-            )
+        if detailed_log_parts:
+            logging.info("Detailed Dry Run Data:\n" + "\n".join(detailed_log_parts))
 
     # --- Telegram Notification ---
     if actions_summary_for_telegram:
