@@ -54,6 +54,8 @@ Options:
   --lncli-cltv-limit INT Set the CLTV limit (max time lock in blocks) for lncli payinvoice/queryroutes. (Default: 0, LND's default).
                          A lower value might make payments resolve or fail faster.
   --queryroutes-timeout STR Timeout for an individual lncli queryroutes attempt (e.g., '10s', '30s'). Default: 20s.
+  --outgoing-channel-id  Specify a single outgoing channel ID to use for payment. Skips LNDg API query and batching process.
+                         If specified but no channel ID provided, script will prompt for one.
   -h, --help             Show this help message and exit.
 
 Workflow:
@@ -284,6 +286,13 @@ def parse_arguments():
         type=str,
         default="20s",
         help="Timeout for an individual lncli queryroutes attempt (e.g., '10s', '30s'). Default: 20s.",
+    )
+    parser.add_argument(
+        "--outgoing-channel-id",
+        type=str,
+        default=None,
+        help="Specify a single outgoing channel ID to use for payment. Skips LNDg API query and batching process. "
+        "If specified but no channel ID provided, script will prompt for one.",
     )
 
     # Using parser.description which should be set from the constructor.
@@ -2101,6 +2110,276 @@ def send_prepay_probe(config, args, dest_pubkey, amt, outgoing_chan_ids):
     return False, output.get("payment_error", error)
 
 
+def get_channel_info_by_id(config, args, channel_id):
+    """
+    Gets channel information by channel ID using lncli listchannels.
+    Returns a dict with channel info or None if not found.
+    """
+    lncli_path = config.get("lncli_path", "/usr/local/bin/lncli")
+    lnd_rpcserver = config.get("lnd_rpcserver") or "localhost:10009"
+    lnd_tlscertpath = config.get("lnd_tlscertpath") or os.path.expanduser(
+        "~/.lnd/tls.cert"
+    )
+    lnd_macaroonpath = config.get("lnd_macaroonpath") or os.path.expanduser(
+        "~/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
+    )
+
+    command = [
+        lncli_path,
+        "--rpcserver=" + lnd_rpcserver,
+        "--tlscertpath=" + lnd_tlscertpath,
+        "--macaroonpath=" + lnd_macaroonpath,
+        "listchannels",
+        "--json",
+    ]
+
+    success, output, error = run_command(
+        command,
+        timeout=30,
+        debug=args.debug,
+        expect_json=True,
+        dry_run_output="lncli listchannels",
+        verbose=args.verbose,
+    )
+
+    if not success or not isinstance(output, dict):
+        print_color(f"Failed to get channel list: {error}", Colors.FAIL)
+        return None
+
+    channels = output.get("channels", [])
+    for channel in channels:
+        if channel.get("chan_id") == channel_id:
+            return {
+                "id": channel.get("chan_id"),
+                "balance": channel.get("local_balance", 0),
+                "alias": channel.get("remote_alias", "Unknown"),
+                "fee_rate": 0,  # We don't have this from listchannels, but it's not critical for single channel mode
+                "remote_pubkey": channel.get("remote_pubkey"),
+                "capacity": channel.get("capacity"),
+                "active": channel.get("active", False),
+            }
+
+    return None
+
+
+def pay_with_single_channel(config, args, invoice_str, channel_id, debug):
+    """
+    Pays the Lightning invoice using a single specified channel.
+    Returns True on success, False on failure.
+    """
+    print_color(
+        f"\nStep 4: Attempting to pay Lightning invoice via single channel {channel_id}",
+        Colors.HEADER,
+    )
+
+    # Get channel info
+    channel_info = get_channel_info_by_id(config, args, channel_id)
+    if not channel_info:
+        print_color(f"Channel {channel_id} not found or not accessible.", Colors.FAIL)
+        return False, None
+
+    if not channel_info.get("active", False):
+        print_color(
+            f"Channel {channel_id} ({channel_info['alias']}) is not active.",
+            Colors.FAIL,
+        )
+        return False, None
+
+    local_balance = channel_info.get("balance", 0)
+    if local_balance < args.amount:
+        print_color(
+            f"Channel {channel_id} ({channel_info['alias']}) has insufficient balance: "
+            f"{local_balance} sats < {args.amount} sats required.",
+            Colors.FAIL,
+        )
+        return False, None
+
+    print_color(
+        f"Using channel {channel_id} ({channel_info['alias']}) with local balance: {local_balance} sats",
+        Colors.OKGREEN,
+    )
+
+    # Decode invoice
+    decoded_invoice = decode_payreq(config, args, invoice_str)
+    if not decoded_invoice:
+        print_color("Failed to decode Boltz invoice, cannot proceed.", Colors.FAIL)
+        return False, None
+
+    invoice_destination_pubkey = decoded_invoice.get("destination")
+    payment_hash = decoded_invoice.get("payment_hash")
+
+    if not invoice_destination_pubkey or not payment_hash:
+        print_color(
+            "Decoded invoice missing destination pubkey or payment hash.", Colors.FAIL
+        )
+        return False, None
+
+    # Test route with queryroutes
+    lncli_path = config.get("lncli_path", "/usr/local/bin/lncli")
+    lnd_connection_params = [
+        "--rpcserver=" + (config.get("lnd_rpcserver") or "localhost:10009"),
+        "--tlscertpath="
+        + os.path.expanduser(config.get("lnd_tlscertpath") or "~/.lnd/tls.cert"),
+        "--macaroonpath="
+        + os.path.expanduser(
+            config.get("lnd_macaroonpath")
+            or "~/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
+        ),
+    ]
+
+    query_command = [
+        lncli_path,
+        *lnd_connection_params,
+        "queryroutes",
+        "--dest",
+        invoice_destination_pubkey,
+        "--amt",
+        str(args.amount),
+        "--outgoing_chan_id",
+        str(channel_id),
+    ]
+
+    if args.ppm is not None:
+        fee_limit_sats = math.floor(args.amount * args.ppm / 1_000_000)
+        query_command.extend(["--fee_limit", str(fee_limit_sats)])
+    else:
+        query_command.extend(["--fee_limit", "0"])
+
+    if args.lncli_cltv_limit > 0:
+        query_command.extend(["--cltv_limit", str(args.lncli_cltv_limit)])
+
+    query_timeout_val = 30
+    try:
+        if args.queryroutes_timeout.lower().endswith("s"):
+            query_timeout_val = int(args.queryroutes_timeout[:-1])
+        elif args.queryroutes_timeout.lower().endswith("m"):
+            query_timeout_val = int(args.queryroutes_timeout[:-1]) * 60
+        query_timeout_val += 10
+    except ValueError:
+        pass
+
+    print_color(
+        f"Testing route via channel {channel_id} ({channel_info['alias']})...",
+        Colors.OKCYAN,
+    )
+    qr_success, qr_output, qr_error = run_command(
+        query_command,
+        timeout=query_timeout_val,
+        debug=args.debug,
+        expect_json=True,
+        dry_run_output=f"lncli queryroutes via {channel_info['alias']}({channel_id})",
+        verbose=args.verbose,
+    )
+
+    if not qr_success or not isinstance(qr_output, dict) or not qr_output.get("routes"):
+        print_color(
+            f"No route found via channel {channel_id} ({channel_info['alias']}): {qr_error}",
+            Colors.FAIL,
+        )
+        return False, None
+
+    print_color(
+        f"Route found via channel {channel_id} ({channel_info['alias']}). Proceeding with prepay probe...",
+        Colors.OKGREEN,
+    )
+
+    # Prepay probe
+    probe_success, probe_error = send_prepay_probe(
+        config,
+        args,
+        invoice_destination_pubkey,
+        args.amount,
+        [channel_id],
+    )
+
+    if not probe_success:
+        print_color(
+            f"Prepay probe failed for channel {channel_id} ({channel_info['alias']}): {probe_error}",
+            Colors.FAIL,
+        )
+        return False, None
+
+    print_color(
+        f"Prepay probe successful for channel {channel_id} ({channel_info['alias']}). Proceeding with payment...",
+        Colors.OKGREEN,
+    )
+
+    # Actual payment
+    actual_command_list, display_command_str = construct_lncli_command(
+        config, args, invoice_str, [channel_id]
+    )
+
+    lncli_timeout_val = 300  # Default
+    try:
+        if args.payment_timeout.lower().endswith("s"):
+            lncli_timeout_val = int(args.payment_timeout[:-1])
+        elif args.payment_timeout.lower().endswith("m"):
+            lncli_timeout_val = int(args.payment_timeout[:-1]) * 60
+        elif args.payment_timeout.lower().endswith("h"):
+            lncli_timeout_val = int(args.payment_timeout[:-1]) * 3600
+        else:
+            lncli_timeout_val = int(args.payment_timeout)
+    except ValueError:
+        print_color(
+            f"Invalid payment timeout format: {args.payment_timeout}. Using default {lncli_timeout_val}s.",
+            Colors.WARNING,
+        )
+
+    script_subprocess_timeout = (
+        lncli_timeout_val + 30
+    )  # SUBPROCESS_TIMEOUT_BUFFER_SECONDS
+
+    print_color(
+        f"Attempting payment via channel {channel_id} ({channel_info['alias']})...",
+        Colors.OKBLUE,
+    )
+
+    payinvoice_success, payinvoice_output_json, payinvoice_error_stderr = run_command(
+        actual_command_list,
+        timeout=script_subprocess_timeout,
+        debug=args.debug,
+        expect_json=True,
+        dry_run_output="lncli payinvoice",
+        success_codes=[0],
+        display_str_override=display_command_str,
+        attempt_graceful_terminate_on_timeout=True,
+        verbose=args.verbose,
+    )
+
+    if payinvoice_success and isinstance(payinvoice_output_json, dict):
+        payment_error = payinvoice_output_json.get("payment_error", "")
+        payment_preimage = payinvoice_output_json.get("payment_preimage", "")
+
+        if not payment_error and payment_preimage:
+            print_color(
+                f"Payment SUCCESSFUL via channel {channel_id} ({channel_info['alias']})!",
+                Colors.OKGREEN,
+                bold=True,
+            )
+            script_logger.info(
+                f"Payment SUCCESS via channel {channel_id} ({channel_info['alias']}). Preimage: {payment_preimage}"
+            )
+            return True, payment_preimage
+        else:
+            print_color(
+                f"Payment FAILED via channel {channel_id} ({channel_info['alias']}): {payment_error}",
+                Colors.FAIL,
+            )
+            script_logger.warning(
+                f"Payment FAILED via channel {channel_id} ({channel_info['alias']}). Error: {payment_error}"
+            )
+            return False, None
+    else:
+        print_color(
+            f"Payment command failed via channel {channel_id} ({channel_info['alias']}): {payinvoice_error_stderr}",
+            Colors.FAIL,
+        )
+        script_logger.error(
+            f"Payment command failed via channel {channel_id} ({channel_info['alias']}). Error: {payinvoice_error_stderr}"
+        )
+        return False, None
+
+
 def main():
     """Main execution flow."""
     setup_logging()  # Initialize logging system
@@ -2243,50 +2522,58 @@ def main():
             script_logger.error(err_msg.strip())
             sys.exit(1)
 
-        candidate_channels_info = get_swap_candidate_channels(
-            args.lndg_api,  # Use the potentially overridden args.lndg_api
-            config["lndg_username"],
-            config["lndg_password"],
-            args.capacity,
-            args.local_fee_limit,
-            args.debug,
-        )
-        if not candidate_channels_info:
-            err_msg = "\nExiting: No suitable swap candidate channels found."
-            print_color(err_msg, Colors.FAIL, bold=True)
-            script_logger.error(err_msg.strip())
-            sys.exit(1)
-        print_color(
-            f"Total candidate channels for payment: {len(candidate_channels_info)}",
-            Colors.OKBLUE,
-        )
+        # Check if using single channel mode
+        if args.outgoing_channel_id:
+            if not args.outgoing_channel_id.strip():
+                print_color(
+                    "Error: --outgoing-channel-id specified but no channel ID provided.",
+                    Colors.FAIL,
+                )
+                print_color(
+                    "Please provide a channel ID, e.g., --outgoing-channel-id 1234567890123456789",
+                    Colors.FAIL,
+                )
+                sys.exit(1)
 
-        swap_id, lightning_invoice, boltz_response_dict = create_boltz_swap(
-            config["boltzcli_path"],
-            config["boltzd_tlscert_path"],
-            config["boltzd_admin_macaroon_path"],
-            args.amount,
-            lbtc_address,
-            args.description,
-            args.debug,
-            args,  # Add args parameter
-        )
-        if not lightning_invoice:
-            err_msg = "\nExiting: Failed to create Boltz swap or get invoice."
-            print_color(err_msg, Colors.FAIL, bold=True)
-            # Specific error already logged by create_boltz_swap
-            script_logger.error(
-                f"Main: {err_msg.strip()} Amount: {args.amount}, L-BTC Addr: {lbtc_address}"
+            print_color(
+                f"Single channel mode: Using channel ID {args.outgoing_channel_id}",
+                Colors.OKBLUE,
             )
-            sys.exit(1)
 
-        payment_successful, payment_preimage_final = pay_lightning_invoice(
-            config,
-            args,
-            lightning_invoice,
-            candidate_channels_info,
-            args.debug,
-        )
+            payment_successful, payment_preimage_final = pay_with_single_channel(
+                config,
+                args,
+                lightning_invoice,
+                args.outgoing_channel_id,
+                args.debug,
+            )
+        else:
+            # Original batch processing logic
+            candidate_channels_info = get_swap_candidate_channels(
+                args.lndg_api,
+                config["lndg_username"],
+                config["lndg_password"],
+                args.capacity,
+                args.local_fee_limit,
+                args.debug,
+            )
+            if not candidate_channels_info:
+                err_msg = "\nExiting: No suitable swap candidate channels found."
+                print_color(err_msg, Colors.FAIL, bold=True)
+                script_logger.error(err_msg.strip())
+                sys.exit(1)
+            print_color(
+                f"Total candidate channels for payment: {len(candidate_channels_info)}",
+                Colors.OKBLUE,
+            )
+
+            payment_successful, payment_preimage_final = pay_lightning_invoice(
+                config,
+                args,
+                lightning_invoice,
+                candidate_channels_info,
+                args.debug,
+            )
 
         print_color("\n--- Swap Summary ---", Colors.HEADER, bold=True)
         print_color(f"L-BTC Destination Address: {lbtc_address}", Colors.OKCYAN)
