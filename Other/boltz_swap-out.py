@@ -252,7 +252,7 @@ def parse_arguments():
         "--verbose",
         "-v",
         action="store_true",
-        help="Enable verbose output, showing full details of executed commands like LND connection parameters.",
+        help="Enable verbose output, showing full details of executed commands like LND connection parameters and detailed error output.",
     )
     parser.add_argument(
         "--max-payment-attempts",
@@ -327,6 +327,12 @@ def parse_arguments():
     print("LNCLI CLTV Limit: Using LND's default")
 
     print(f"LNCLI QueryRoutes Timeout per attempt: {args.queryroutes_timeout}")
+
+    # Add verbose status to the initial output
+    if args.verbose:
+        print(
+            "Verbose Mode: ENABLED (showing detailed command output and error details)"
+        )
 
     return args, parser
 
@@ -405,6 +411,7 @@ def run_command(
     success_codes=None,
     display_str_override=None,
     attempt_graceful_terminate_on_timeout=False,
+    verbose=False,  # Add verbose parameter
 ):
     """
     Executes a system command.
@@ -503,9 +510,20 @@ def run_command(
                     )
             return True, stdout.strip(), ""
         else:
-            error_msg = f"Command failed with exit code {return_code}.\nStderr: {stderr.strip()}\nStdout: {stdout.strip()}"
-            print_color(error_msg, Colors.FAIL)
-            script_logger.error(f"{error_msg} for command: {actual_command_str}")
+            # Only show detailed output if verbose is enabled
+            if verbose:
+                error_msg = f"Command failed with exit code {return_code}.\nStderr: {stderr.strip()}\nStdout: {stdout.strip()}"
+                print_color(error_msg, Colors.FAIL)
+            else:
+                # Show minimal error info
+                error_msg = f"Command failed with exit code {return_code}."
+                if stderr.strip():
+                    error_msg += f" Stderr: {stderr.strip()}"
+                print_color(error_msg, Colors.FAIL)
+
+            script_logger.error(
+                f"Command failed (exit code {return_code}): {actual_command_str}"
+            )
             return False, stdout.strip(), stderr.strip()
 
     except FileNotFoundError:
@@ -544,13 +562,19 @@ def run_command(
             # Get any final output after attempting to terminate/kill
             try:
                 stdout_after_kill, stderr_after_kill = process.communicate(timeout=5)
-                error_msg += f"\nProcess terminated. Stdout after: {stdout_after_kill.strip()}. Stderr after: {stderr_after_kill.strip()}"
+                if verbose:
+                    error_msg += f"\nProcess terminated. Stdout after: {stdout_after_kill.strip()}. Stderr after: {stderr_after_kill.strip()}"
+                else:
+                    error_msg += "\nProcess terminated."
             except subprocess.TimeoutExpired:
                 error_msg += "\nProcess terminated. Failed to get additional output after termination."
             except Exception as e:
-                error_msg += (
-                    f"\nProcess terminated. Error getting additional output: {e}"
-                )
+                if verbose:
+                    error_msg += (
+                        f"\nProcess terminated. Error getting additional output: {e}"
+                    )
+                else:
+                    error_msg += "\nProcess terminated."
         script_logger.error(f"Command timeout details: {error_msg}")
         return False, "", error_msg
     except Exception as e:
@@ -567,7 +591,11 @@ def get_lbtc_address(pscli_path, debug):
     print_color("\nStep 1: Fetching new L-BTC address...", Colors.HEADER)
     command = [pscli_path, "lbtc-getaddress"]
     success, output, error = run_command(
-        command, debug=debug, expect_json=True, dry_run_output="L-BTC address command"
+        command,
+        debug=debug,
+        expect_json=True,
+        dry_run_output="L-BTC address command",
+        verbose=args.verbose if hasattr(args, "verbose") else False,  # Add this line
     )
 
     if success and isinstance(output, dict) and "address" in output:
@@ -787,6 +815,7 @@ def create_boltz_swap(
         debug=debug,
         expect_json=True,
         dry_run_output="Boltz `createreverseswap` command",
+        verbose=args.verbose if hasattr(args, "verbose") else False,  # Add this line
     )
 
     if success and isinstance(output, dict):
@@ -1191,6 +1220,7 @@ def pay_lightning_invoice(
                     success_codes=[0],
                     display_str_override=display_command_str,
                     attempt_graceful_terminate_on_timeout=True,
+                    verbose=args.verbose,  # Add this line
                 )
             )
 
@@ -1878,6 +1908,7 @@ def decode_payreq(config, args, invoice_str):
         debug=args.debug,
         expect_json=True,
         dry_run_output="lncli decodepayreq command",
+        verbose=args.verbose,  # Add this line
     )
 
     if args.debug and success:  # Simulate successful decode in debug
@@ -2011,6 +2042,7 @@ def send_prepay_probe(config, args, dest_pubkey, amt, outgoing_chan_ids):
         debug=args.debug,
         expect_json=True,
         dry_run_output="lncli prepay probe",
+        verbose=args.verbose,  # Add this line
     )
 
     # Acceptable probe success signals
