@@ -586,7 +586,7 @@ def run_command(
         return False, "", error_msg
 
 
-def get_lbtc_address(pscli_path, debug):
+def get_lbtc_address(pscli_path, debug, args):  # Add args parameter
     """Fetches a new L-BTC address using pscli."""
     print_color("\nStep 1: Fetching new L-BTC address...", Colors.HEADER)
     command = [pscli_path, "lbtc-getaddress"]
@@ -595,7 +595,7 @@ def get_lbtc_address(pscli_path, debug):
         debug=debug,
         expect_json=True,
         dry_run_output="L-BTC address command",
-        verbose=args.verbose if hasattr(args, "verbose") else False,  # Add this line
+        verbose=args.verbose if hasattr(args, "verbose") else False,
     )
 
     if success and isinstance(output, dict) and "address" in output:
@@ -783,6 +783,7 @@ def create_boltz_swap(
     lbtc_address,
     description,
     debug,
+    args,  # Add args parameter
 ):
     """
     Initiates a reverse swap (LN -> L-BTC) using `boltzcli createreverseswap`.
@@ -815,7 +816,7 @@ def create_boltz_swap(
         debug=debug,
         expect_json=True,
         dry_run_output="Boltz `createreverseswap` command",
-        verbose=args.verbose if hasattr(args, "verbose") else False,  # Add this line
+        verbose=args.verbose if hasattr(args, "verbose") else False,
     )
 
     if success and isinstance(output, dict):
@@ -2042,7 +2043,7 @@ def send_prepay_probe(config, args, dest_pubkey, amt, outgoing_chan_ids):
         debug=args.debug,
         expect_json=True,
         dry_run_output="lncli prepay probe",
-        verbose=args.verbose,  # Add this line
+        verbose=False,  # Always suppress verbose output for prepay probes
     )
 
     # Acceptable probe success signals
@@ -2232,7 +2233,9 @@ def main():
                     "Custom address confirmation skipped due to --force."
                 )
         else:
-            lbtc_address = get_lbtc_address(config["pscli_path"], args.debug)
+            lbtc_address = get_lbtc_address(
+                config["pscli_path"], args.debug, args
+            )  # Add args
 
         if not lbtc_address:
             err_msg = "\nExiting: L-BTC address not available or confirmed."
@@ -2266,6 +2269,7 @@ def main():
             lbtc_address,
             args.description,
             args.debug,
+            args,  # Add args parameter
         )
         if not lightning_invoice:
             err_msg = "\nExiting: Failed to create Boltz swap or get invoice."
