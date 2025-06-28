@@ -313,8 +313,12 @@ def parse_arguments():
         print("DEBUG MODE ENABLED: No actual transactions.")
         script_logger.setLevel(logging.DEBUG)  # More verbose logging in debug mode
     print(f"Swap Amount (LN): {args.amount} sats")
-    print(f"Min Local Balance (candidates): {args.capacity} sats")
-    print(f"Max Local Fee (LNDg candidates): {args.local_fee_limit} ppm")
+
+    # Only show LNDg-specific settings if not using single channel mode
+    if not args.outgoing_channel_id:
+        print(f"Min Local Balance (candidates): {args.capacity} sats")
+        print(f"Max Local Fee (LNDg candidates): {args.local_fee_limit} ppm")
+
     print(f"LNDg API: {args.lndg_api}")
     print(f"LNCLI Payment Timeout: {args.payment_timeout}")
 
@@ -2053,22 +2057,38 @@ def send_prepay_probe(config, args, dest_pubkey, amt, outgoing_chan_ids):
         expect_json=True,
         dry_run_output="lncli prepay probe",
         verbose=False,  # Always suppress verbose output for prepay probes
+        success_codes=[
+            0,
+            1,
+        ],  # Accept both success (0) and "failure" (1) exit codes for probes
     )
 
     # Acceptable probe success signals
     def is_probe_success(output):
-        # Check both payment_error and failure_reason fields
-        for key in ("payment_error", "failure_reason"):
-            val = output.get(key, "")
-            if any(
-                s in val
-                for s in [
-                    "INCORRECT_PAYMENT_DETAILS",
-                    "INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS",
-                    "FAILURE_REASON_INCORRECT_PAYMENT_DETAILS",
-                ]
-            ):
-                return True
+        # Check failure_reason field first (most reliable)
+        failure_reason = output.get("failure_reason", "")
+        if any(
+            s in failure_reason
+            for s in [
+                "FAILURE_REASON_INCORRECT_PAYMENT_DETAILS",
+                "INCORRECT_PAYMENT_DETAILS",
+                "INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS",
+            ]
+        ):
+            return True
+
+        # Check payment_error field
+        payment_error = output.get("payment_error", "")
+        if any(
+            s in payment_error
+            for s in [
+                "INCORRECT_PAYMENT_DETAILS",
+                "INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS",
+                "FAILURE_REASON_INCORRECT_PAYMENT_DETAILS",
+            ]
+        ):
+            return True
+
         # Also check htlcs for failure code
         for htlc in output.get("htlcs", []):
             failure = htlc.get("failure", {})
@@ -2080,20 +2100,8 @@ def send_prepay_probe(config, args, dest_pubkey, amt, outgoing_chan_ids):
                 return True
         return False
 
-    if not success:
-        # Sometimes output is still a dict even if exit code != 0
-        if isinstance(output, dict) and is_probe_success(output):
-            print_color(
-                "Prepay probe reached destination (INCORRECT_PAYMENT_DETAILS or similar). Route is viable.",
-                Colors.OKGREEN,
-            )
-            script_logger.info(
-                "Prepay probe: INCORRECT_PAYMENT_DETAILS or similar (route viable)"
-            )
-            return True, None
-        return False, f"Probe command failed: {error if error else output}"
-
-    if is_probe_success(output):
+    # Always check the output for probe success signals, regardless of exit code
+    if isinstance(output, dict) and is_probe_success(output):
         print_color(
             "Prepay probe reached destination (INCORRECT_PAYMENT_DETAILS or similar). Route is viable.",
             Colors.OKGREEN,
@@ -2103,63 +2111,70 @@ def send_prepay_probe(config, args, dest_pubkey, amt, outgoing_chan_ids):
         )
         return True, None
 
-    print_color(
-        f"Prepay probe failed: {output.get('payment_error', error)}", Colors.WARNING
-    )
-    script_logger.warning(f"Prepay probe failed: {output.get('payment_error', error)}")
-    return False, output.get("payment_error", error)
+    # If we get here, the probe failed for a reason other than incorrect payment details
+    error_msg = f"Probe failed: {output.get('failure_reason', output.get('payment_error', error))}"
+    print_color(f"Prepay probe failed: {error_msg}", Colors.WARNING)
+    script_logger.warning(f"Prepay probe failed: {error_msg}")
+    return False, error_msg
 
 
 def get_channel_info_by_id(config, args, channel_id):
     """
-    Gets channel information by channel ID using lncli listchannels.
+    Gets channel information by channel ID using LNDg API.
     Returns a dict with channel info or None if not found.
     """
-    lncli_path = config.get("lncli_path", "/usr/local/bin/lncli")
-    lnd_rpcserver = config.get("lnd_rpcserver") or "localhost:10009"
-    lnd_tlscertpath = config.get("lnd_tlscertpath") or os.path.expanduser(
-        "~/.lnd/tls.cert"
-    )
-    lnd_macaroonpath = config.get("lnd_macaroonpath") or os.path.expanduser(
-        "~/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
-    )
+    # Use LNDg API to get channel info (more efficient than lncli listchannels)
+    api_url = f"{args.lndg_api}/api/channels?limit=5000&is_open=true&is_active=true"
 
-    command = [
-        lncli_path,
-        "--rpcserver=" + lnd_rpcserver,
-        "--tlscertpath=" + lnd_tlscertpath,
-        "--macaroonpath=" + lnd_macaroonpath,
-        "listchannels",
-        "--json",
-    ]
+    try:
+        response = requests.get(
+            api_url, auth=(config["lndg_username"], config["lndg_password"]), timeout=30
+        )
+        response.raise_for_status()
+        data = response.json()
 
-    success, output, error = run_command(
-        command,
-        timeout=30,
-        debug=args.debug,
-        expect_json=True,
-        dry_run_output="lncli listchannels",
-        verbose=args.verbose,
-    )
+        if "results" in data:
+            for channel in data["results"]:
+                if channel.get("chan_id") == channel_id:
+                    return {
+                        "id": channel.get("chan_id"),
+                        "balance": channel.get("local_balance", 0),
+                        "alias": channel.get("alias", "Unknown"),
+                        "fee_rate": channel.get("local_fee_rate", 0),
+                        "remote_pubkey": channel.get("remote_pubkey"),
+                        "capacity": channel.get("capacity"),
+                        "active": channel.get("is_active", False),
+                    }
 
-    if not success or not isinstance(output, dict):
-        print_color(f"Failed to get channel list: {error}", Colors.FAIL)
-        return None
+        # If not found in LNDg, return minimal info with just the channel ID
+        print_color(
+            f"Channel {channel_id} not found in LNDg API. Using minimal channel info.",
+            Colors.WARNING,
+        )
 
-    channels = output.get("channels", [])
-    for channel in channels:
-        if channel.get("chan_id") == channel_id:
-            return {
-                "id": channel.get("chan_id"),
-                "balance": channel.get("local_balance", 0),
-                "alias": channel.get("remote_alias", "Unknown"),
-                "fee_rate": 0,  # We don't have this from listchannels, but it's not critical for single channel mode
-                "remote_pubkey": channel.get("remote_pubkey"),
-                "capacity": channel.get("capacity"),
-                "active": channel.get("active", False),
-            }
+        return {
+            "id": channel_id,
+            "balance": 0,  # We'll check this with queryroutes
+            "alias": f"Channel_{channel_id}",
+            "fee_rate": 0,
+            "remote_pubkey": None,
+            "capacity": 0,
+            "active": True,  # Assume active since we're trying to use it
+        }
 
-    return None
+    except requests.exceptions.RequestException as e:
+        print_color(f"Failed to get channel info from LNDg API: {e}", Colors.FAIL)
+        print_color(f"Using minimal channel info for {channel_id}", Colors.WARNING)
+
+        return {
+            "id": channel_id,
+            "balance": 0,  # We'll check this with queryroutes
+            "alias": f"Channel_{channel_id}",
+            "fee_rate": 0,
+            "remote_pubkey": None,
+            "capacity": 0,
+            "active": True,  # Assume active since we're trying to use it
+        }
 
 
 def pay_with_single_channel(config, args, invoice_str, channel_id, debug):
@@ -2186,18 +2201,23 @@ def pay_with_single_channel(config, args, invoice_str, channel_id, debug):
         return False, None
 
     local_balance = channel_info.get("balance", 0)
-    if local_balance < args.amount:
+    if local_balance > 0:  # Only check balance if we have it
+        if local_balance < args.amount:
+            print_color(
+                f"Channel {channel_id} ({channel_info['alias']}) has insufficient balance: "
+                f"{local_balance} sats < {args.amount} sats required.",
+                Colors.FAIL,
+            )
+            return False, None
         print_color(
-            f"Channel {channel_id} ({channel_info['alias']}) has insufficient balance: "
-            f"{local_balance} sats < {args.amount} sats required.",
-            Colors.FAIL,
+            f"Using channel {channel_id} ({channel_info['alias']}) with local balance: {local_balance} sats",
+            Colors.OKGREEN,
         )
-        return False, None
-
-    print_color(
-        f"Using channel {channel_id} ({channel_info['alias']}) with local balance: {local_balance} sats",
-        Colors.OKGREEN,
-    )
+    else:
+        print_color(
+            f"Using channel {channel_id} ({channel_info['alias']}) - balance will be checked during route query",
+            Colors.OKGREEN,
+        )
 
     # Decode invoice
     decoded_invoice = decode_payreq(config, args, invoice_str)
@@ -2402,11 +2422,22 @@ def main():
     )
     print_color(f"LNDg API: {args.lndg_api}", Colors.OKCYAN)
     print_color(f"Swap Amount (LN): {args.amount} sats", Colors.OKCYAN)
-    print_color(f"Min Local Balance (candidates): {args.capacity} sats", Colors.OKCYAN)
-    print_color(
-        f"Max Local Fee (candidates): {args.local_fee_limit} ppm", Colors.OKCYAN
-    )
-    # Print other relevant args if they can also be overridden by config
+
+    # Adapt output based on mode
+    if args.outgoing_channel_id:
+        print_color(
+            f"Mode: Single Channel (ID: {args.outgoing_channel_id})", Colors.OKCYAN
+        )
+        print_color(
+            "Note: LNDg API and batching process will be skipped", Colors.OKCYAN
+        )
+    else:
+        print_color(
+            f"Min Local Balance (candidates): {args.capacity} sats", Colors.OKCYAN
+        )
+        print_color(
+            f"Max Local Fee (candidates): {args.local_fee_limit} ppm", Colors.OKCYAN
+        )
 
     print_color("\n--- Initial Configuration & Paths ---", Colors.HEADER, bold=True)
     if args.debug:
@@ -2522,6 +2553,25 @@ def main():
             script_logger.error(err_msg.strip())
             sys.exit(1)
 
+        # Create Boltz swap first (required for both modes)
+        swap_id, lightning_invoice, boltz_response_dict = create_boltz_swap(
+            config["boltzcli_path"],
+            config["boltzd_tlscert_path"],
+            config["boltzd_admin_macaroon_path"],
+            args.amount,
+            lbtc_address,
+            args.description,
+            args.debug,
+            args,
+        )
+        if not lightning_invoice:
+            err_msg = "\nExiting: Failed to create Boltz swap or get invoice."
+            print_color(err_msg, Colors.FAIL, bold=True)
+            script_logger.error(
+                f"Main: {err_msg.strip()} Amount: {args.amount}, L-BTC Addr: {lbtc_address}"
+            )
+            sys.exit(1)
+
         # Check if using single channel mode
         if args.outgoing_channel_id:
             if not args.outgoing_channel_id.strip():
@@ -2578,6 +2628,15 @@ def main():
         print_color("\n--- Swap Summary ---", Colors.HEADER, bold=True)
         print_color(f"L-BTC Destination Address: {lbtc_address}", Colors.OKCYAN)
         print_color(f"Boltz Swap ID: {swap_id if swap_id else 'N/A'}", Colors.OKCYAN)
+
+        # Add mode-specific summary information
+        if args.outgoing_channel_id:
+            print_color(
+                f"Payment Mode: Single Channel ({args.outgoing_channel_id})",
+                Colors.OKCYAN,
+            )
+        else:
+            print_color(f"Payment Mode: Multi-Channel Batch", Colors.OKCYAN)
 
         log_details = {
             "SwapID": swap_id if swap_id else "N/A",
