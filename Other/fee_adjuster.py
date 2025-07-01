@@ -586,10 +586,16 @@ def update_lndg_fee(
 
     # Then, update the fee policy (outgoing and inbound)
     fee_update_url = f"{lndg_api_url}/api/chanpolicy/"
+    
+    # Fix: Send -0 instead of 0 for inbound fees to ensure LNDg properly sets it to zero
+    inbound_fee_to_send = new_inbound_fee_rate_ppm
+    if inbound_fee_to_send == 0:
+        inbound_fee_to_send = -0  # Explicitly set to negative zero
+    
     fee_payload = {
         "chan_id": chan_id,
         "fee_rate": new_outgoing_fee_rate,
-        "inbound_fee_rate": new_inbound_fee_rate_ppm,
+        "inbound_fee_rate": inbound_fee_to_send,
     }
 
     try:
@@ -1261,13 +1267,10 @@ def main():
                         not should_update_lndg_for_this_channel
                         and inbound_auto_fee_enabled_for_node
                     ):
-                        current_inbound_fee_on_channel = channel_data.get(
-                            "local_inbound_fee_rate", 0
-                        )
-                        if (
-                            current_inbound_fee_on_channel is None
-                        ):  # Handle None from API
-                            current_inbound_fee_on_channel = 0
+                        current_inbound_fee_on_channel = int(channel_data.get("local_inbound_fee_rate", 0) or 0)
+                        current_chan_calculated_inbound_ppm = int(current_chan_calculated_inbound_ppm)
+
+                        logging.debug(f"Comparing inbound fee: current={current_inbound_fee_on_channel} (type {type(current_inbound_fee_on_channel)}), new={current_chan_calculated_inbound_ppm} (type {type(current_chan_calculated_inbound_ppm)})")
 
                         inbound_fee_delta = abs(
                             current_chan_calculated_inbound_ppm
