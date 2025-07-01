@@ -2014,6 +2014,34 @@ def send_prepay_probe(config, args, dest_pubkey, amt, outgoing_chan_ids):
     # Generate random 32-byte payment hash
     fake_payment_hash = binascii.hexlify(os.urandom(32)).decode()
 
+    # Calculate timeout values using the same logic as the real payment
+    lncli_timeout_val = 300  # Default
+    try:
+        if args.payment_timeout.lower().endswith("s"):
+            lncli_timeout_val = int(args.payment_timeout[:-1])
+        elif args.payment_timeout.lower().endswith("m"):
+            lncli_timeout_val = int(args.payment_timeout[:-1]) * 60
+        elif args.payment_timeout.lower().endswith("h"):
+            lncli_timeout_val = int(args.payment_timeout[:-1]) * 3600
+        else:
+            lncli_timeout_val = int(args.payment_timeout)
+    except ValueError:
+        print_color(
+            f"Invalid payment timeout format: {args.payment_timeout}. Using default {lncli_timeout_val}s for probe.",
+            Colors.WARNING,
+        )
+        script_logger.warning(
+            f"Invalid payment timeout format: {args.payment_timeout}. Using default {lncli_timeout_val}s for probe."
+        )
+
+    # Convert to string format for lncli (e.g., 300 -> "5m", 60 -> "1m", 30 -> "30s")
+    if lncli_timeout_val >= 3600:
+        lncli_timeout_str = f"{lncli_timeout_val // 3600}h"
+    elif lncli_timeout_val >= 60:
+        lncli_timeout_str = f"{lncli_timeout_val // 60}m"
+    else:
+        lncli_timeout_str = f"{lncli_timeout_val}s"
+
     command = [
         lncli_path,
         "--rpcserver=" + lnd_rpcserver,
@@ -2027,7 +2055,7 @@ def send_prepay_probe(config, args, dest_pubkey, amt, outgoing_chan_ids):
         "--payment_hash",
         fake_payment_hash,
         "--timeout",
-        "30s",
+        lncli_timeout_str,
         "--json",
     ]
     for chan_id in outgoing_chan_ids:
@@ -2043,16 +2071,19 @@ def send_prepay_probe(config, args, dest_pubkey, amt, outgoing_chan_ids):
         command.extend(["--cltv_limit", str(args.lncli_cltv_limit)])
 
     print_color(
-        f"Probing route with fake payment hash (prepay probe) for {amt} sats via channels: {', '.join(str(c) for c in outgoing_chan_ids)}",
+        f"Probing route with fake payment hash (prepay probe) for {amt} sats via channels: {', '.join(str(c) for c in outgoing_chan_ids)} (timeout: {lncli_timeout_str})",
         Colors.WARNING,
     )
     script_logger.info(
-        f"Prepay probe: {amt} sats, outgoing_chan_ids: {outgoing_chan_ids}"
+        f"Prepay probe: {amt} sats, outgoing_chan_ids: {outgoing_chan_ids}, timeout: {lncli_timeout_str}"
     )
+
+    # Use the same subprocess timeout calculation as the real payment
+    script_subprocess_timeout = lncli_timeout_val + SUBPROCESS_TIMEOUT_BUFFER_SECONDS
 
     success, output, error = run_command(
         command,
-        timeout=40,
+        timeout=script_subprocess_timeout,
         debug=args.debug,
         expect_json=True,
         dry_run_output="lncli prepay probe",
