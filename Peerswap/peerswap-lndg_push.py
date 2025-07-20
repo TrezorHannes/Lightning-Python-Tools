@@ -131,15 +131,17 @@ def filter_and_delete_notes(peers_info, channels_data, dry_run=False):
 
     for channel in channels_data:
         channel_id = channel.get("scid")
+        alias = channel.get("peer_alias", "Unknown")
         if channel_id not in pscli_channel_ids:
             current_notes = get_current_notes(channel_id)
             if current_notes and current_notes.startswith("Swaps Allowed"):
+                msg = f"{alias} (channel {channel_id})"
                 if dry_run:
-                    print(f"[DRY RUN] Would delete notes for channel {channel_id}. Is their daemon running?")
+                    print(f"[DRY RUN] Would delete notes for {msg}. Is their daemon running?")
                 else:
                     update_notes(channel_id, "")  # Clear the notes
-                    print(f"Deleted notes for channel {channel_id}. Is their daemon running?")
-                    logging.info(f"Deleted notes channel {channel_id} Is their daemon running?")
+                    print(f"Deleted notes for {msg}. Is their daemon running?")
+                    logging.info(f"Deleted notes for {msg}. Is their daemon running?")
 
 
 def get_current_timestamp():
@@ -317,4 +319,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. Exiting cleanly.")
+        logging.info("Script interrupted by user (CTRL-C). Exiting cleanly.")
+        exit(0)
