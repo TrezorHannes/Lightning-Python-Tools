@@ -20,6 +20,8 @@ Configuration Settings (see fee_adjuster_config_docs.txt for details):
   - enabled: true/false.
   - stuck_time_period: Number of days defining one 'stuck period' interval (e.g., 7).
   - min_local_balance_for_stuck_discount: (Optional) If the peer's aggregate local balance ratio is below this threshold (e.g., 0.2 for 20%), the stuck discount will not be applied.
+  - min_updates_for_discount: (Optional) If the channel's `num_updates` is below this threshold, the fee band discount will not be applied. This is useful to prevent applying a discount to a newly opened channel.
+
 - inbound_auto_fee_enabled: (Optional) Enables dynamic inbound fee adjustments. Can be set per-node or per-group. Defaults to false if not specified.
   - If enabled, the script will attempt to set a negative inbound fee (a discount) to incentivize rebalancing towards your node.
   - The discount is calculated based on the channel's `ar_max_cost` (auto-rebalancer max cost percentage, fetched from LNDg) and the current local liquidity band.
@@ -368,6 +370,7 @@ def calculate_stuck_channel_band_adjustment(
 def calculate_fee_band_adjustment(
     fee_conditions,
     outbound_ratio,
+    num_updates,
     stuck_bands_to_move_down=0,  # New parameter: Number of bands to move down due to stuck status
 ):
     """
@@ -394,6 +397,10 @@ def calculate_fee_band_adjustment(
     fee_bands = fee_conditions.get("fee_bands", {})
     discount = fee_bands.get("discount", 0)
     premium = fee_bands.get("premium", 0)
+
+    # Get min_updates_for_discount from stuck_channel_adjustment section
+    stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
+    min_updates_for_discount = stuck_settings.get("min_updates_for_discount", 0)
 
     # Calculate the initial band based on current liquidity (0-4)
     # Band 0 (80-100% local) -> index 0
@@ -422,6 +429,10 @@ def calculate_fee_band_adjustment(
         # Calculate adjustment percentage based on the effective band (0-3)
         adjustment_per_band_step = adjustment_range / 3.0
         adjustment = discount + effective_band_for_calc * adjustment_per_band_step
+
+    # If the channel is new, don't apply the discount
+    if num_updates < min_updates_for_discount and adjustment < 0:
+        adjustment = 0
 
     # Return the multiplicative factor and the initial/final bands for printing/notes
     return 1 + adjustment, initial_raw_band, adjusted_raw_band
@@ -492,6 +503,7 @@ def get_channels_to_modify(pubkey, config):
                     auto_fees = result.get("auto_fees", False)
                     ar_max_cost = result.get("ar_max_cost")
                     local_inbound_fee_rate = result.get("local_inbound_fee_rate")
+                    num_updates = result.get("num_updates", 0)
 
                     if is_open:
                         local_balance_ratio = (
@@ -512,6 +524,7 @@ def get_channels_to_modify(pubkey, config):
                             "auto_fees": auto_fees,
                             "ar_max_cost": ar_max_cost,
                             "local_inbound_fee_rate": local_inbound_fee_rate,
+                            "num_updates": num_updates,
                         }
         return channels_to_modify
     except requests.exceptions.RequestException as e:
@@ -586,12 +599,12 @@ def update_lndg_fee(
 
     # Then, update the fee policy (outgoing and inbound)
     fee_update_url = f"{lndg_api_url}/api/chanpolicy/"
-    
+
     # Fix: Send -0 instead of 0 for inbound fees to ensure LNDg properly sets it to zero
     inbound_fee_to_send = new_inbound_fee_rate_ppm
     if inbound_fee_to_send == 0:
         inbound_fee_to_send = -0  # Explicitly set to negative zero
-    
+
     fee_payload = {
         "chan_id": chan_id,
         "fee_rate": new_outgoing_fee_rate,
@@ -833,6 +846,8 @@ def print_fee_adjustment(
     fee_band_enabled,
     fee_band_discount,
     fee_band_premium,
+    num_updates,
+    min_updates_for_discount,
     initial_raw_band,  # Initial band based on liquidity
     stuck_adj_bands_applied,  # How many bands were moved down due to stuck status
     final_raw_band,  # Final band used for adjustment calculation
@@ -867,6 +882,8 @@ def print_fee_adjustment(
             f"Local Balance: {local_balance:,.0f} | (Outbound: {outbound_ratio*100:.1f}%)"
         )
     print(f"Old Fee Rate (LNDg): {old_fee_rate}")
+    print(f"Num Updates: {num_updates}")
+    print(f"Min Updates for Discount: {min_updates_for_discount}")
 
     # --- Waterfall ---
     print("\n--- Fee Calculation Waterfall ---")
@@ -1267,10 +1284,16 @@ def main():
                         not should_update_lndg_for_this_channel
                         and inbound_auto_fee_enabled_for_node
                     ):
-                        current_inbound_fee_on_channel = int(channel_data.get("local_inbound_fee_rate", 0) or 0)
-                        current_chan_calculated_inbound_ppm = int(current_chan_calculated_inbound_ppm)
+                        current_inbound_fee_on_channel = int(
+                            channel_data.get("local_inbound_fee_rate", 0) or 0
+                        )
+                        current_chan_calculated_inbound_ppm = int(
+                            current_chan_calculated_inbound_ppm
+                        )
 
-                        logging.debug(f"Comparing inbound fee: current={current_inbound_fee_on_channel} (type {type(current_inbound_fee_on_channel)}), new={current_chan_calculated_inbound_ppm} (type {type(current_chan_calculated_inbound_ppm)})")
+                        logging.debug(
+                            f"Comparing inbound fee: current={current_inbound_fee_on_channel} (type {type(current_inbound_fee_on_channel)}), new={current_chan_calculated_inbound_ppm} (type {type(current_chan_calculated_inbound_ppm)})"
+                        )
 
                         inbound_fee_delta = abs(
                             current_chan_calculated_inbound_ppm
@@ -1382,6 +1405,11 @@ def main():
                             inbound_auto_fee_enabled=inbound_auto_fee_enabled_for_node,  # Pass resolved value
                             calculated_inbound_ppm=calculated_inbound_ppm_for_peer,
                             ar_max_cost=first_channel_data.get("ar_max_cost"),
+                            # New num_updates parameter
+                            num_updates=first_channel_data["num_updates"],
+                            min_updates_for_discount=stuck_settings.get(
+                                "min_updates_for_discount", 0
+                            ),
                         )
                         sys.stdout.flush()  # Ensure output is shown immediately
 
