@@ -10,8 +10,6 @@ and local liquidity using data from the Amboss API and LNDg API.
 - trend_sensitivity: Multiplier for the influence of Amboss fee trends on the adjustment.
 - fee_base: Statistical measure from Amboss used as the fee calculation base ("median", "mean", etc.).
 - groups: Node categories for applying differentiated strategies via group_adjustment_percentage.
-- max_outbound: (Optional) Maximum outbound liquidity percentage (0.0-1.0). Script only applies adjustments if channel's outbound liquidity is *below* this value.
-- min_outbound: (Optional) Minimum outbound liquidity percentage (0.0-1.0). Script only applies adjustments if channel's outbound liquidity is *above* this value.
 - fee_bands: (Optional) Dynamic fee adjustments based on local liquidity.
   - enabled: true/false.
   - discount: Negative percentage adjustment for high local balance (80-100%).
@@ -19,6 +17,8 @@ and local liquidity using data from the Amboss API and LNDg API.
 - stuck_channel_adjustment: (Optional) Gradually reduces fees for channels without recent forwards.
   - enabled: true/false.
   - stuck_time_period: Number of days defining one 'stuck period' interval (e.g., 7).
+  - min_local_balance_for_stuck_discount: (Optional) If the peer's aggregate local balance ratio is below this threshold (e.g., 0.2 for 20%), the stuck discount will not be applied.
+  - min_updates_for_discount: (Optional) If the channel's `num_updates` is below this threshold, the fee band discount will not be applied. This is useful to prevent applying a discount to a newly opened channel.
 
 ### Groups and group_adjustment_percentage:
 Allows tailored fee strategies for nodes in specific categories (e.g., "sink", "expensive").
