@@ -474,7 +474,7 @@ def confirm_channel_point_to_amboss(order_id, transaction):
 
 def get_channel_point(hash_to_find):
     def execute_lightning_command():
-        command = [f"{LNCLI_PATH}", "pendingchannels"]
+        command = [LNCLI_PATH, "pendingchannels"]
 
         try:
             logging.info(f"Command: {command}")
