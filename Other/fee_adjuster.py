@@ -551,11 +551,11 @@ def calculate_inbound_fee_discount_ppm(
         )
     elif initial_raw_band == 3:  # Low Local Liquidity (20-40% local)
         inbound_fee_discount_ppm = -round(
-            calculated_final_outgoing_fee_ppm * ar_max_cost_fraction * 0.50
+            calculated_final_outgoing_fee_ppm * ar_max_cost_fraction * 0.55
         )
     elif initial_raw_band == 4:  # Very Low Local Liquidity (0-20% local)
         inbound_fee_discount_ppm = -round(
-            calculated_final_outgoing_fee_ppm * ar_max_cost_fraction * 0.80
+            calculated_final_outgoing_fee_ppm * ar_max_cost_fraction * 0.90
         )
 
     # Ensure the effective fee (outgoing + inbound_discount) isn't negative
