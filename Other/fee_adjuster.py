@@ -812,6 +812,52 @@ def update_channel_notes(
         logging.error(f"Error updating notes for channel {chan_id}: {e}")
 
 
+# Compact calculation summary logger for auditability
+def log_fee_calc_debug(context):
+    """
+    Log a compact, single-line summary of fee calculation inputs/outputs.
+    Expects a dict with the keys used below.
+    """
+    try:
+        logging.info(
+            "CalcSummary | alias=%s pubkey=%s chan_id=%s grp=%s "
+            "fee_base=%s TODAY=%.3f 1D=%.3f 1W=%.3f 1M=%.3f "
+            "base_adj=%.3f grp_adj=%.3f trend=%.3f sens=%.3f bands=%.3f "
+            "liq=%.3f init_band=%s stuck_down=%d final_band=%s "
+            "after_base=%.1f after_group=%.1f after_trend=%.1f after_bands=%.1f "
+            "cap=%d final=%d current=%d delta=%d reason=%s",
+            context["alias"],
+            context["pubkey"],
+            context["chan_id"],
+            context["group_name"],
+            context["fee_base"],
+            context["today"],
+            context["one_day"],
+            context["one_week"],
+            context["one_month"],
+            context["base_adj"],
+            context["group_adj"],
+            context["trend_factor"],
+            context["trend_sensitivity"],
+            context["fee_band_factor"],
+            context["outbound_ratio"],
+            context["initial_band_name"],
+            context["stuck_bands_down"],
+            context["final_band_name"],
+            context["rate_after_base"],
+            context["rate_after_group"],
+            context["rate_after_trend"],
+            context["rate_after_fee_band"],
+            context["max_cap"],
+            context["final_rate"],
+            context["current_rate"],
+            context["delta"],
+            context["update_reason"],
+        )
+    except Exception as e:
+        logging.debug(f"Failed to write CalcSummary log: {e}")
+
+
 # --- Redesigned print_fee_adjustment ---
 def print_fee_adjustment(
     # Basic Info
@@ -1110,6 +1156,16 @@ def main():
                         f"No Amboss data found for pubkey {pubkey}. Skipping fee adjustment."
                     )
                     continue  # Skip to the next node
+                # Snapshot the exact Amboss values used for this run (to correlate future flips)
+                logging.debug(
+                    "AmbossSnapshot | pubkey=%s base=%s TODAY=%s ONE_DAY=%s ONE_WEEK=%s ONE_MONTH=%s",
+                    pubkey,
+                    fee_base,
+                    all_amboss_data.get("TODAY", {}),
+                    all_amboss_data.get("ONE_DAY", {}),
+                    all_amboss_data.get("ONE_WEEK", {}),
+                    all_amboss_data.get("ONE_MONTH", {}),
+                )
                 trend_factor = analyze_fee_trends(all_amboss_data, fee_base)
                 channels_to_modify = get_channels_to_modify(pubkey, config)
                 num_channels = len(channels_to_modify)
@@ -1270,6 +1326,39 @@ def main():
 
                     # Determine if an update to LNDg is needed based on deltas
                     should_update_lndg_for_this_channel = False
+                    update_decision_reason = "delta<=threshold"
+
+                    # Emit a compact calc summary line before decision
+                    band_names_short = ["D+", "D", "N", "P", "P+"]
+                    calc_ctx = {
+                        "alias": channel_data.get("alias", pubkey[:8]),
+                        "pubkey": pubkey,
+                        "chan_id": chan_id,
+                        "group_name": group_name if group_name else "None",
+                        "fee_base": fee_base,
+                        "today": float(all_amboss_data.get("TODAY", {}).get(fee_base, 0) or 0),
+                        "one_day": float(all_amboss_data.get("ONE_DAY", {}).get(fee_base, 0) or 0),
+                        "one_week": float(all_amboss_data.get("ONE_WEEK", {}).get(fee_base, 0) or 0),
+                        "one_month": float(all_amboss_data.get("ONE_MONTH", {}).get(fee_base, 0) or 0),
+                        "base_adj": float(base_adjustment_percentage),
+                        "group_adj": float(group_adjustment_percentage),
+                        "trend_factor": float(trend_factor),
+                        "trend_sensitivity": float(trend_sensitivity),
+                        "fee_band_factor": float(fee_band_factor),
+                        "outbound_ratio": float(check_ratio),
+                        "initial_band_name": band_names_short[initial_raw_band],
+                        "stuck_bands_down": int(stuck_bands_to_move_down),
+                        "final_band_name": band_names_short[final_raw_band],
+                        "rate_after_base": float(rate_after_base),
+                        "rate_after_group": float(rate_after_group),
+                        "rate_after_trend": float(rate_after_trend),
+                        "rate_after_fee_band": float(rate_after_fee_band),
+                        "max_cap": int(max_cap),
+                        "final_rate": int(final_rate),
+                        "current_rate": int(channel_data.get("local_fee_rate", 0) or 0),
+                        "delta": 0,
+                        "update_reason": "pending",
+                    }
 
                     # Outbound fee check
                     current_outbound_fee_on_channel = channel_data["local_fee_rate"]
@@ -1278,6 +1367,7 @@ def main():
                     )
                     if outbound_fee_delta > fee_delta_threshold:
                         should_update_lndg_for_this_channel = True
+                        update_decision_reason = f"out_delta>{fee_delta_threshold} (delta={outbound_fee_delta})"
 
                     # Inbound fee check (only if not already decided by outbound change and feature is enabled)
                     if (
@@ -1302,9 +1392,27 @@ def main():
 
                         if inbound_fee_delta > fee_delta_threshold:
                             should_update_lndg_for_this_channel = True
+                            update_decision_reason = f"in_delta>{fee_delta_threshold} (delta={inbound_fee_delta})"
+
+                    # finalize and emit calc summary
+                    calc_ctx["delta"] = abs(calc_ctx["final_rate"] - calc_ctx["current_rate"])
+                    calc_ctx["update_reason"] = (
+                        update_decision_reason if should_update_lndg_for_this_channel else "delta<=threshold"
+                    )
+                    log_fee_calc_debug(calc_ctx)
 
                     if lndg_fee_update_enabled and should_update_lndg_for_this_channel:
                         try:
+                            logging.info(
+                                "UpdateDecision | chan_id=%s final=%d current=%d delta=%d threshold=%d reason=%s inbound_check=%s",
+                                chan_id,
+                                final_rate,
+                                current_outbound_fee_on_channel,
+                                outbound_fee_delta,
+                                fee_delta_threshold,
+                                update_decision_reason,
+                                "enabled" if inbound_auto_fee_enabled_for_node else "disabled",
+                            )
                             update_lndg_fee(
                                 chan_id,
                                 final_rate,
