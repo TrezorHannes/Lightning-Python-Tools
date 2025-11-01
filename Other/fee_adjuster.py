@@ -20,6 +20,8 @@ Configuration Settings (see fee_adjuster_config_docs.txt for details):
   - enabled: true/false.
   - stuck_time_period: Number of days defining one 'stuck period' interval (e.g., 7).
   - min_local_balance_for_stuck_discount: (Optional) If the peer's aggregate local balance ratio is below this threshold (e.g., 0.2 for 20%), the stuck discount will not be applied.
+  - min_updates_for_discount: (Optional) If the channel's `num_updates` is below this threshold, the fee band discount will not be applied. This is useful to prevent applying a discount to a newly opened channel.
+
 - inbound_auto_fee_enabled: (Optional) Enables dynamic inbound fee adjustments. Can be set per-node or per-group. Defaults to false if not specified.
   - If enabled, the script will attempt to set a negative inbound fee (a discount) to incentivize rebalancing towards your node.
   - The discount is calculated based on the channel's `ar_max_cost` (auto-rebalancer max cost percentage, fetched from LNDg) and the current local liquidity band.
@@ -368,6 +370,7 @@ def calculate_stuck_channel_band_adjustment(
 def calculate_fee_band_adjustment(
     fee_conditions,
     outbound_ratio,
+    num_updates,
     stuck_bands_to_move_down=0,  # New parameter: Number of bands to move down due to stuck status
 ):
     """
@@ -394,6 +397,10 @@ def calculate_fee_band_adjustment(
     fee_bands = fee_conditions.get("fee_bands", {})
     discount = fee_bands.get("discount", 0)
     premium = fee_bands.get("premium", 0)
+
+    # Get min_updates_for_discount from stuck_channel_adjustment section
+    stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
+    min_updates_for_discount = stuck_settings.get("min_updates_for_discount", 0)
 
     # Calculate the initial band based on current liquidity (0-4)
     # Band 0 (80-100% local) -> index 0
@@ -422,6 +429,10 @@ def calculate_fee_band_adjustment(
         # Calculate adjustment percentage based on the effective band (0-3)
         adjustment_per_band_step = adjustment_range / 3.0
         adjustment = discount + effective_band_for_calc * adjustment_per_band_step
+
+    # If the channel is new, don't apply the discount
+    if num_updates < min_updates_for_discount and adjustment < 0:
+        adjustment = 0
 
     # Return the multiplicative factor and the initial/final bands for printing/notes
     return 1 + adjustment, initial_raw_band, adjusted_raw_band
@@ -492,6 +503,7 @@ def get_channels_to_modify(pubkey, config):
                     auto_fees = result.get("auto_fees", False)
                     ar_max_cost = result.get("ar_max_cost")
                     local_inbound_fee_rate = result.get("local_inbound_fee_rate")
+                    num_updates = result.get("num_updates", 0)
 
                     if is_open:
                         local_balance_ratio = (
@@ -512,6 +524,7 @@ def get_channels_to_modify(pubkey, config):
                             "auto_fees": auto_fees,
                             "ar_max_cost": ar_max_cost,
                             "local_inbound_fee_rate": local_inbound_fee_rate,
+                            "num_updates": num_updates,
                         }
         return channels_to_modify
     except requests.exceptions.RequestException as e:
@@ -538,11 +551,11 @@ def calculate_inbound_fee_discount_ppm(
         )
     elif initial_raw_band == 3:  # Low Local Liquidity (20-40% local)
         inbound_fee_discount_ppm = -round(
-            calculated_final_outgoing_fee_ppm * ar_max_cost_fraction * 0.50
+            calculated_final_outgoing_fee_ppm * ar_max_cost_fraction * 0.55
         )
     elif initial_raw_band == 4:  # Very Low Local Liquidity (0-20% local)
         inbound_fee_discount_ppm = -round(
-            calculated_final_outgoing_fee_ppm * ar_max_cost_fraction * 0.80
+            calculated_final_outgoing_fee_ppm * ar_max_cost_fraction * 0.90
         )
 
     # Ensure the effective fee (outgoing + inbound_discount) isn't negative
@@ -556,7 +569,12 @@ def calculate_inbound_fee_discount_ppm(
 
 # Write to LNDg
 def update_lndg_fee(
-    chan_id, new_outgoing_fee_rate, new_inbound_fee_rate_ppm, channel_data, config
+    chan_id,
+    new_outgoing_fee_rate,
+    new_inbound_fee_rate_ppm,
+    channel_data,
+    config,
+    log_api_response=False,
 ):
     lndg_api_url = config["lndg"]["lndg_api_url"]
     username = config["credentials"]["lndg_username"]
@@ -581,23 +599,45 @@ def update_lndg_fee(
 
     # Then, update the fee policy (outgoing and inbound)
     fee_update_url = f"{lndg_api_url}/api/chanpolicy/"
+
+    # Fix: Send -0 instead of 0 for inbound fees to ensure LNDg properly sets it to zero
+    inbound_fee_to_send = new_inbound_fee_rate_ppm
+    if inbound_fee_to_send == 0:
+        inbound_fee_to_send = -0  # Explicitly set to negative zero
+
     fee_payload = {
         "chan_id": chan_id,
         "fee_rate": new_outgoing_fee_rate,
-        "inbound_fee_rate": new_inbound_fee_rate_ppm,
+        "inbound_fee_rate": inbound_fee_to_send,
     }
 
     try:
+        # ADDED: Log the exact payload being sent
+        logging.debug(
+            f"{timestamp}: Sending LNDg fee update payload for {chan_id}: {json.dumps(fee_payload)}"
+        )
+
         response = requests.post(
             fee_update_url, json=fee_payload, auth=(username, password)
         )
-        response.raise_for_status()
+
+        if log_api_response:  # Only log verbose response if specifically requested
+            logging.debug(
+                f"{timestamp}: LNDg fee update response for {chan_id}: Status={response.status_code}, Text={response.text}"
+            )
+
+        response.raise_for_status()  # This will raise an exception for 4xx/5xx responses
         logging.info(
             f"{timestamp}: API confirmed changing outgoing fee to {new_outgoing_fee_rate} ppm "
             f"and inbound fee discount to {new_inbound_fee_rate_ppm} ppm for channel {chan_id}"
         )
     except requests.exceptions.RequestException as e:
         logging.error(f"Error updating LNDg fee policy for channel {chan_id}: {e}")
+        # If response was available but an error occurred, log its details
+        if hasattr(e, "response") and e.response is not None:
+            logging.error(
+                f"LNDg API Error Response Details: Status={e.response.status_code}, Text={e.response.text}"
+            )
         raise LNDGAPIError(f"Error updating LNDg fee policy for channel {chan_id}: {e}")
 
 
@@ -772,6 +812,52 @@ def update_channel_notes(
         logging.error(f"Error updating notes for channel {chan_id}: {e}")
 
 
+# Compact calculation summary logger for auditability
+def log_fee_calc_debug(context):
+    """
+    Log a compact, single-line summary of fee calculation inputs/outputs.
+    Expects a dict with the keys used below.
+    """
+    try:
+        logging.info(
+            "CalcSummary | alias=%s pubkey=%s chan_id=%s grp=%s "
+            "fee_base=%s TODAY=%.3f 1D=%.3f 1W=%.3f 1M=%.3f "
+            "base_adj=%.3f grp_adj=%.3f trend=%.3f sens=%.3f bands=%.3f "
+            "liq=%.3f init_band=%s stuck_down=%d final_band=%s "
+            "after_base=%.1f after_group=%.1f after_trend=%.1f after_bands=%.1f "
+            "cap=%d final=%d current=%d delta=%d reason=%s",
+            context["alias"],
+            context["pubkey"],
+            context["chan_id"],
+            context["group_name"],
+            context["fee_base"],
+            context["today"],
+            context["one_day"],
+            context["one_week"],
+            context["one_month"],
+            context["base_adj"],
+            context["group_adj"],
+            context["trend_factor"],
+            context["trend_sensitivity"],
+            context["fee_band_factor"],
+            context["outbound_ratio"],
+            context["initial_band_name"],
+            context["stuck_bands_down"],
+            context["final_band_name"],
+            context["rate_after_base"],
+            context["rate_after_group"],
+            context["rate_after_trend"],
+            context["rate_after_fee_band"],
+            context["max_cap"],
+            context["final_rate"],
+            context["current_rate"],
+            context["delta"],
+            context["update_reason"],
+        )
+    except Exception as e:
+        logging.debug(f"Failed to write CalcSummary log: {e}")
+
+
 # --- Redesigned print_fee_adjustment ---
 def print_fee_adjustment(
     # Basic Info
@@ -806,6 +892,8 @@ def print_fee_adjustment(
     fee_band_enabled,
     fee_band_discount,
     fee_band_premium,
+    num_updates,
+    min_updates_for_discount,
     initial_raw_band,  # Initial band based on liquidity
     stuck_adj_bands_applied,  # How many bands were moved down due to stuck status
     final_raw_band,  # Final band used for adjustment calculation
@@ -840,6 +928,8 @@ def print_fee_adjustment(
             f"Local Balance: {local_balance:,.0f} | (Outbound: {outbound_ratio*100:.1f}%)"
         )
     print(f"Old Fee Rate (LNDg): {old_fee_rate}")
+    print(f"Num Updates: {num_updates}")
+    print(f"Min Updates for Discount: {min_updates_for_discount}")
 
     # --- Waterfall ---
     print("\n--- Fee Calculation Waterfall ---")
@@ -1066,6 +1156,16 @@ def main():
                         f"No Amboss data found for pubkey {pubkey}. Skipping fee adjustment."
                     )
                     continue  # Skip to the next node
+                # Snapshot the exact Amboss values used for this run (to correlate future flips)
+                logging.debug(
+                    "AmbossSnapshot | pubkey=%s base=%s TODAY=%s ONE_DAY=%s ONE_WEEK=%s ONE_MONTH=%s",
+                    pubkey,
+                    fee_base,
+                    all_amboss_data.get("TODAY", {}),
+                    all_amboss_data.get("ONE_DAY", {}),
+                    all_amboss_data.get("ONE_WEEK", {}),
+                    all_amboss_data.get("ONE_MONTH", {}),
+                )
                 trend_factor = analyze_fee_trends(all_amboss_data, fee_base)
                 channels_to_modify = get_channels_to_modify(pubkey, config)
                 num_channels = len(channels_to_modify)
@@ -1226,6 +1326,39 @@ def main():
 
                     # Determine if an update to LNDg is needed based on deltas
                     should_update_lndg_for_this_channel = False
+                    update_decision_reason = "delta<=threshold"
+
+                    # Emit a compact calc summary line before decision
+                    band_names_short = ["D+", "D", "N", "P", "P+"]
+                    calc_ctx = {
+                        "alias": channel_data.get("alias", pubkey[:8]),
+                        "pubkey": pubkey,
+                        "chan_id": chan_id,
+                        "group_name": group_name if group_name else "None",
+                        "fee_base": fee_base,
+                        "today": float(all_amboss_data.get("TODAY", {}).get(fee_base, 0) or 0),
+                        "one_day": float(all_amboss_data.get("ONE_DAY", {}).get(fee_base, 0) or 0),
+                        "one_week": float(all_amboss_data.get("ONE_WEEK", {}).get(fee_base, 0) or 0),
+                        "one_month": float(all_amboss_data.get("ONE_MONTH", {}).get(fee_base, 0) or 0),
+                        "base_adj": float(base_adjustment_percentage),
+                        "group_adj": float(group_adjustment_percentage),
+                        "trend_factor": float(trend_factor),
+                        "trend_sensitivity": float(trend_sensitivity),
+                        "fee_band_factor": float(fee_band_factor),
+                        "outbound_ratio": float(check_ratio),
+                        "initial_band_name": band_names_short[initial_raw_band],
+                        "stuck_bands_down": int(stuck_bands_to_move_down),
+                        "final_band_name": band_names_short[final_raw_band],
+                        "rate_after_base": float(rate_after_base),
+                        "rate_after_group": float(rate_after_group),
+                        "rate_after_trend": float(rate_after_trend),
+                        "rate_after_fee_band": float(rate_after_fee_band),
+                        "max_cap": int(max_cap),
+                        "final_rate": int(final_rate),
+                        "current_rate": int(channel_data.get("local_fee_rate", 0) or 0),
+                        "delta": 0,
+                        "update_reason": "pending",
+                    }
 
                     # Outbound fee check
                     current_outbound_fee_on_channel = channel_data["local_fee_rate"]
@@ -1234,35 +1367,59 @@ def main():
                     )
                     if outbound_fee_delta > fee_delta_threshold:
                         should_update_lndg_for_this_channel = True
+                        update_decision_reason = f"out_delta>{fee_delta_threshold} (delta={outbound_fee_delta})"
 
                     # Inbound fee check (only if not already decided by outbound change and feature is enabled)
                     if (
                         not should_update_lndg_for_this_channel
                         and inbound_auto_fee_enabled_for_node
                     ):
-                        current_inbound_fee_on_channel = channel_data.get(
-                            "local_inbound_fee_rate", 0
+                        current_inbound_fee_on_channel = int(
+                            channel_data.get("local_inbound_fee_rate", 0) or 0
                         )
-                        if (
-                            current_inbound_fee_on_channel is None
-                        ):  # Handle None from API
-                            current_inbound_fee_on_channel = 0
+                        current_chan_calculated_inbound_ppm = int(
+                            current_chan_calculated_inbound_ppm
+                        )
+
+                        logging.debug(
+                            f"Comparing inbound fee: current={current_inbound_fee_on_channel} (type {type(current_inbound_fee_on_channel)}), new={current_chan_calculated_inbound_ppm} (type {type(current_chan_calculated_inbound_ppm)})"
+                        )
 
                         inbound_fee_delta = abs(
                             current_chan_calculated_inbound_ppm
                             - current_inbound_fee_on_channel
                         )
+
                         if inbound_fee_delta > fee_delta_threshold:
                             should_update_lndg_for_this_channel = True
+                            update_decision_reason = f"in_delta>{fee_delta_threshold} (delta={inbound_fee_delta})"
+
+                    # finalize and emit calc summary
+                    calc_ctx["delta"] = abs(calc_ctx["final_rate"] - calc_ctx["current_rate"])
+                    calc_ctx["update_reason"] = (
+                        update_decision_reason if should_update_lndg_for_this_channel else "delta<=threshold"
+                    )
+                    log_fee_calc_debug(calc_ctx)
 
                     if lndg_fee_update_enabled and should_update_lndg_for_this_channel:
                         try:
+                            logging.info(
+                                "UpdateDecision | chan_id=%s final=%d current=%d delta=%d threshold=%d reason=%s inbound_check=%s",
+                                chan_id,
+                                final_rate,
+                                current_outbound_fee_on_channel,
+                                outbound_fee_delta,
+                                fee_delta_threshold,
+                                update_decision_reason,
+                                "enabled" if inbound_auto_fee_enabled_for_node else "disabled",
+                            )
                             update_lndg_fee(
                                 chan_id,
                                 final_rate,
                                 current_chan_calculated_inbound_ppm,
                                 channel_data,
                                 config,
+                                log_api_response=True,
                             )
                             updated_any_channel = True
                         except LNDGAPIError as api_err:
@@ -1356,6 +1513,11 @@ def main():
                             inbound_auto_fee_enabled=inbound_auto_fee_enabled_for_node,  # Pass resolved value
                             calculated_inbound_ppm=calculated_inbound_ppm_for_peer,
                             ar_max_cost=first_channel_data.get("ar_max_cost"),
+                            # New num_updates parameter
+                            num_updates=first_channel_data["num_updates"],
+                            min_updates_for_discount=stuck_settings.get(
+                                "min_updates_for_discount", 0
+                            ),
                         )
                         sys.stdout.flush()  # Ensure output is shown immediately
 

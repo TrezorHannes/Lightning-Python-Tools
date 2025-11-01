@@ -19,7 +19,8 @@
             "stuck_channel_adjustment": {
                 "enabled": true,
                 "stuck_time_period": 7,
-                "min_local_balance_for_stuck_discount": 0.2
+                "min_local_balance_for_stuck_discount": 0.2,
+                "min_updates_for_discount": 50
             }
         },
         "expensive": {
@@ -37,7 +38,8 @@
             "stuck_channel_adjustment": {
                 "enabled": false,
                 "stuck_time_period": 5,
-                "min_local_balance_for_stuck_discount": 0.4 
+                "min_local_balance_for_stuck_discount": 0.4,
+                "min_updates_for_discount": 50 
             }
         }
     },
@@ -72,7 +74,8 @@
                 "stuck_channel_adjustment": {
                     "enabled": true,
                     "stuck_time_period": 3,
-                    "min_local_balance_for_stuck_discount": 0.1
+                    "min_local_balance_for_stuck_discount": 0.1,
+                    "min_updates_for_discount": 50
                 }
             }
         }

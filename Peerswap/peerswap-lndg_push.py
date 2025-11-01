@@ -41,16 +41,21 @@ logging.basicConfig(filename=log_file_path, level=logging.DEBUG)
 
 
 def get_lncli_listchannels_output():
-    result = subprocess.run([lncli_path, "listchannels"], stdout=subprocess.PIPE)
+    """
+    Returns a list of active channels from lncli.
+    """
+    result = subprocess.run([lncli_path, "listchannels", "--active_only"], stdout=subprocess.PIPE)
     channels_data = json.loads(result.stdout)
     return channels_data["channels"]
 
 
-def find_alias_by_chan_id(chan_id):
-    channels_data = get_lncli_listchannels_output()
+def find_alias_by_scid(scid, channels_data):
+    """
+    Finds the peer alias for a given numeric channel id (scid) in the provided channels_data.
+    """
     for channel in channels_data:
-        if channel["chan_id"] == chan_id:
-            return channel["peer_alias"]
+        if channel.get("scid") == scid:
+            return channel.get("peer_alias")
     return None
 
 
@@ -118,22 +123,25 @@ def get_peerswap_info():
 
 
 # Filters channels based on pscli output and deletes notes for non-existent channels
-def filter_and_delete_notes(peers_info):
-
+def filter_and_delete_notes(peers_info, channels_data, dry_run=False):
+    """
+    Deletes notes for channels that are no longer present in peerswap.
+    """
     pscli_channel_ids = [peer_info[0] for peer_info in peers_info if peer_info]
 
-    for channel in get_lncli_listchannels_output():
-        channel_id = channel["chan_id"]
+    for channel in channels_data:
+        channel_id = channel.get("scid")
+        alias = channel.get("peer_alias", "Unknown")
         if channel_id not in pscli_channel_ids:
             current_notes = get_current_notes(channel_id)
             if current_notes and current_notes.startswith("Swaps Allowed"):
-                update_notes(channel_id, "")  # Clear the notes
-                print(
-                    f"Deleted notes for channel {channel_id}. Is their daemon running?"
-                )
-                logging.info(
-                    f"Deleted notes channel {channel_id} Is their daemon running?"
-                )
+                msg = f"{alias} (channel {channel_id})"
+                if dry_run:
+                    print(f"[DRY RUN] Would delete notes for {msg}. Is their daemon running?")
+                else:
+                    update_notes(channel_id, "")  # Clear the notes
+                    print(f"Deleted notes for {msg}. Is their daemon running?")
+                    logging.info(f"Deleted notes for {msg}. Is their daemon running?")
 
 
 def get_current_timestamp():
@@ -142,6 +150,9 @@ def get_current_timestamp():
 
 # Function to get current notes from LNDg API
 def get_current_notes(channel_id):
+    """
+    Retrieves the current notes for a channel from the LNDg API.
+    """
     # Use the base API URL and append the specific channel ID
     api_url = f"{lndg_api_url}/{channel_id}/"
 
@@ -157,25 +168,33 @@ def get_current_notes(channel_id):
             return notes
         else:
             logging.error(
-                f"API request for channel {channel_id} failed with status code: {response.status_code}"
+                f"API request for channel {channel_id} failed with status code: {response.status_code} (URL: {api_url})"
             )
             return None
 
     except Exception as e:
-        logging.error(f"Error retrieving notes for channel {channel_id}: {e}")
+        logging.error(f"Error retrieving notes for channel {channel_id} (URL: {api_url}): {e}")
         return None
 
 
 # Function to update notes on LNDg API
-def update_notes(channel_id, notes):
+def update_notes(channel_id, notes, dry_run=False):
+    """
+    Updates the notes for a channel on the LNDg API.
+    """
     global lndg_api_url
     payload = {"chan_id": channel_id, "notes": notes}
+    api_url = f"{lndg_api_url}/{channel_id}/"
+    timestamp = get_current_timestamp()
+    if dry_run:
+        print(f"[DRY RUN] Would update notes for channel {channel_id} with payload: {payload}")
+        return
     try:
         response = requests.put(
-            f"{lndg_api_url}/{channel_id}/", json=payload, auth=(username, password)
+            api_url, json=payload, auth=(username, password)
         )
 
-        timestamp = get_current_timestamp()
+        # timestamp = get_current_timestamp() # This line is removed as per new_code
         """
         logging.debug(f"Channel-ID: {channel_id}")
         logging.debug(f"Payload: {payload}")
@@ -188,11 +207,11 @@ def update_notes(channel_id, notes):
                 log_file.write(f"{timestamp}: Updated notes for channel {channel_id}\n")
         else:
             logging.error(
-                f"{timestamp}: Failed to update notes for channel {channel_id}: Status Code {response.status_code}"
+                f"{timestamp}: Failed to update notes for channel {channel_id}: Status Code {response.status_code} (URL: {api_url})"
             )
 
     except Exception as e:
-        logging.error(f"Error updating notes for channel {channel_id}: {e}")
+        logging.error(f"Error updating notes for channel {channel_id} (URL: {api_url}): {e}")
 
 
 def main():
@@ -223,15 +242,18 @@ def main():
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable verbose mode."
     )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Show what would be done, but do not make any changes."
+    )
     args = parser.parse_args()
 
     if args.delete:
-        filter_and_delete_notes(peers_info)
+        filter_and_delete_notes(peers_info, channels_data, dry_run=args.dry_run)
 
     if peers_info:
 
         for channel_id, new_notes in peers_info:
-            alias = find_alias_by_chan_id(channel_id)
+            alias = find_alias_by_scid(channel_id, channels_data)
 
             action = None
 
@@ -261,16 +283,16 @@ def main():
                     )
 
             if action == "o":
-                update_notes(channel_id, new_notes)
+                update_notes(channel_id, new_notes, dry_run=args.dry_run)
             elif action == "a":
                 if not current_notes or current_notes.startswith("Swaps Allowed"):
-                    update_notes(channel_id, new_notes)
+                    update_notes(channel_id, new_notes, dry_run=args.dry_run)
                 else:
-                    update_notes(channel_id, current_notes + "\n" + new_notes)
+                    update_notes(channel_id, current_notes + "\n" + new_notes, dry_run=args.dry_run)
             else:
                 # Add automatic overwrite if current_notes start with "Swaps Allowed"
                 if not current_notes or current_notes.startswith("Swaps Allowed"):
-                    update_notes(channel_id, new_notes)
+                    update_notes(channel_id, new_notes, dry_run=args.dry_run)
 
                 else:
                     print(
@@ -286,15 +308,20 @@ def main():
                         print(
                             f"Overwriting the existing notes with new notes:\n{new_notes}."
                         )
-                        update_notes(channel_id, new_notes)
+                        update_notes(channel_id, new_notes, dry_run=args.dry_run)
                     elif action.lower() == "a":
                         print(
                             f"Appending the existing notes with new notes:\n{current_notes}\n{new_notes}."
                         )
-                        update_notes(channel_id, current_notes + "\n" + new_notes)
+                        update_notes(channel_id, current_notes + "\n" + new_notes, dry_run=args.dry_run)
                     else:
                         print(f"Invalid action. Skipping update for this channel.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. Exiting cleanly.")
+        logging.info("Script interrupted by user (CTRL-C). Exiting cleanly.")
+        exit(0)
