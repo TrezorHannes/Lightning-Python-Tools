@@ -85,6 +85,8 @@ AMBOSS_TOKEN = config["credentials"]["amboss_authorization"]
 CHAT_ID = config["telegram"]["telegram_user_id"]
 
 FULL_PATH_BOS = config["system"]["full_path_bos"]
+LNCLI_PATH = config.get("paths", "lncli_path", fallback="lncli")
+
 
 # Configure data directory
 # MAGMA_DATA_DIR = config.get("magma", "magma_data_dir", fallback=os.path.join(parent_dir, "..", "data", "magma"))
@@ -290,7 +292,7 @@ def get_node_alias(pubkey: str) -> str:
 
 def execute_lncli_addinvoice(amt, memo, expiry):
     # Command to be executed
-    command = f"lncli addinvoice " f"--memo '{memo}' --amt {amt} --expiry {expiry}"
+    command = f"{LNCLI_PATH} addinvoice " f"--memo '{memo}' --amt {amt} --expiry {expiry}"
     logging.info(f"Executing command: {command}")
 
     try:
@@ -472,7 +474,7 @@ def confirm_channel_point_to_amboss(order_id, transaction):
 
 def get_channel_point(hash_to_find):
     def execute_lightning_command():
-        command = [f"lncli", "pendingchannels"]
+        command = [LNCLI_PATH, "pendingchannels"]
 
         try:
             logging.info(f"Command: {command}")
@@ -519,7 +521,7 @@ def execute_lnd_command(
 ):
     # Format the command
     command = (
-        f"lncli openchannel "
+        f"{LNCLI_PATH} openchannel "
         f"--node_key {node_pub_key} --sat_per_vbyte={fee_per_vbyte} "
         f"{formatted_outpoints if formatted_outpoints else ''} --local_amt={input_amount} --fee_rate_ppm {fee_rate_ppm}" # Ensure formatted_outpoints is not None
     )
@@ -628,7 +630,7 @@ def connect_to_node(node_key_address, max_retries=None):
     retries = 0
     last_stderr = "N/A"
     while retries < max_retries:
-        command = f"lncli connect {node_key_address} --timeout 120s"
+        command = f"{LNCLI_PATH} connect {node_key_address} --timeout 120s"
         logging.info(f"Connecting to node (attempt {retries + 1}/{max_retries}): {command}")
         try:
             result = subprocess.run(command, shell=True, capture_output=True, text=True, check=False) # check=False to inspect result
@@ -664,7 +666,7 @@ def connect_to_node(node_key_address, max_retries=None):
 
 def get_lncli_utxos():
     # First get all UTXOs from LND
-    command = f"lncli listunspent --min_confs=3"
+    command = f"{LNCLI_PATH} listunspent --min_confs=3"
     process = subprocess.Popen(
         command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
