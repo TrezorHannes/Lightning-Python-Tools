@@ -749,15 +749,65 @@ def get_lncli_utxos():
             )
             output, error = process.communicate()
             output = output.decode("utf-8")
+            error = error.decode("utf-8") if error else ""
+            return_code = process.returncode
 
-            try:
-                loop_data = json.loads(output)
-                loop_utxos = loop_data.get("utxos", [])
-                logging.info(f"Found {len(loop_utxos)} static loop UTXOs")
-            except json.JSONDecodeError as e:
-                logging.exception(f"Error decoding litloop output: {e}")
+            # Check if litloop command failed (non-zero return code, empty output, or JSON decode error)
+            # Since loop_path is configured, we must be able to query litloop to avoid using reserved UTXOs
+            litloop_error_occurred = False
+            error_message_detail = "Unknown litloop error"
+
+            if return_code != 0:
+                litloop_error_occurred = True
+                error_message_detail = f"litloop command failed with return code {return_code}. stderr: {error.strip() if error else 'No stderr output'}"
+                logging.error(f"litloop command failed: {error_message_detail}")
+            elif not output or not output.strip():
+                litloop_error_occurred = True
+                error_message_detail = f"litloop command returned empty output. stderr: {error.strip() if error else 'No stderr output'}"
+                logging.error(f"litloop command returned empty output: {error_message_detail}")
+            else:
+                try:
+                    loop_data = json.loads(output)
+                    loop_utxos = loop_data.get("utxos", [])
+                    logging.info(f"Found {len(loop_utxos)} static loop UTXOs")
+                except json.JSONDecodeError as e:
+                    litloop_error_occurred = True
+                    error_message_detail = f"Failed to decode litloop JSON output: {e}. Output: {output[:200] if output else 'Empty'}. stderr: {error.strip() if error else 'No stderr output'}"
+                    logging.error(f"Error decoding litloop output: {error_message_detail}")
+
+            # If litloop is configured but failed, this is critical - we cannot safely proceed
+            # as we may try to use reserved static loop UTXOs, causing channel open failures
+            if litloop_error_occurred:
+                failure_message = f"🔥 CRITICAL: litloop command failed when attempting to list static loop UTXOs. Details: `{error_message_detail}`. The litloop service may not be running. Script aborted to prevent using reserved UTXOs."
+                logging.critical(failure_message)
+                send_telegram_notification(failure_message, level="error", parse_mode="Markdown")
+                
+                # Create critical error flag similar to Amboss error handling
+                logging.warning(f"Creating critical error flag due to litloop failure: {error_message_detail}")
+                with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
+                    log_file.write(f"{datetime.now()}: litloop command failed during UTXO check. Error: {error_message_detail}\n")
+                
+                # Raise exception to abort script execution
+                raise RuntimeError(f"litloop failure: {error_message_detail}")
+    except RuntimeError:
+        # Re-raise RuntimeError (our critical error) to propagate up and abort execution
+        raise
     except Exception as e:
-        logging.exception(f"Error checking for loop binary: {e}")
+        # For other unexpected errors, if loop_path is set, treat as critical
+        if loop_path and os.path.exists(loop_path):
+            error_message_detail = f"Unexpected error executing litloop: {str(e)}"
+            failure_message = f"🔥 CRITICAL: Unexpected error when attempting to query litloop. Details: `{error_message_detail}`. Script aborted."
+            logging.critical(failure_message)
+            send_telegram_notification(failure_message, level="error", parse_mode="Markdown")
+            
+            logging.warning(f"Creating critical error flag due to unexpected litloop error: {error_message_detail}")
+            with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
+                log_file.write(f"{datetime.now()}: Unexpected error executing litloop: {error_message_detail}\n")
+            
+            raise RuntimeError(f"litloop unexpected error: {error_message_detail}")
+        else:
+            # If loop_path is not configured, just log and continue (non-critical)
+            logging.exception(f"Error checking for loop binary: {e}")
 
     # Create a set of loop outpoints for efficient lookup
     loop_outpoints = {utxo.get("outpoint") for utxo in loop_utxos}
