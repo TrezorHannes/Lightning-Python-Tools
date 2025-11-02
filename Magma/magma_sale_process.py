@@ -715,6 +715,24 @@ def connect_to_node(node_key_address, max_retries=None):
     return 1, error_message  # Return 1 for failure, and the detailed error message
 
 
+def _handle_critical_litloop_error(detail: str, context: str):
+    """Handles critical errors related to litloop, logs, notifies, and halts the script.
+    
+    Args:
+        detail: The detailed error message
+        context: Context describing what operation failed
+    """
+    failure_message = f"🔥 CRITICAL: {context}. Details: `{detail}`. Script aborted."
+    logging.critical(failure_message)
+    send_telegram_notification(failure_message, level="error", parse_mode="Markdown")
+    
+    logging.warning(f"Creating critical error flag due to litloop failure: {detail}")
+    with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
+        log_file.write(f"{datetime.now()}: litloop command failed. Error: {detail}\n")
+    
+    raise RuntimeError(f"litloop failure: {detail}")
+
+
 def get_lncli_utxos():
     # First get all UTXOs from LND
     command = f"lncli listunspent --min_confs=3"
@@ -778,17 +796,10 @@ def get_lncli_utxos():
             # If litloop is configured but failed, this is critical - we cannot safely proceed
             # as we may try to use reserved static loop UTXOs, causing channel open failures
             if litloop_error_occurred:
-                failure_message = f"🔥 CRITICAL: litloop command failed when attempting to list static loop UTXOs. Details: `{error_message_detail}`. The litloop service may not be running. Script aborted to prevent using reserved UTXOs."
-                logging.critical(failure_message)
-                send_telegram_notification(failure_message, level="error", parse_mode="Markdown")
-                
-                # Create critical error flag similar to Amboss error handling
-                logging.warning(f"Creating critical error flag due to litloop failure: {error_message_detail}")
-                with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
-                    log_file.write(f"{datetime.now()}: litloop command failed during UTXO check. Error: {error_message_detail}\n")
-                
-                # Raise exception to abort script execution
-                raise RuntimeError(f"litloop failure: {error_message_detail}")
+                _handle_critical_litloop_error(
+                    error_message_detail,
+                    "litloop command failed when attempting to list static loop UTXOs. The litloop service may not be running"
+                )
     except RuntimeError:
         # Re-raise RuntimeError (our critical error) to propagate up and abort execution
         raise
@@ -796,15 +807,10 @@ def get_lncli_utxos():
         # For other unexpected errors, if loop_path is set, treat as critical
         if loop_path and os.path.exists(loop_path):
             error_message_detail = f"Unexpected error executing litloop: {str(e)}"
-            failure_message = f"🔥 CRITICAL: Unexpected error when attempting to query litloop. Details: `{error_message_detail}`. Script aborted."
-            logging.critical(failure_message)
-            send_telegram_notification(failure_message, level="error", parse_mode="Markdown")
-            
-            logging.warning(f"Creating critical error flag due to unexpected litloop error: {error_message_detail}")
-            with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
-                log_file.write(f"{datetime.now()}: Unexpected error executing litloop: {error_message_detail}\n")
-            
-            raise RuntimeError(f"litloop unexpected error: {error_message_detail}")
+            _handle_critical_litloop_error(
+                error_message_detail,
+                "Unexpected error when attempting to query litloop"
+            )
         else:
             # If loop_path is not configured, just log and continue (non-critical)
             logging.exception(f"Error checking for loop binary: {e}")
