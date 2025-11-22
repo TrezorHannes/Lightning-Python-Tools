@@ -1139,12 +1139,15 @@ def handle_order_decision_callback(call):
                 logging.debug(f"Could not edit message for already processed callback {order_id}: {e}")
             return
 
+        # Immediately acknowledge the callback to stop the client-side loading animation
+        decision_text_verb = "Approved" if action == "approve" else "Rejected"
+        bot.answer_callback_query(call.id, text=f"Order {order_id} {decision_text_verb}. Processing...")
+
         order_original_details = confirmation_details_entry["details"]
         buyer_alias = order_original_details.get("buyer_alias", "N/A")
         buyer_pubkey = order_original_details.get('account') or order_original_details.get("endpoints", {}).get("destination", "Unknown")
         amount = order_original_details['seller_invoice_amount']
 
-        decision_text_verb = "Approved" if action == "approve" else "Rejected"
         decision_emoji = "✅" if action == "approve" else "❌"
         
         try:
@@ -1166,7 +1169,8 @@ def handle_order_decision_callback(call):
         if action == "approve":
             send_telegram_notification(f"▶️ Proceeding with approved order `{order_id}` ({buyer_alias}).", parse_mode="Markdown")
             if order_original_details.get("status") == "WAITING_FOR_SELLER_APPROVAL":
-                _complete_offer_approval_process(order_id, order_original_details)
+                # Run long-running task in a separate thread to avoid blocking Telegram polling
+                threading.Thread(target=_complete_offer_approval_process, args=(order_id, order_original_details), name=f"Approve-{order_id}").start()
             else:
                 msg = f"⚠️ Order `{order_id}` status changed to `{order_original_details.get('status')}` before user approval ({action}) could be fully processed. No action taken."
                 logging.warning(msg)
@@ -1174,13 +1178,15 @@ def handle_order_decision_callback(call):
 
         elif action == "reject":
             send_telegram_notification(f"🗑️ Rejecting order `{order_id}` ({buyer_alias}) on Amboss.", parse_mode="Markdown")
-            reject_order(order_id)
-
-        bot.answer_callback_query(call.id, text=f"Order {order_id} {decision_text_verb}.")
+            # Thread rejection as well to be safe and responsive
+            threading.Thread(target=reject_order, args=(order_id,), name=f"Reject-{order_id}").start()
 
     except Exception as e:
         logging.exception(f"Error in order_decision_callback for call data {call.data}:")
-        bot.answer_callback_query(call.id, text="Error processing your decision.")
+        try:
+            bot.answer_callback_query(call.id, text="Error processing your decision.")
+        except:
+            pass
         send_telegram_notification("🔥 Error processing user decision from Telegram button. Check logs.", level="error", parse_mode="Markdown")
 
 
@@ -1234,6 +1240,23 @@ def _handle_timeout_for_offer(order_id, confirmation_info):
         send_telegram_notification(msg, level="error", parse_mode="Markdown")
 
 
+def check_pending_confirmations_timeouts():
+    """Checks for timed-out offers in pending_user_confirmations."""
+    global pending_user_confirmations
+    current_time = time.time()
+    timed_out_orders_ids = []
+    
+    # Use list() to create a copy of keys/items for thread-safe iteration
+    for order_id, info in list(pending_user_confirmations.items()):
+        if current_time - info["timestamp"] > USER_CONFIRMATION_TIMEOUT_SECONDS:
+            timed_out_orders_ids.append(order_id)
+            
+    for order_id in timed_out_orders_ids:
+        # Pop safely; another thread (callback) might have handled it
+        confirmation_info = pending_user_confirmations.pop(order_id, None)
+        if confirmation_info:
+            _handle_timeout_for_offer(order_id, confirmation_info)
+
 def process_new_offers():
     """
     Checks for new offers (WAITING_FOR_SELLER_APPROVAL).
@@ -1242,17 +1265,7 @@ def process_new_offers():
     """
     global pending_user_confirmations
 
-    # 1. Handle Timeouts for pending user actions
-    current_time = time.time()
-    timed_out_orders_ids = []
-    for order_id, info in list(pending_user_confirmations.items()):
-        if current_time - info["timestamp"] > USER_CONFIRMATION_TIMEOUT_SECONDS:
-            timed_out_orders_ids.append(order_id)
-            
-    for order_id in timed_out_orders_ids:
-        confirmation_info = pending_user_confirmations.pop(order_id, None)
-        if confirmation_info:
-            _handle_timeout_for_offer(order_id, confirmation_info)
+    # Timeout logic moved to check_pending_confirmations_timeouts() to run more frequently
 
     # 2. Fetch new offers from Amboss
     logging.info("Checking for new Magma offers (WAITING_FOR_SELLER_APPROVAL)...")
@@ -1702,10 +1715,15 @@ if __name__ == "__main__":
     else:
         logging.info("Starting Magma Sale Process scheduler.")
         send_telegram_notification("🤖 Magma Sale Process Bot Started\nScheduler running. Listening for orders.", level="info", parse_mode="Markdown")
+        
+        # Check for timeouts every 1 minute to ensure responsive auto-approval (independent of heavy polling)
+        schedule.every(1).minutes.do(check_pending_confirmations_timeouts)
+        
         schedule.every(POLLING_INTERVAL_MINUTES).minutes.do(execute_bot_behavior)
         # Start the Telegram bot polling in a separate thread
         logging.info("Starting Telegram bot poller thread.")
-        threading.Thread(target=lambda: bot.polling(none_stop=True, interval=30), name="TelegramPoller").start()
+        # Reduced interval from 30 to 2 seconds for better responsiveness
+        threading.Thread(target=lambda: bot.polling(none_stop=True, interval=2), name="TelegramPoller").start()
 
         # Run scheduled tasks in the main thread
         logging.info("Entering main scheduling loop.")
