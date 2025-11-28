@@ -1530,24 +1530,31 @@ def process_paid_order(order_details):
 
         # 1. Connect to Peer
         send_telegram_notification(f"🔗 Attempting to connect to peer `{buyer_alias}` ({customer_pubkey[:10]}...) for order `{order_id}`.", parse_mode="Markdown")
-        customer_addr_uri = get_address_by_pubkey(customer_pubkey)
+        
+        # Use the new function to get a list of prioritized connection details
+        connection_details = get_node_connection_details(customer_pubkey)
 
-        if not customer_addr_uri:
-            error_msg = f"🔥 Could not get address for peer `{buyer_alias}` ({customer_pubkey[:10]}...) (Order `{order_id}`). Cannot open channel."
+        if not connection_details:
+            error_msg = f"🔥 Could not get any address details for peer `{buyer_alias}` ({customer_pubkey[:10]}...) (Order `{order_id}`). Connection might fail."
             logging.error(error_msg)
             send_telegram_notification(error_msg, level="error", parse_mode="Markdown")
-            # Consider if CRITICAL_ERROR_FILE_PATH should be created here.
-            # For now, let's assume it's an order-specific issue unless it becomes persistent.
-            return
-
-        node_connection_status, conn_error_msg = connect_to_node(customer_addr_uri)
+            # We continue anyway, as maybe we are already connected or LND knows a path.
+        
+        # Pass the list to the updated connect_to_node function
+        # It returns: (status_code, connected_address_uri, error_msg)
+        node_connection_status, connected_addr, conn_error_msg = connect_to_node(customer_pubkey, connection_details)
+        
         if node_connection_status == 0:
-            send_telegram_notification(f"✅ Successfully connected to `{buyer_alias}` ({customer_addr_uri}).", parse_mode="Markdown")
+            # connected_addr will contain the specific address we succeeded with
+            success_msg = f"✅ Successfully connected to `{buyer_alias}`."
+            if connected_addr:
+                 success_msg += f" ({connected_addr})"
+            send_telegram_notification(success_msg, parse_mode="Markdown")
         else:
             tg_error_msg = (
-                f"⚠️ Could not connect to `{buyer_alias}` ({customer_addr_uri}) for order `{order_id}`.\n"
-                f"`lncli` error: `{conn_error_msg}`\n"
-                f"Will attempt channel open anyway."
+                f"⚠️ Could not connect to `{buyer_alias}` for order `{order_id}` after trying all addresses.\n"
+                f"Last error: `{conn_error_msg}`\n"
+                f"Will attempt channel open anyway (LND might handle it)."
             )
             send_telegram_notification(tg_error_msg, level="warning", parse_mode="Markdown")
 
