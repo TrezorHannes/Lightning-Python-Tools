@@ -306,6 +306,16 @@ def get_node_extended_details(pubkey: str) -> dict:
                     num_channels
                     total_capacity
                   }
+                  node {
+                    addresses {
+                      addr
+                      ip_info {
+                        country
+                        ip_address
+                      }
+                      network
+                    }
+                  }
                 }
                 socials {
                   info {
@@ -338,7 +348,7 @@ def get_node_extended_details(pubkey: str) -> dict:
         logging.warning(f"No extended details returned for pubkey {pubkey} from Amboss.")
         return {} # Return empty dict on error or no data
 
-    return data.get("getNode") # Return the 'getNode' part of the data
+    return data.get("getNode")
 
 
 def execute_lncli_addinvoice(amt, memo, expiry):
@@ -633,86 +643,123 @@ def get_fast_fee():
         return None
 
 
-def get_address_by_pubkey(peer_pubkey):
-    """Fetches the node address (IP/Tor) for a given peer pubkey from Amboss."""
-    logging.info(f"Fetching address for pubkey: {peer_pubkey} from Amboss...")
-    payload = {
-        "query": """
-            query GetNodeAddress($pubkey: String!) {
-              getNode(pubkey: $pubkey) {
-                graph_info {
-                  node {
-                    addresses {
-                      addr
-                    }
-                  }
-                }
-              }
+def get_node_connection_details(peer_pubkey: str) -> list[dict]:
+    """
+    Fetches all node addresses (IP/Tor) and related info for a given peer pubkey from Amboss.
+    Returns a list of dictionaries with 'addr', 'network', and 'country' (if available).
+    Prioritizes non-Tor addresses.
+    """
+    logging.info(f"Fetching all connection details for pubkey: {peer_pubkey} from Amboss...")
+    
+    node_details = get_node_extended_details(peer_pubkey)
+
+    if not node_details:
+        logging.error(f"Failed to get extended details for {peer_pubkey} for connection.")
+        return []
+
+    addresses_raw = node_details.get("graph_info", {}).get("node", {}).get("addresses", [])
+    
+    if not addresses_raw:
+        logging.warning(f"No addresses found for {peer_pubkey} on Amboss.")
+        return []
+
+    connection_details = []
+    for address_entry in addresses_raw:
+        addr = address_entry.get("addr")
+        network = address_entry.get("network")
+        country = address_entry.get("ip_info", {}).get("country") if address_entry.get("ip_info") else None
+
+        if addr and network:
+            detail = {
+                "addr": addr,
+                "network": network,
+                "country": country
             }
-        """,
-        "variables": {"pubkey": peer_pubkey}
-    }
+            connection_details.append(detail)
+            logging.debug(f"Found address: {addr}, Network: {network}, Country: {country}")
 
-    data = _execute_amboss_graphql_request(payload, f"GetNodeAddress-{peer_pubkey[:10]}")
+    # Prioritize non-Tor addresses
+    # Sort: put non-Tor addresses first (check for '.onion' in addr for Tor)
+    clearnet_addresses = [d for d in connection_details if ".onion" not in d["addr"]]
+    tor_addresses = [d for d in connection_details if ".onion" in d["addr"]]
 
-    if not data:
-        logging.error(f"Failed to get address for {peer_pubkey} from Amboss.") # Error logged by helper
-        return None
-
-    addresses = (
-        data.get("getNode", {})
-        .get("graph_info", {})
-        .get("node", {})
-        .get("addresses", [])
-    )
-    first_address = addresses[0]["addr"] if addresses else None
-
-    if first_address:
-        logging.info(f"Found address for {peer_pubkey}: {first_address}")
-        return f"{peer_pubkey}@{first_address}"
-    else:
-        logging.warning(f"No address found for {peer_pubkey} on Amboss.")
-        return None
+    # Return clearnet addresses first, then Tor addresses
+    final_ordered_addresses = clearnet_addresses + tor_addresses
+    
+    logging.info(f"Returning {len(final_ordered_addresses)} connection details for {peer_pubkey}.")
+    return final_ordered_addresses
 
 
-def connect_to_node(node_key_address, max_retries=None):
+def connect_to_node(peer_pubkey: str, connection_details_list: list[dict], max_retries=None) -> tuple[int, str | None, str | None]:
+    """
+    Attempts to connect to a node using multiple addresses provided in a prioritized list.
+    Retries each address based on MAX_CONNECT_RETRIES.
+    
+    Args:
+        peer_pubkey: The public key of the peer.
+        connection_details_list: A list of dicts, each containing 'addr', 'network', 'country'.
+        max_retries: Maximum connection attempts per address.
+        
+    Returns:
+        tuple: (0 for success, 1 for failure, connected_addr_uri if successful, error_message if failed)
+    """
     if max_retries is None:
         max_retries = MAX_CONNECT_RETRIES
-    retries = 0
-    last_stderr = "N/A"
-    while retries < max_retries:
-        command = f"lncli connect {node_key_address} --timeout 120s"
-        logging.info(f"Connecting to node (attempt {retries + 1}/{max_retries}): {command}")
-        try:
-            result = subprocess.run(command, shell=True, capture_output=True, text=True, check=False) # check=False to inspect result
-            last_stderr = result.stderr.strip() if result.stderr else "N/A"
-
-            if result.returncode == 0:
-                logging.info(f"Successfully connected to node {node_key_address}")
-                return 0, None  # Return 0 for success, None for error message
-            elif "already connected to peer" in last_stderr.lower(): # Check lowercased stderr
-                logging.info(f"Peer {node_key_address} is already connected.")
-                return 0, None  # Return 0 for success
-            else:
-                logging.error(
-                    f"Error connecting to node {node_key_address} (attempt {retries + 1}): {last_stderr}"
-                )
-        except subprocess.CalledProcessError as e: # Should not happen with check=False
-            last_stderr = e.stderr.strip() if e.stderr else "N/A"
-            logging.error(f"CalledProcessError executing lncli connect (attempt {retries + 1}): {e}. stderr: {last_stderr}")
-        except Exception as e:
-            logging.error(f"Unexpected error executing lncli connect (attempt {retries + 1}): {e}")
-            last_stderr = f"Unexpected Exception: {str(e)}"
+    
+    overall_last_stderr = "No connection attempts made."
+    
+    if not connection_details_list:
+        error_message = f"No connection addresses provided for peer {peer_pubkey}."
+        logging.error(error_message)
+        return 1, None, error_message # No addresses to try
         
-        retries += 1
-        if retries < max_retries:
-            logging.info(f"Waiting {CONNECT_RETRY_DELAY_SECONDS}s before retrying connection to {node_key_address}")
-            time.sleep(CONNECT_RETRY_DELAY_SECONDS)
+    for detail in connection_details_list:
+        address_to_try = detail["addr"]
+        network = detail["network"]
+        country_info = f" ({detail['country']})" if detail['country'] else ""
+        node_key_address = f"{peer_pubkey}@{address_to_try}"
+        
+        logging.info(f"Attempting to connect to peer {peer_pubkey} via {network} address {address_to_try}{country_info}...")
 
-    # If we reach this point, all retries have failed
-    error_message = f"Failed to connect to node {node_key_address} after {max_retries} retries. Last error: {last_stderr}"
+        retries = 0
+        while retries < max_retries:
+            command = f"lncli connect {node_key_address} --timeout 120s"
+            logging.info(f"Executing connect command (attempt {retries + 1}/{max_retries} for current address): {command}")
+            try:
+                result = subprocess.run(command, shell=True, capture_output=True, text=True, check=False)
+                current_stderr = result.stderr.strip() if result.stderr else "N/A"
+                overall_last_stderr = current_stderr # Keep track of the very last stderr encountered
+
+                if result.returncode == 0:
+                    logging.info(f"Successfully connected to node {node_key_address}")
+                    return 0, node_key_address, None  # Success
+                elif "already connected to peer" in current_stderr.lower():
+                    logging.info(f"Peer {node_key_address} is already connected.")
+                    return 0, node_key_address, None  # Already connected is also a success
+                else:
+                    logging.error(
+                        f"Error connecting to node {node_key_address} (attempt {retries + 1}): {current_stderr}"
+                    )
+            except subprocess.CalledProcessError as e:
+                current_stderr = e.stderr.strip() if e.stderr else "N/A"
+                overall_last_stderr = current_stderr
+                logging.error(f"CalledProcessError executing lncli connect (attempt {retries + 1}): {e}. stderr: {current_stderr}")
+            except Exception as e:
+                current_stderr = f"Unexpected Exception: {str(e)}"
+                overall_last_stderr = current_stderr
+                logging.error(f"Unexpected error executing lncli connect (attempt {retries + 1}): {current_stderr}")
+            
+            retries += 1
+            if retries < max_retries:
+                logging.info(f"Waiting {CONNECT_RETRY_DELAY_SECONDS}s before retrying connection to {node_key_address}")
+                time.sleep(CONNECT_RETRY_DELAY_SECONDS)
+        
+        logging.warning(f"Failed to connect to {node_key_address} after {max_retries} retries. Trying next address if available.")
+
+    # If we reach this point, all addresses and retries have failed
+    error_message = f"Failed to connect to peer {peer_pubkey} after trying all available addresses and retries. Last error: {overall_last_stderr}"
     logging.error(error_message)
-    return 1, error_message  # Return 1 for failure, and the detailed error message
+    return 1, None, error_message # Failure
 
 
 def _handle_critical_litloop_error(detail: str, context: str):
