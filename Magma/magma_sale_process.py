@@ -1046,22 +1046,35 @@ def open_channel(pubkey, size, invoice):
 
 
 def bos_confirm_income(amount, peer_pubkey):
-    command = (
-        f"{FULL_PATH_BOS} send {config['info']['NODE']} " # Use new config variable
-        f"--amount {amount} --avoid-high-fee-routes --message 'HODLmeTight Amboss Channel Sale with {peer_pubkey}'"
-    )
-    logging.info(f"Executing BOS command: {command}")
+    # It's better to pass command as a list when shell=False
+    # This avoids shell interpretation issues with quotes in the message.
+    command = [
+        FULL_PATH_BOS,
+        "send",
+        config['info']['NODE'],
+        "--amount", str(amount),
+        "--avoid-high-fee-routes",
+        "--message", f"HODLmeTight Amboss Channel Sale with {peer_pubkey}"
+    ]
+    logging.info(f"Executing BOS command: {' '.join(command)}")
 
     try:
+        # Changed shell=True to shell=False, and added timeout for robustness
         result = subprocess.run(
-            command, shell=True, check=True, capture_output=True, text=True
+            command, check=True, capture_output=True, text=True, timeout=120 # Added a 2-minute timeout
         )
-        logging.info(f"BOS Command Output: {result.stdout}")
-        # bot.send_message(CHAT_ID, text=f"BOS Command Output: {result.stdout}") # Removed
+        logging.info(f"BOS Command Output: stdout='{result.stdout.strip()}', stderr='{result.stderr.strip()}'")
         return result.stdout
     except subprocess.CalledProcessError as e:
         logging.error(f"Error executing BOS command: {e}")
-        # bot.send_message(CHAT_ID, text=f"Error executing BOS command: {e}") # Removed
+        logging.error(f"BOS command failed. stdout: '{e.stdout.strip()}', stderr: '{e.stderr.strip()}'")
+        return None
+    except subprocess.TimeoutExpired as e:
+        logging.error(f"BOS command timed out after {e.timeout} seconds.")
+        logging.error(f"BOS command timed out. stdout: '{e.stdout.strip()}', stderr: '{e.stderr.strip()}'")
+        return None
+    except Exception as e:
+        logging.exception(f"Unexpected error in bos_confirm_income: {e}")
         return None
 
 
