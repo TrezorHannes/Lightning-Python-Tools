@@ -76,7 +76,7 @@ CHANNEL_FEE_RATE_PPM = config.getint("magma", "channel_fee_rate_ppm", fallback=3
 MEMPOOL_FEES_API_URL = config.get("urls", "mempool_fees_api", fallback="https://mempool.space/api/v1/fees/recommended")
 CONNECT_RETRY_DELAY_SECONDS = config.getint("magma", "connect_retry_delay_seconds", fallback=60)
 MAX_CONNECT_RETRIES = config.getint("magma", "max_connect_retries", fallback=30)
-POLLING_INTERVAL_MINUTES = config.getint("magma", "polling_interval_minutes", fallback=20)
+POLLING_INTERVAL_MINUTES = config.getint("magma", "polling_interval_minutes", fallback=10)
 
 BANNED_PUBKEYS = config.get("pubkey", "banned_magma_pubkeys", fallback="").split(",")
 
@@ -308,6 +308,16 @@ def get_node_extended_details(pubkey: str) -> dict:
                     num_channels
                     total_capacity
                   }
+                  node {
+                    addresses {
+                      addr
+                      ip_info {
+                        country
+                        ip_address
+                      }
+                      network
+                    }
+                  }
                 }
                 socials {
                   info {
@@ -340,18 +350,18 @@ def get_node_extended_details(pubkey: str) -> dict:
         logging.warning(f"No extended details returned for pubkey {pubkey} from Amboss.")
         return {} # Return empty dict on error or no data
 
-    return data.get("getNode") # Return the 'getNode' part of the data
+    return data.get("getNode")
 
 
 def execute_lncli_addinvoice(amt, memo, expiry):
-    # Command to be executed
-    command = f"{LNCLI_PATH} addinvoice " f"--memo '{memo}' --amt {amt} --expiry {expiry}"
-    logging.info(f"Executing command: {command}")
+    # Command to be executed as list
+    command = [LNCLI_PATH, "addinvoice", "--memo", str(memo), "--amt", str(amt), "--expiry", str(expiry)]
+    logging.info(f"Executing command: {' '.join(command)}")
 
     try:
-        # Execute the command and capture the output
+        # Execute the command as list with shell=False
         result = subprocess.Popen(
-            command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         output, error = result.communicate()
         output_decoded = output.decode("utf-8").strip()
@@ -572,19 +582,29 @@ def get_channel_point(hash_to_find):
 def execute_lnd_command(
     node_pub_key, fee_per_vbyte, formatted_outpoints, input_amount, fee_rate_ppm
 ):
-    # Format the command
-    command = (
-        f"{LNCLI_PATH} openchannel "
-        f"--node_key {node_pub_key} --sat_per_vbyte={fee_per_vbyte} "
-        f"{formatted_outpoints if formatted_outpoints else ''} --local_amt={input_amount} --fee_rate_ppm {fee_rate_ppm}" # Ensure formatted_outpoints is not None
-    )
-    logging.info(f"Executing command: {command}")
+    # Format the command as list
+    command = [
+        LNCLI_PATH, "openchannel",
+        "--node_key", node_pub_key,
+        "--sat_per_vbyte", str(fee_per_vbyte),
+        "--local_amt", str(input_amount),
+        "--fee_rate_ppm", str(fee_rate_ppm)
+    ]
+    
+    # Add outpoints if present
+    if formatted_outpoints:
+        # Assuming formatted_outpoints is a string like "--utxo hash:index --utxo hash:index"
+        # We need to split it for the list format
+        parts = formatted_outpoints.split()
+        command.extend(parts)
+
+    logging.info(f"Executing command: {' '.join(command)}")
     std_err_output = "N/A" # Initialize stderr output
 
     try:
-        # Run the command and capture both stdout and stderr
+        # Run the command as list with shell=False
         result = subprocess.run(
-            command, shell=True, check=False, capture_output=True, text=True
+            command, check=False, capture_output=True, text=True
         )
         std_err_output = result.stderr.strip() if result.stderr else "N/A"
 
@@ -635,93 +655,147 @@ def get_fast_fee():
         return None
 
 
-def get_address_by_pubkey(peer_pubkey):
-    """Fetches the node address (IP/Tor) for a given peer pubkey from Amboss."""
-    logging.info(f"Fetching address for pubkey: {peer_pubkey} from Amboss...")
-    payload = {
-        "query": """
-            query GetNodeAddress($pubkey: String!) {
-              getNode(pubkey: $pubkey) {
-                graph_info {
-                  node {
-                    addresses {
-                      addr
-                    }
-                  }
-                }
-              }
+def get_node_connection_details(peer_pubkey: str) -> list[dict]:
+    """
+    Fetches all node addresses (IP/Tor) and related info for a given peer pubkey from Amboss.
+    Returns a list of dictionaries with 'addr', 'network', and 'country' (if available).
+    Prioritizes non-Tor addresses.
+    """
+    logging.info(f"Fetching all connection details for pubkey: {peer_pubkey} from Amboss...")
+    
+    node_details = get_node_extended_details(peer_pubkey)
+
+    if not node_details:
+        logging.error(f"Failed to get extended details for {peer_pubkey} for connection.")
+        return []
+
+    addresses_raw = node_details.get("graph_info", {}).get("node", {}).get("addresses", [])
+    
+    if not addresses_raw:
+        logging.warning(f"No addresses found for {peer_pubkey} on Amboss.")
+        return []
+
+    connection_details = []
+    for address_entry in addresses_raw:
+        addr = address_entry.get("addr")
+        network = address_entry.get("network")
+        country = address_entry.get("ip_info", {}).get("country") if address_entry.get("ip_info") else None
+
+        if addr and network:
+            detail = {
+                "addr": addr,
+                "network": network,
+                "country": country
             }
-        """,
-        "variables": {"pubkey": peer_pubkey}
-    }
+            connection_details.append(detail)
+            logging.debug(f"Found address: {addr}, Network: {network}, Country: {country}")
 
-    data = _execute_amboss_graphql_request(payload, f"GetNodeAddress-{peer_pubkey[:10]}")
+    # Prioritize non-Tor addresses
+    # Sort: put non-Tor addresses first (check for '.onion' in addr for Tor)
+    clearnet_addresses = [d for d in connection_details if ".onion" not in d["addr"]]
+    tor_addresses = [d for d in connection_details if ".onion" in d["addr"]]
 
-    if not data:
-        logging.error(f"Failed to get address for {peer_pubkey} from Amboss.") # Error logged by helper
-        return None
-
-    addresses = (
-        data.get("getNode", {})
-        .get("graph_info", {})
-        .get("node", {})
-        .get("addresses", [])
-    )
-    first_address = addresses[0]["addr"] if addresses else None
-
-    if first_address:
-        logging.info(f"Found address for {peer_pubkey}: {first_address}")
-        return f"{peer_pubkey}@{first_address}"
-    else:
-        logging.warning(f"No address found for {peer_pubkey} on Amboss.")
-        return None
+    # Return clearnet addresses first, then Tor addresses
+    final_ordered_addresses = clearnet_addresses + tor_addresses
+    
+    logging.info(f"Returning {len(final_ordered_addresses)} connection details for {peer_pubkey}.")
+    return final_ordered_addresses
 
 
-def connect_to_node(node_key_address, max_retries=None):
+def connect_to_node(peer_pubkey: str, connection_details_list: list[dict], max_retries=None) -> tuple[int, str | None, str | None]:
+    """
+    Attempts to connect to a node using multiple addresses provided in a prioritized list.
+    Retries each address based on MAX_CONNECT_RETRIES.
+    
+    Args:
+        peer_pubkey: The public key of the peer.
+        connection_details_list: A list of dicts, each containing 'addr', 'network', 'country'.
+        max_retries: Maximum connection attempts per address.
+        
+    Returns:
+        tuple: (0 for success, 1 for failure, connected_addr_uri if successful, error_message if failed)
+    """
     if max_retries is None:
         max_retries = MAX_CONNECT_RETRIES
-    retries = 0
-    last_stderr = "N/A"
-    while retries < max_retries:
-        command = f"{LNCLI_PATH} connect {node_key_address} --timeout 120s"
-        logging.info(f"Connecting to node (attempt {retries + 1}/{max_retries}): {command}")
-        try:
-            result = subprocess.run(command, shell=True, capture_output=True, text=True, check=False) # check=False to inspect result
-            last_stderr = result.stderr.strip() if result.stderr else "N/A"
-
-            if result.returncode == 0:
-                logging.info(f"Successfully connected to node {node_key_address}")
-                return 0, None  # Return 0 for success, None for error message
-            elif "already connected to peer" in last_stderr.lower(): # Check lowercased stderr
-                logging.info(f"Peer {node_key_address} is already connected.")
-                return 0, None  # Return 0 for success
-            else:
-                logging.error(
-                    f"Error connecting to node {node_key_address} (attempt {retries + 1}): {last_stderr}"
-                )
-        except subprocess.CalledProcessError as e: # Should not happen with check=False
-            last_stderr = e.stderr.strip() if e.stderr else "N/A"
-            logging.error(f"CalledProcessError executing lncli connect (attempt {retries + 1}): {e}. stderr: {last_stderr}")
-        except Exception as e:
-            logging.error(f"Unexpected error executing lncli connect (attempt {retries + 1}): {e}")
-            last_stderr = f"Unexpected Exception: {str(e)}"
+    overall_last_stderr = "No connection attempts made."
+    
+    if not connection_details_list:
+        error_message = f"No connection addresses provided for peer {peer_pubkey}."
+        logging.error(error_message)
+        return 1, None, error_message # No addresses to try
         
-        retries += 1
-        if retries < max_retries:
-            logging.info(f"Waiting {CONNECT_RETRY_DELAY_SECONDS}s before retrying connection to {node_key_address}")
-            time.sleep(CONNECT_RETRY_DELAY_SECONDS)
+    for detail in connection_details_list:
+        address_to_try = detail["addr"]
+        network = detail["network"]
+        country_info = f" ({detail['country']})" if detail['country'] else ""
+        node_key_address = f"{peer_pubkey}@{address_to_try}"
+        
+        logging.info(f"Attempting to connect to peer {peer_pubkey} via {network} address {address_to_try}{country_info}...")
 
-    # If we reach this point, all retries have failed
-    error_message = f"Failed to connect to node {node_key_address} after {max_retries} retries. Last error: {last_stderr}"
+        retries = 0
+        while retries < max_retries:
+            command = [LNCLI_PATH, "connect", node_key_address, "--timeout", "120s"]
+            logging.info(f"Executing connect command (attempt {retries + 1}/{max_retries} for current address): {' '.join(command)}")
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, check=False)
+                current_stderr = result.stderr.strip() if result.stderr else "N/A"
+                overall_last_stderr = current_stderr # Keep track of the very last stderr encountered
+
+                if result.returncode == 0:
+                    logging.info(f"Successfully connected to node {node_key_address}")
+                    return 0, node_key_address, None  # Success
+                elif "already connected to peer" in current_stderr.lower():
+                    logging.info(f"Peer {node_key_address} is already connected.")
+                    return 0, node_key_address, None  # Already connected is also a success
+                else:
+                    logging.error(
+                        f"Error connecting to node {node_key_address} (attempt {retries + 1}): {current_stderr}"
+                    )
+            except subprocess.CalledProcessError as e:
+                current_stderr = e.stderr.strip() if e.stderr else "N/A"
+                overall_last_stderr = current_stderr
+                logging.error(f"CalledProcessError executing lncli connect (attempt {retries + 1}): {e}. stderr: {current_stderr}")
+            except Exception as e:
+                current_stderr = f"Unexpected Exception: {str(e)}"
+                overall_last_stderr = current_stderr
+                logging.error(f"Unexpected error executing lncli connect (attempt {retries + 1}): {current_stderr}")
+            
+            retries += 1
+            if retries < max_retries:
+                logging.info(f"Waiting {CONNECT_RETRY_DELAY_SECONDS}s before retrying connection to {node_key_address}")
+                time.sleep(CONNECT_RETRY_DELAY_SECONDS)
+        
+        logging.warning(f"Failed to connect to {node_key_address} after {max_retries} retries. Trying next address if available.")
+
+    # If we reach this point, all addresses and retries have failed
+    error_message = f"Failed to connect to peer {peer_pubkey} after trying all available addresses and retries. Last error: {overall_last_stderr}"
     logging.error(error_message)
-    return 1, error_message  # Return 1 for failure, and the detailed error message
+    return 1, None, error_message # Failure
+
+
+def _handle_critical_litloop_error(detail: str, context: str):
+    """Handles critical errors related to litloop, logs, notifies, and halts the script.
+    
+    Args:
+        detail: The detailed error message
+        context: Context describing what operation failed
+    """
+    failure_message = f"🔥 CRITICAL: {context}. Details: `{detail}`. Script aborted."
+    logging.critical(failure_message)
+    send_telegram_notification(failure_message, level="error", parse_mode="Markdown")
+    
+    logging.warning(f"Creating critical error flag due to litloop failure: {detail}")
+    with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
+        log_file.write(f"{datetime.now()}: litloop command failed. Error: {detail}\n")
+    
+    raise RuntimeError(f"litloop failure: {detail}")
 
 
 def get_lncli_utxos():
     # First get all UTXOs from LND
-    command = f"{LNCLI_PATH} listunspent --min_confs=3"
+    command = [LNCLI_PATH, "listunspent", "--min_confs=3"]
     process = subprocess.Popen(
-        command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
     output, error = process.communicate()
     output = output.decode("utf-8")
@@ -744,22 +818,66 @@ def get_lncli_utxos():
 
     try:
         if loop_path and os.path.exists(loop_path):
-            # Construct the litloop command
-            litloop_cmd = f"{loop_path} --rpcserver=localhost:8443 --tlscertpath=~/.lit/tls.cert static listunspent"
+            # Construct the litloop command as list
+            litloop_cmd = [
+                loop_path,
+                "--rpcserver=localhost:8443",
+                "--tlscertpath=~/.lit/tls.cert",
+                "static",
+                "listunspent"
+            ]
             process = subprocess.Popen(
-                litloop_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                litloop_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
             output, error = process.communicate()
             output = output.decode("utf-8")
+            error = error.decode("utf-8") if error else ""
+            return_code = process.returncode
 
-            try:
-                loop_data = json.loads(output)
-                loop_utxos = loop_data.get("utxos", [])
-                logging.info(f"Found {len(loop_utxos)} static loop UTXOs")
-            except json.JSONDecodeError as e:
-                logging.exception(f"Error decoding litloop output: {e}")
+            # Check if litloop command failed (non-zero return code, empty output, or JSON decode error)
+            # Since loop_path is configured, we must be able to query litloop to avoid using reserved UTXOs
+            litloop_error_occurred = False
+            error_message_detail = "Unknown litloop error"
+
+            if return_code != 0:
+                litloop_error_occurred = True
+                error_message_detail = f"litloop command failed with return code {return_code}. stderr: {error.strip() if error else 'No stderr output'}"
+                logging.error(f"litloop command failed: {error_message_detail}")
+            elif not output or not output.strip():
+                litloop_error_occurred = True
+                error_message_detail = f"litloop command returned empty output. stderr: {error.strip() if error else 'No stderr output'}"
+                logging.error(f"litloop command returned empty output: {error_message_detail}")
+            else:
+                try:
+                    loop_data = json.loads(output)
+                    loop_utxos = loop_data.get("utxos", [])
+                    logging.info(f"Found {len(loop_utxos)} static loop UTXOs")
+                except json.JSONDecodeError as e:
+                    litloop_error_occurred = True
+                    error_message_detail = f"Failed to decode litloop JSON output: {e}. Output: {output[:200] if output else 'Empty'}. stderr: {error.strip() if error else 'No stderr output'}"
+                    logging.error(f"Error decoding litloop output: {error_message_detail}")
+
+            # If litloop is configured but failed, this is critical - we cannot safely proceed
+            # as we may try to use reserved static loop UTXOs, causing channel open failures
+            if litloop_error_occurred:
+                _handle_critical_litloop_error(
+                    error_message_detail,
+                    "litloop command failed when attempting to list static loop UTXOs. The litloop service may not be running"
+                )
+    except RuntimeError:
+        # Re-raise RuntimeError (our critical error) to propagate up and abort execution
+        raise
     except Exception as e:
-        logging.exception(f"Error checking for loop binary: {e}")
+        # For other unexpected errors, if loop_path is set, treat as critical
+        if loop_path and os.path.exists(loop_path):
+            error_message_detail = f"Unexpected error executing litloop: {str(e)}"
+            _handle_critical_litloop_error(
+                error_message_detail,
+                "Unexpected error when attempting to query litloop"
+            )
+        else:
+            # If loop_path is not configured, just log and continue (non-critical)
+            logging.exception(f"Error checking for loop binary: {e}")
 
     # Create a set of loop outpoints for efficient lookup
     loop_outpoints = {utxo.get("outpoint") for utxo in loop_utxos}
@@ -992,22 +1110,35 @@ def open_channel(pubkey, size, invoice):
 
 
 def bos_confirm_income(amount, peer_pubkey):
-    command = (
-        f"{FULL_PATH_BOS} send {config['info']['NODE']} " # Use new config variable
-        f"--amount {amount} --avoid-high-fee-routes --message 'HODLmeTight Amboss Channel Sale with {peer_pubkey}'"
-    )
-    logging.info(f"Executing BOS command: {command}")
+    # It's better to pass command as a list when shell=False
+    # This avoids shell interpretation issues with quotes in the message.
+    command = [
+        FULL_PATH_BOS,
+        "send",
+        config['info']['NODE'],
+        "--amount", str(amount),
+        "--avoid-high-fee-routes",
+        "--message", f"HODLmeTight Amboss Channel Sale with {peer_pubkey}"
+    ]
+    logging.info(f"Executing BOS command: {' '.join(command)}")
 
     try:
+        # Changed shell=True to shell=False, and added timeout for robustness
         result = subprocess.run(
-            command, shell=True, check=True, capture_output=True, text=True
+            command, check=True, capture_output=True, text=True, timeout=120 # Added a 2-minute timeout
         )
-        logging.info(f"BOS Command Output: {result.stdout}")
-        # bot.send_message(CHAT_ID, text=f"BOS Command Output: {result.stdout}") # Removed
+        logging.info(f"BOS Command Output: stdout='{result.stdout.strip()}', stderr='{result.stderr.strip()}'")
         return result.stdout
     except subprocess.CalledProcessError as e:
         logging.error(f"Error executing BOS command: {e}")
-        # bot.send_message(CHAT_ID, text=f"Error executing BOS command: {e}") # Removed
+        logging.error(f"BOS command failed. stdout: '{e.stdout.strip()}', stderr: '{e.stderr.strip()}'")
+        return None
+    except subprocess.TimeoutExpired as e:
+        logging.error(f"BOS command timed out after {e.timeout} seconds.")
+        logging.error(f"BOS command timed out. stdout: '{e.stdout.strip()}', stderr: '{e.stderr.strip()}'")
+        return None
+    except Exception as e:
+        logging.exception(f"Unexpected error in bos_confirm_income: {e}")
         return None
 
 
@@ -1085,12 +1216,15 @@ def handle_order_decision_callback(call):
                 logging.debug(f"Could not edit message for already processed callback {order_id}: {e}")
             return
 
+        # Immediately acknowledge the callback to stop the client-side loading animation
+        decision_text_verb = "Approved" if action == "approve" else "Rejected"
+        bot.answer_callback_query(call.id, text=f"Order {order_id} {decision_text_verb}. Processing...")
+
         order_original_details = confirmation_details_entry["details"]
         buyer_alias = order_original_details.get("buyer_alias", "N/A")
         buyer_pubkey = order_original_details.get('account') or order_original_details.get("endpoints", {}).get("destination", "Unknown")
         amount = order_original_details['seller_invoice_amount']
 
-        decision_text_verb = "Approved" if action == "approve" else "Rejected"
         decision_emoji = "✅" if action == "approve" else "❌"
         
         try:
@@ -1112,7 +1246,8 @@ def handle_order_decision_callback(call):
         if action == "approve":
             send_telegram_notification(f"▶️ Proceeding with approved order `{order_id}` ({buyer_alias}).", parse_mode="Markdown")
             if order_original_details.get("status") == "WAITING_FOR_SELLER_APPROVAL":
-                _complete_offer_approval_process(order_id, order_original_details)
+                # Run long-running task in a separate thread to avoid blocking Telegram polling
+                threading.Thread(target=_complete_offer_approval_process, args=(order_id, order_original_details), name=f"Approve-{order_id}").start()
             else:
                 msg = f"⚠️ Order `{order_id}` status changed to `{order_original_details.get('status')}` before user approval ({action}) could be fully processed. No action taken."
                 logging.warning(msg)
@@ -1120,13 +1255,15 @@ def handle_order_decision_callback(call):
 
         elif action == "reject":
             send_telegram_notification(f"🗑️ Rejecting order `{order_id}` ({buyer_alias}) on Amboss.", parse_mode="Markdown")
-            reject_order(order_id)
-
-        bot.answer_callback_query(call.id, text=f"Order {order_id} {decision_text_verb}.")
+            # Thread rejection as well to be safe and responsive
+            threading.Thread(target=reject_order, args=(order_id,), name=f"Reject-{order_id}").start()
 
     except Exception as e:
         logging.exception(f"Error in order_decision_callback for call data {call.data}:")
-        bot.answer_callback_query(call.id, text="Error processing your decision.")
+        try:
+            bot.answer_callback_query(call.id, text="Error processing your decision.")
+        except:
+            pass
         send_telegram_notification("🔥 Error processing user decision from Telegram button. Check logs.", level="error", parse_mode="Markdown")
 
 
@@ -1180,6 +1317,23 @@ def _handle_timeout_for_offer(order_id, confirmation_info):
         send_telegram_notification(msg, level="error", parse_mode="Markdown")
 
 
+def check_pending_confirmations_timeouts():
+    """Checks for timed-out offers in pending_user_confirmations."""
+    global pending_user_confirmations
+    current_time = time.time()
+    timed_out_orders_ids = []
+    
+    # Use list() to create a copy of keys/items for thread-safe iteration
+    for order_id, info in list(pending_user_confirmations.items()):
+        if current_time - info["timestamp"] > USER_CONFIRMATION_TIMEOUT_SECONDS:
+            timed_out_orders_ids.append(order_id)
+            
+    for order_id in timed_out_orders_ids:
+        # Pop safely; another thread (callback) might have handled it
+        confirmation_info = pending_user_confirmations.pop(order_id, None)
+        if confirmation_info:
+            _handle_timeout_for_offer(order_id, confirmation_info)
+
 def process_new_offers():
     """
     Checks for new offers (WAITING_FOR_SELLER_APPROVAL).
@@ -1188,17 +1342,7 @@ def process_new_offers():
     """
     global pending_user_confirmations
 
-    # 1. Handle Timeouts for pending user actions
-    current_time = time.time()
-    timed_out_orders_ids = []
-    for order_id, info in list(pending_user_confirmations.items()):
-        if current_time - info["timestamp"] > USER_CONFIRMATION_TIMEOUT_SECONDS:
-            timed_out_orders_ids.append(order_id)
-            
-    for order_id in timed_out_orders_ids:
-        confirmation_info = pending_user_confirmations.pop(order_id, None)
-        if confirmation_info:
-            _handle_timeout_for_offer(order_id, confirmation_info)
+    # Timeout logic moved to check_pending_confirmations_timeouts() to run more frequently
 
     # 2. Fetch new offers from Amboss
     logging.info("Checking for new Magma offers (WAITING_FOR_SELLER_APPROVAL)...")
@@ -1403,24 +1547,31 @@ def process_paid_order(order_details):
 
         # 1. Connect to Peer
         send_telegram_notification(f"🔗 Attempting to connect to peer `{buyer_alias}` ({customer_pubkey[:10]}...) for order `{order_id}`.", parse_mode="Markdown")
-        customer_addr_uri = get_address_by_pubkey(customer_pubkey)
+        
+        # Use the new function to get a list of prioritized connection details
+        connection_details = get_node_connection_details(customer_pubkey)
 
-        if not customer_addr_uri:
-            error_msg = f"🔥 Could not get address for peer `{buyer_alias}` ({customer_pubkey[:10]}...) (Order `{order_id}`). Cannot open channel."
+        if not connection_details:
+            error_msg = f"🔥 Could not get any address details for peer `{buyer_alias}` ({customer_pubkey[:10]}...) (Order `{order_id}`). Connection might fail."
             logging.error(error_msg)
             send_telegram_notification(error_msg, level="error", parse_mode="Markdown")
-            # Consider if CRITICAL_ERROR_FILE_PATH should be created here.
-            # For now, let's assume it's an order-specific issue unless it becomes persistent.
-            return
-
-        node_connection_status, conn_error_msg = connect_to_node(customer_addr_uri)
+            # We continue anyway, as maybe we are already connected or LND knows a path.
+        
+        # Pass the list to the updated connect_to_node function
+        # It returns: (status_code, connected_address_uri, error_msg)
+        node_connection_status, connected_addr, conn_error_msg = connect_to_node(customer_pubkey, connection_details)
+        
         if node_connection_status == 0:
-            send_telegram_notification(f"✅ Successfully connected to `{buyer_alias}` ({customer_addr_uri}).", parse_mode="Markdown")
+            # connected_addr will contain the specific address we succeeded with
+            success_msg = f"✅ Successfully connected to `{buyer_alias}`."
+            if connected_addr:
+                 success_msg += f" ({connected_addr})"
+            send_telegram_notification(success_msg, parse_mode="Markdown")
         else:
             tg_error_msg = (
-                f"⚠️ Could not connect to `{buyer_alias}` ({customer_addr_uri}) for order `{order_id}`.\n"
-                f"`lncli` error: `{conn_error_msg}`\n"
-                f"Will attempt channel open anyway."
+                f"⚠️ Could not connect to `{buyer_alias}` for order `{order_id}` after trying all addresses.\n"
+                f"Last error: `{conn_error_msg}`\n"
+                f"Will attempt channel open anyway (LND might handle it)."
             )
             send_telegram_notification(tg_error_msg, level="warning", parse_mode="Markdown")
 
@@ -1648,10 +1799,15 @@ if __name__ == "__main__":
     else:
         logging.info("Starting Magma Sale Process scheduler.")
         send_telegram_notification("🤖 Magma Sale Process Bot Started\nScheduler running. Listening for orders.", level="info", parse_mode="Markdown")
+        
+        # Check for timeouts every 1 minute to ensure responsive auto-approval (independent of heavy polling)
+        schedule.every(1).minutes.do(check_pending_confirmations_timeouts)
+        
         schedule.every(POLLING_INTERVAL_MINUTES).minutes.do(execute_bot_behavior)
         # Start the Telegram bot polling in a separate thread
         logging.info("Starting Telegram bot poller thread.")
-        threading.Thread(target=lambda: bot.polling(none_stop=True, interval=30), name="TelegramPoller").start()
+        # Reduced interval from 30 to 2 seconds for better responsiveness
+        threading.Thread(target=lambda: bot.polling(none_stop=True, interval=2), name="TelegramPoller").start()
 
         # Run scheduled tasks in the main thread
         logging.info("Entering main scheduling loop.")
