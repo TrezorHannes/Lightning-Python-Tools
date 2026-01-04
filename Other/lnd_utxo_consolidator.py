@@ -333,13 +333,14 @@ Disclaimer:
     command_parts = [
         lncli_path,
         "sendcoins",
-        "--sweepall",
         f"--addr {shlex.quote(address)}",
         fee_flag
     ]
     
-    # Add UTXOs only if not using all (when using all, --sweepall handles it automatically)
-    if not use_all:
+    if use_all:
+        command_parts.append("--sweepall")
+    else:
+        # Add UTXOs only if not using all
         for utxo in selected_utxos:
             outpoint = utxo.get("outpoint")
             if outpoint:

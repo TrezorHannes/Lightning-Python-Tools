@@ -76,7 +76,7 @@ CHANNEL_FEE_RATE_PPM = config.getint("magma", "channel_fee_rate_ppm", fallback=3
 MEMPOOL_FEES_API_URL = config.get("urls", "mempool_fees_api", fallback="https://mempool.space/api/v1/fees/recommended")
 CONNECT_RETRY_DELAY_SECONDS = config.getint("magma", "connect_retry_delay_seconds", fallback=60)
 MAX_CONNECT_RETRIES = config.getint("magma", "max_connect_retries", fallback=30)
-POLLING_INTERVAL_MINUTES = config.getint("magma", "polling_interval_minutes", fallback=20)
+POLLING_INTERVAL_MINUTES = config.getint("magma", "polling_interval_minutes", fallback=10)
 
 BANNED_PUBKEYS = config.get("pubkey", "banned_magma_pubkeys", fallback="").split(",")
 
@@ -354,14 +354,14 @@ def get_node_extended_details(pubkey: str) -> dict:
 
 
 def execute_lncli_addinvoice(amt, memo, expiry):
-    # Command to be executed
-    command = f"{LNCLI_PATH} addinvoice " f"--memo '{memo}' --amt {amt} --expiry {expiry}"
-    logging.info(f"Executing command: {command}")
+    # Command to be executed as list
+    command = [LNCLI_PATH, "addinvoice", "--memo", str(memo), "--amt", str(amt), "--expiry", str(expiry)]
+    logging.info(f"Executing command: {' '.join(command)}")
 
     try:
-        # Execute the command and capture the output
+        # Execute the command as list with shell=False
         result = subprocess.Popen(
-            command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         output, error = result.communicate()
         output_decoded = output.decode("utf-8").strip()
@@ -582,19 +582,29 @@ def get_channel_point(hash_to_find):
 def execute_lnd_command(
     node_pub_key, fee_per_vbyte, formatted_outpoints, input_amount, fee_rate_ppm
 ):
-    # Format the command
-    command = (
-        f"{LNCLI_PATH} openchannel "
-        f"--node_key {node_pub_key} --sat_per_vbyte={fee_per_vbyte} "
-        f"{formatted_outpoints if formatted_outpoints else ''} --local_amt={input_amount} --fee_rate_ppm {fee_rate_ppm}" # Ensure formatted_outpoints is not None
-    )
-    logging.info(f"Executing command: {command}")
+    # Format the command as list
+    command = [
+        LNCLI_PATH, "openchannel",
+        "--node_key", node_pub_key,
+        "--sat_per_vbyte", str(fee_per_vbyte),
+        "--local_amt", str(input_amount),
+        "--fee_rate_ppm", str(fee_rate_ppm)
+    ]
+    
+    # Add outpoints if present
+    if formatted_outpoints:
+        # Assuming formatted_outpoints is a string like "--utxo hash:index --utxo hash:index"
+        # We need to split it for the list format
+        parts = formatted_outpoints.split()
+        command.extend(parts)
+
+    logging.info(f"Executing command: {' '.join(command)}")
     std_err_output = "N/A" # Initialize stderr output
 
     try:
-        # Run the command and capture both stdout and stderr
+        # Run the command as list with shell=False
         result = subprocess.run(
-            command, shell=True, check=False, capture_output=True, text=True
+            command, check=False, capture_output=True, text=True
         )
         std_err_output = result.stderr.strip() if result.stderr else "N/A"
 
@@ -724,10 +734,10 @@ def connect_to_node(peer_pubkey: str, connection_details_list: list[dict], max_r
 
         retries = 0
         while retries < max_retries:
-            command = f"lncli connect {node_key_address} --timeout 120s"
-            logging.info(f"Executing connect command (attempt {retries + 1}/{max_retries} for current address): {command}")
+            command = [LNCLI_PATH, "connect", node_key_address, "--timeout", "120s"]
+            logging.info(f"Executing connect command (attempt {retries + 1}/{max_retries} for current address): {' '.join(command)}")
             try:
-                result = subprocess.run(command, shell=True, capture_output=True, text=True, check=False)
+                result = subprocess.run(command, capture_output=True, text=True, check=False)
                 current_stderr = result.stderr.strip() if result.stderr else "N/A"
                 overall_last_stderr = current_stderr # Keep track of the very last stderr encountered
 
@@ -783,9 +793,9 @@ def _handle_critical_litloop_error(detail: str, context: str):
 
 def get_lncli_utxos():
     # First get all UTXOs from LND
-    command = f"{LNCLI_PATH} listunspent --min_confs=3"
+    command = [LNCLI_PATH, "listunspent", "--min_confs=3"]
     process = subprocess.Popen(
-        command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
     output, error = process.communicate()
     output = output.decode("utf-8")
@@ -808,10 +818,16 @@ def get_lncli_utxos():
 
     try:
         if loop_path and os.path.exists(loop_path):
-            # Construct the litloop command
-            litloop_cmd = f"{loop_path} --rpcserver=localhost:8443 --tlscertpath=~/.lit/tls.cert static listunspent"
+            # Construct the litloop command as list
+            litloop_cmd = [
+                loop_path,
+                "--rpcserver=localhost:8443",
+                "--tlscertpath=~/.lit/tls.cert",
+                "static",
+                "listunspent"
+            ]
             process = subprocess.Popen(
-                litloop_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                litloop_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
             output, error = process.communicate()
             output = output.decode("utf-8")
