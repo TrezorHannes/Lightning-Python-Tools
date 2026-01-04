@@ -1264,8 +1264,12 @@ def main():
                 # --- Calculate Adjustments ---
                 # Call calculate_fee_band_adjustment with the determined stuck_bands_to_move_down
                 # It now returns factor, initial_raw_band, final_raw_band
+
+                # Get max num_updates to ensure we don't penalize a peer for having one new channel if they have older ones
+                max_num_updates = max((c["num_updates"] for c in channels_to_modify.values()), default=0)
+
                 fee_band_result = calculate_fee_band_adjustment(
-                    fee_conditions, check_ratio, stuck_bands_to_move_down
+                    fee_conditions, check_ratio, max_num_updates, stuck_bands_to_move_down
                 )
                 fee_band_factor, initial_raw_band, final_raw_band = fee_band_result
                 fee_band_adj_pct = fee_band_factor - 1.0
