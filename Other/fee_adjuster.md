@@ -38,6 +38,20 @@ This adjustment is automatically skipped if the aggregate local liquidity for th
 - Run the script to automatically adjust fees based on configured settings.
 - Requires a running LNDg instance for local channel details and fee updates.
 
+### Test Suite:
+New features and refactors are guarded by a suite of unit tests. To run them locally:
+
+```bash
+# Activate your venv first if not active
+source .venv/bin/activate
+
+# Install test dependencies
+pip install -r requirements-dev.txt
+
+# Run the tests (pytest auto-discovers tests in the current directory)
+pytest
+```
+
 ### Command Line Arguments:
 - --debug: Enable detailed debug output, including stuck channel check results.
 
