@@ -161,6 +161,16 @@ ACTIVE_ORDER_POLL_INTERVAL_SECONDS = 30  # Check every 30 seconds
 ACTIVE_ORDER_POLL_DURATION_MINUTES = 15   # Poll for a total of 15 minutes
 USER_CONFIRMATION_TIMEOUT_SECONDS = 300  # 5 minutes for user to respond to new offer
 
+# --- Constants for transaction size calculation (SegWit P2WPKH) ---
+P2WPKH_INPUT_VBYTES = 57.5  # Virtual bytes per input
+P2WPKH_OUTPUT_VBYTES = 43  # Virtual bytes per output
+TRANSACTION_OVERHEAD_VBYTES = 10.5  # Transaction overhead
+
+# --- Constants for Telegram polling retry with exponential backoff ---
+TELEGRAM_POLL_INITIAL_DELAY_SECONDS = 10
+TELEGRAM_POLL_MAX_DELAY_SECONDS = 300  # Cap at 5 minutes
+TELEGRAM_POLL_BACKOFF_MULTIPLIER = 2
+
 # --- State for pending user confirmations ---
 # Structure: {order_id: {"message_id": int, "timestamp": float, "details": dict}}
 pending_user_confirmations = {}
@@ -897,9 +907,10 @@ def get_lncli_utxos():
 
 
 def calculate_transaction_size(utxos_needed):
-    inputs_size = utxos_needed * 57.5  # Each UTXO is 57.5 vBytes
-    outputs_size = 2 * 43  # Two outputs of 43 vBytes each
-    overhead_size = 10.5  # Transaction overhead of 10.5 vBytes
+    """Calculate transaction size in virtual bytes for a given number of UTXOs."""
+    inputs_size = utxos_needed * P2WPKH_INPUT_VBYTES
+    outputs_size = 2 * P2WPKH_OUTPUT_VBYTES
+    overhead_size = TRANSACTION_OVERHEAD_VBYTES
     total_size = inputs_size + outputs_size + overhead_size
     return total_size
 
@@ -1727,6 +1738,46 @@ def handle_run_command(message):
     threading.Thread(target=execute_bot_behavior, name=f"ManualRun-{message.text[1:]}").start()
 
 
+def run_telegram_polling():
+    """Runs Telegram polling with automatic restart on failure using exponential backoff.
+    
+    Uses infinity_polling() instead of polling() for better error recovery.
+    If polling crashes (network issues, timeouts, etc.), it will automatically
+    restart after a delay that increases exponentially (capped at 5 minutes).
+    This prevents log spam during extended outages while still recovering quickly
+    from transient failures.
+    """
+    restart_count = 0
+    current_delay = TELEGRAM_POLL_INITIAL_DELAY_SECONDS
+    
+    while True:
+        try:
+            if restart_count > 0:
+                logging.warning(f"Telegram polling restart #{restart_count} (next delay: {current_delay}s)")
+                send_telegram_notification(
+                    f"⚠️ Telegram poller restarted (attempt #{restart_count}). "
+                    f"Next retry delay: {current_delay}s. "
+                    "If you see this frequently, check network connectivity.",
+                    level="warning"
+                )
+            logging.info("Starting Telegram bot infinity_polling...")
+            # infinity_polling handles most transient errors internally
+            # timeout: connection timeout for requests
+            # long_polling_timeout: how long Telegram waits before returning empty response
+            bot.infinity_polling(timeout=60, long_polling_timeout=30)
+            # If we get here, polling exited cleanly - reset backoff
+            restart_count = 0
+            current_delay = TELEGRAM_POLL_INITIAL_DELAY_SECONDS
+        except Exception as e:
+            restart_count += 1
+            logging.error(f"Telegram polling crashed with error: {e}. Restarting in {current_delay} seconds... (restart #{restart_count})")
+            time.sleep(current_delay)
+            # Exponential backoff with cap
+            current_delay = min(
+                current_delay * TELEGRAM_POLL_BACKOFF_MULTIPLIER,
+                TELEGRAM_POLL_MAX_DELAY_SECONDS
+            )
+
 if __name__ == "__main__":
     # Ensure logs directory exists before setting up handler
     logs_dir_for_main = os.path.join(parent_dir, "..", "logs")
@@ -1804,35 +1855,6 @@ if __name__ == "__main__":
         schedule.every(1).minutes.do(check_pending_confirmations_timeouts)
         
         schedule.every(POLLING_INTERVAL_MINUTES).minutes.do(execute_bot_behavior)
-        
-        # Define robust polling wrapper with automatic restart on failure
-        def run_telegram_polling():
-            """Runs Telegram polling with automatic restart on failure.
-            
-            Uses infinity_polling() instead of polling() for better error recovery.
-            If polling crashes (network issues, timeouts, etc.), it will automatically
-            restart after a short delay. This prevents the silent thread death that
-            causes callback buttons to stop working.
-            """
-            restart_count = 0
-            while True:
-                try:
-                    if restart_count > 0:
-                        logging.warning(f"Telegram polling restart #{restart_count}")
-                        send_telegram_notification(
-                            f"⚠️ Telegram poller restarted (attempt #{restart_count}). "
-                            "If you see this frequently, check network connectivity.",
-                            level="warning"
-                        )
-                    logging.info("Starting Telegram bot infinity_polling...")
-                    # infinity_polling handles most transient errors internally
-                    # timeout: connection timeout for requests
-                    # long_polling_timeout: how long Telegram waits before returning empty response
-                    bot.infinity_polling(timeout=60, long_polling_timeout=30)
-                except Exception as e:
-                    restart_count += 1
-                    logging.error(f"Telegram polling crashed with error: {e}. Restarting in 10 seconds... (restart #{restart_count})")
-                    time.sleep(10)
         
         # Start the Telegram bot polling in a separate daemon thread
         logging.info("Starting Telegram bot poller thread with infinity_polling.")
