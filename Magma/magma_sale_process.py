@@ -1804,10 +1804,40 @@ if __name__ == "__main__":
         schedule.every(1).minutes.do(check_pending_confirmations_timeouts)
         
         schedule.every(POLLING_INTERVAL_MINUTES).minutes.do(execute_bot_behavior)
-        # Start the Telegram bot polling in a separate thread
-        logging.info("Starting Telegram bot poller thread.")
-        # Reduced interval from 30 to 2 seconds for better responsiveness
-        threading.Thread(target=lambda: bot.polling(none_stop=True, interval=2), name="TelegramPoller").start()
+        
+        # Define robust polling wrapper with automatic restart on failure
+        def run_telegram_polling():
+            """Runs Telegram polling with automatic restart on failure.
+            
+            Uses infinity_polling() instead of polling() for better error recovery.
+            If polling crashes (network issues, timeouts, etc.), it will automatically
+            restart after a short delay. This prevents the silent thread death that
+            causes callback buttons to stop working.
+            """
+            restart_count = 0
+            while True:
+                try:
+                    if restart_count > 0:
+                        logging.warning(f"Telegram polling restart #{restart_count}")
+                        send_telegram_notification(
+                            f"⚠️ Telegram poller restarted (attempt #{restart_count}). "
+                            "If you see this frequently, check network connectivity.",
+                            level="warning"
+                        )
+                    logging.info("Starting Telegram bot infinity_polling...")
+                    # infinity_polling handles most transient errors internally
+                    # timeout: connection timeout for requests
+                    # long_polling_timeout: how long Telegram waits before returning empty response
+                    bot.infinity_polling(timeout=60, long_polling_timeout=30)
+                except Exception as e:
+                    restart_count += 1
+                    logging.error(f"Telegram polling crashed with error: {e}. Restarting in 10 seconds... (restart #{restart_count})")
+                    time.sleep(10)
+        
+        # Start the Telegram bot polling in a separate daemon thread
+        logging.info("Starting Telegram bot poller thread with infinity_polling.")
+        telegram_thread = threading.Thread(target=run_telegram_polling, name="TelegramPoller", daemon=True)
+        telegram_thread.start()
 
         # Run scheduled tasks in the main thread
         logging.info("Entering main scheduling loop.")
