@@ -371,11 +371,15 @@ def calculate_fee_band_adjustment(
     fee_conditions,
     outbound_ratio,
     num_updates,
-    stuck_bands_to_move_down=0,  # New parameter: Number of bands to move down due to stuck status
+    stuck_bands_to_move_down=0,  # Number of bands to move down due to stuck status
 ):
     """
     Calculate fee adjustment based on outbound liquidity ratio bands, applying
     an additional adjustment based on how many bands to move down due to stuck status.
+
+    IMPORTANT: Discounts (negative adjustments) are ONLY applied when the channel
+    is stuck (stuck_bands_to_move_down > 0). This prevents fee drops on active
+    channels with high local liquidity.
 
     Args:
         fee_conditions: Dictionary containing fee band settings.
@@ -401,6 +405,9 @@ def calculate_fee_band_adjustment(
     # Get min_updates_for_discount from stuck_channel_adjustment section
     stuck_settings = fee_conditions.get("stuck_channel_adjustment", {})
     min_updates_for_discount = stuck_settings.get("min_updates_for_discount", 0)
+
+    # Determine if channel is stuck (has been without outbound traffic long enough)
+    is_channel_stuck = stuck_bands_to_move_down > 0
 
     # Calculate the initial band based on current liquidity (0-4)
     # Band 0 (80-100% local) -> index 0
@@ -430,8 +437,9 @@ def calculate_fee_band_adjustment(
         adjustment_per_band_step = adjustment_range / 3.0
         adjustment = discount + effective_band_for_calc * adjustment_per_band_step
 
-    # If the channel is new, don't apply the discount
-    if num_updates < min_updates_for_discount and adjustment < 0:
+    # CRITICAL: Only apply discounts when channel is stuck OR has sufficient updates
+    # This prevents fee drops on active channels with high local liquidity
+    if adjustment < 0 and (not is_channel_stuck or num_updates < min_updates_for_discount):
         adjustment = 0
 
     # Return the multiplicative factor and the initial/final bands for printing/notes
