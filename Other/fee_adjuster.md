@@ -48,8 +48,8 @@ source .venv/bin/activate
 # Install test dependencies
 pip install -r requirements-dev.txt
 
-# Run the tests
-pytest tests/
+# Run the tests (pytest auto-discovers tests in the current directory)
+pytest
 ```
 
 ### Command Line Arguments:

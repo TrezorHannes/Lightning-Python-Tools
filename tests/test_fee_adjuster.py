@@ -2,8 +2,7 @@ import sys
 import os
 import pytest
 
-# Add Other directory to sys.path to allow importing fee_adjuster
-sys.path.append(os.path.join(os.path.dirname(__file__), '../Other'))
+import pytest
 
 from fee_adjuster import calculate_fee_band_adjustment
 
