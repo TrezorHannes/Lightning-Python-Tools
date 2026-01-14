@@ -897,9 +897,9 @@ def get_lncli_utxos():
 
 
 def calculate_transaction_size(utxos_needed):
-    inputs_size = utxos_needed * 57.5  # Cada UTXO é de 57.5 vBytes
-    outputs_size = 2 * 43  # Dois outputs de 43 vBytes cada
-    overhead_size = 10.5  # Overhead de 10.5 vBytes
+    inputs_size = utxos_needed * 57.5  # Each UTXO is 57.5 vBytes
+    outputs_size = 2 * 43  # Two outputs of 43 vBytes each
+    overhead_size = 10.5  # Transaction overhead of 10.5 vBytes
     total_size = inputs_size + outputs_size + overhead_size
     return total_size
 
