@@ -437,13 +437,9 @@ def calculate_fee_band_adjustment(
         adjustment_per_band_step = adjustment_range / 3.0
         adjustment = discount + effective_band_for_calc * adjustment_per_band_step
 
-    # CRITICAL: Only apply discounts when channel is stuck
+    # CRITICAL: Only apply discounts when channel is stuck OR has sufficient updates
     # This prevents fee drops on active channels with high local liquidity
-    if adjustment < 0 and not is_channel_stuck:
-        adjustment = 0
-
-    # If the channel is new, don't apply the discount (legacy safeguard)
-    if num_updates < min_updates_for_discount and adjustment < 0:
+    if adjustment < 0 and (not is_channel_stuck or num_updates < min_updates_for_discount):
         adjustment = 0
 
     # Return the multiplicative factor and the initial/final bands for printing/notes
