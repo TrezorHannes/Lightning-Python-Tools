@@ -484,60 +484,105 @@ def calculate_new_fee_rate(
     return round(new_fee_rate)
 
 
-# Need to fetch from LNDg since lncli listchannels doesn't provide local_fee
-# and want to avoid two lncli subprocesses per pubkey
-def get_channels_to_modify(pubkey, config):
+# Global channel cache - populated once per script run to avoid redundant API calls
+_CHANNEL_CACHE = None
+
+
+def fetch_all_channels(config):
+    """
+    Fetch all channels from LNDg once and cache them by remote_pubkey.
+    Returns a dict: {pubkey: {chan_id: channel_data, ...}, ...}
+    """
+    global _CHANNEL_CACHE
+    if _CHANNEL_CACHE is not None:
+        logging.debug("Using cached channel data")
+        return _CHANNEL_CACHE
+
     lndg_api_url = config["lndg"]["lndg_api_url"]
     api_url = f"{lndg_api_url}/api/channels?limit=1500"
     username = config["credentials"]["lndg_username"]
     password = config["credentials"]["lndg_password"]
-    channels_to_modify = {}
+
     try:
         response = requests.get(api_url, auth=(username, password))
         response.raise_for_status()
         data = response.json()
+
+        _CHANNEL_CACHE = {}
+
         if "results" in data:
             results = data["results"]
             for result in results:
                 remote_pubkey = result.get("remote_pubkey", "")
-                if remote_pubkey == pubkey:
-                    chan_id = result.get("chan_id", "")
-                    local_fee_rate = result.get("local_fee_rate", 0)
-                    is_open = result.get("is_open", False)
-                    alias = result.get("alias", "")
-                    capacity = result.get("capacity", 0)
-                    local_balance = result.get("local_balance", 0)
-                    fees_updated = result.get("fees_updated", "")
-                    auto_fees = result.get("auto_fees", False)
-                    ar_max_cost = result.get("ar_max_cost")
-                    local_inbound_fee_rate = result.get("local_inbound_fee_rate")
-                    num_updates = result.get("num_updates", 0)
+                is_open = result.get("is_open", False)
 
-                    if is_open:
-                        local_balance_ratio = (
-                            (local_balance / capacity) * 100 if capacity else 0
+                if not is_open:
+                    continue
+
+                chan_id = result.get("chan_id", "")
+                local_fee_rate = result.get("local_fee_rate", 0)
+                alias = result.get("alias", "")
+                capacity = result.get("capacity", 0)
+                local_balance = result.get("local_balance", 0)
+                fees_updated = result.get("fees_updated", "")
+                auto_fees = result.get("auto_fees", False)
+                ar_max_cost = result.get("ar_max_cost")
+                local_inbound_fee_rate = result.get("local_inbound_fee_rate")
+                num_updates = result.get("num_updates", 0)
+
+                local_balance_ratio = (
+                    (local_balance / capacity) * 100 if capacity else 0
+                )
+
+                # Parse fees_updated with fallback for missing fractional seconds
+                fees_updated_datetime = None
+                if fees_updated:
+                    try:
+                        fees_updated_datetime = datetime.strptime(
+                            fees_updated, "%Y-%m-%dT%H:%M:%S.%f"
                         )
-                        fees_updated_datetime = (
-                            datetime.strptime(fees_updated, "%Y-%m-%dT%H:%M:%S.%f")
-                            if fees_updated
-                            else None
+                    except ValueError:
+                        fees_updated_datetime = datetime.strptime(
+                            fees_updated, "%Y-%m-%dT%H:%M:%S"
                         )
-                        channels_to_modify[chan_id] = {
-                            "alias": alias,
-                            "capacity": capacity,
-                            "local_balance": local_balance,
-                            "local_balance_ratio": local_balance_ratio,
-                            "fees_updated_datetime": fees_updated_datetime,
-                            "local_fee_rate": local_fee_rate,
-                            "auto_fees": auto_fees,
-                            "ar_max_cost": ar_max_cost,
-                            "local_inbound_fee_rate": local_inbound_fee_rate,
-                            "num_updates": num_updates,
-                        }
-        return channels_to_modify
+
+                channel_data = {
+                    "alias": alias,
+                    "capacity": capacity,
+                    "local_balance": local_balance,
+                    "local_balance_ratio": local_balance_ratio,
+                    "fees_updated_datetime": fees_updated_datetime,
+                    "local_fee_rate": local_fee_rate,
+                    "auto_fees": auto_fees,
+                    "ar_max_cost": ar_max_cost,
+                    "local_inbound_fee_rate": local_inbound_fee_rate,
+                    "num_updates": num_updates,
+                }
+
+                if remote_pubkey not in _CHANNEL_CACHE:
+                    _CHANNEL_CACHE[remote_pubkey] = {}
+                _CHANNEL_CACHE[remote_pubkey][chan_id] = channel_data
+
+        logging.info(
+            f"Fetched and cached {sum(len(v) for v in _CHANNEL_CACHE.values())} channels for {len(_CHANNEL_CACHE)} peers"
+        )
+        return _CHANNEL_CACHE
+
     except requests.exceptions.RequestException as e:
         logging.error(f"Error fetching LNDg channels: {e}")
+        _CHANNEL_CACHE = None  # Reset cache to allow retry on next call
         raise LNDGAPIError(f"Error fetching LNDg channels: {e}")
+
+
+# Need to fetch from LNDg since lncli listchannels doesn't provide local_fee
+# and want to avoid two lncli subprocesses per pubkey
+def get_channels_to_modify(pubkey, config):
+    """
+    Get channels for a specific pubkey from the cached channel data.
+    Uses global cache to avoid redundant API calls when processing multiple peers.
+    """
+    all_channels = fetch_all_channels(config)
+    return all_channels.get(pubkey, {})
 
 
 def calculate_inbound_fee_discount_ppm(
