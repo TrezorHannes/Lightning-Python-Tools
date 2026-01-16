@@ -503,12 +503,12 @@ def fetch_all_channels(config):
     username = config["credentials"]["lndg_username"]
     password = config["credentials"]["lndg_password"]
 
-    _CHANNEL_CACHE = {}
-
     try:
         response = requests.get(api_url, auth=(username, password))
         response.raise_for_status()
         data = response.json()
+
+        _CHANNEL_CACHE = {}
 
         if "results" in data:
             results = data["results"]
@@ -533,11 +533,18 @@ def fetch_all_channels(config):
                 local_balance_ratio = (
                     (local_balance / capacity) * 100 if capacity else 0
                 )
-                fees_updated_datetime = (
-                    datetime.strptime(fees_updated, "%Y-%m-%dT%H:%M:%S.%f")
-                    if fees_updated
-                    else None
-                )
+
+                # Parse fees_updated with fallback for missing fractional seconds
+                fees_updated_datetime = None
+                if fees_updated:
+                    try:
+                        fees_updated_datetime = datetime.strptime(
+                            fees_updated, "%Y-%m-%dT%H:%M:%S.%f"
+                        )
+                    except ValueError:
+                        fees_updated_datetime = datetime.strptime(
+                            fees_updated, "%Y-%m-%dT%H:%M:%S"
+                        )
 
                 channel_data = {
                     "alias": alias,
@@ -563,6 +570,7 @@ def fetch_all_channels(config):
 
     except requests.exceptions.RequestException as e:
         logging.error(f"Error fetching LNDg channels: {e}")
+        _CHANNEL_CACHE = None  # Reset cache to allow retry on next call
         raise LNDGAPIError(f"Error fetching LNDg channels: {e}")
 
 
