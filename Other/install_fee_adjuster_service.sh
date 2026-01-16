@@ -57,7 +57,7 @@ After=network.target
 
 [Service]
 Type=oneshot
-User=$USER
+User=$SUDO_USER
 WorkingDirectory=$SCRIPT_DIR
 ExecStart=$VENV_PYTHON $FEE_ADJUSTER_SCRIPT
 RemainAfterExit=no
