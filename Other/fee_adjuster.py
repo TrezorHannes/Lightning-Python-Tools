@@ -634,8 +634,36 @@ def calculate_inbound_fee_discount_ppm(
     return inbound_fee_discount_ppm
 
 
+baseline_file_path = os.path.join(parent_dir, "..", "data", "rebalance_targets_baseline.json")
+
+
+def load_baseline_targets():
+    """Load persistent channel baseline targets map."""
+    if os.path.exists(baseline_file_path):
+        try:
+            with open(baseline_file_path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.error(f"Error reading baseline targets file: {e}")
+    return {}
+
+
+def save_baseline_targets(baseline_map):
+    """Save persistent channel baseline targets map."""
+    try:
+        os.makedirs(os.path.dirname(baseline_file_path), exist_ok=True)
+        with open(baseline_file_path, "w") as f:
+            json.dump(baseline_map, f, indent=4)
+    except Exception as e:
+        logging.error(f"Error saving baseline targets file: {e}")
+
+
 def determine_ar_out_target_update(
-    channel_data, new_inbound_fee_ppm, inbound_protection_config=None
+    channel_data,
+    new_inbound_fee_ppm,
+    inbound_protection_config=None,
+    baseline_map=None,
+    chan_id=None,
 ):
     """
     Determines if ar_out_target needs to be updated to prevent rebalancing feedback loops.
@@ -644,10 +672,10 @@ def determine_ar_out_target_update(
       locks target to lock_target (default 100) to prevent channel from being used as an outbound rebalance source.
     - If new_inbound_fee_ppm >= 0, local liquidity >= restore_threshold (default 75%),
       and current ar_out_target >= lock_target:
-      restores ar_out_target to baseline (default 75 or configured default).
+      restores ar_out_target to baseline (channel specific baseline or default 75).
 
     Returns:
-        int: New target value (e.g. 100 or 75) if update needed, else None.
+        int: New target value (e.g. 100 or baseline) if update needed, else None.
     """
     if inbound_protection_config is None:
         inbound_protection_config = {}
@@ -665,14 +693,21 @@ def determine_ar_out_target_update(
         current_out_target = 100
 
     local_balance_ratio = channel_data.get("local_balance_ratio", 0)
+    chan_key = str(chan_id) if chan_id else str(channel_data.get("chan_id", ""))
 
     if new_inbound_fee_ppm < 0:
         if current_out_target < lock_target:
+            if baseline_map is not None and chan_key and chan_key not in baseline_map:
+                baseline_map[chan_key] = current_out_target
             return lock_target
     elif new_inbound_fee_ppm >= 0:
         if current_out_target >= lock_target and local_balance_ratio >= restore_threshold:
-            if current_out_target != default_restored_target:
-                return default_restored_target
+            channel_restore_target = default_restored_target
+            if baseline_map and chan_key in baseline_map:
+                channel_restore_target = baseline_map[chan_key]
+
+            if current_out_target != channel_restore_target:
+                return channel_restore_target
 
     return None
 
@@ -1417,6 +1452,7 @@ def main():
                     "max_inbound_discount_ppm",
                     inbound_protection_config.get("max_inbound_discount_ppm", None),
                 )
+                baseline_map = load_baseline_targets()
 
                 calculated_inbound_ppm_for_peer = 0
 
@@ -1461,6 +1497,8 @@ def main():
                         channel_data,
                         current_chan_calculated_inbound_ppm,
                         inbound_protection_config=inbound_protection_config,
+                        baseline_map=baseline_map,
+                        chan_id=chan_id,
                     )
 
                     # Determine if an update to LNDg is needed based on deltas
@@ -1567,6 +1605,8 @@ def main():
                                 log_api_response=True,
                             )
                             updated_any_channel = True
+                            if new_ar_out_target is not None:
+                                save_baseline_targets(baseline_map)
                         except LNDGAPIError as api_err:
                             logging.error(
                                 f"Failed LNDg update for {chan_id}: {api_err}"

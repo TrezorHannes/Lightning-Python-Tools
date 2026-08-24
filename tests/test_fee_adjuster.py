@@ -236,4 +236,32 @@ def test_determine_ar_out_target_update_disabled_lock():
     assert determine_ar_out_target_update(channel_data, new_inbound_fee_ppm=-250, inbound_protection_config=inbound_protection) is None
 
 
+def test_determine_ar_out_target_update_restores_custom_baseline():
+    """
+    Test that when a channel has a saved baseline in baseline_map (e.g. 45%),
+    it restores to 45% instead of generic default (e.g. 75%).
+    """
+    from fee_adjuster import determine_ar_out_target_update
+    channel_data = {
+        "ar_out_target": 100,
+        "local_balance_ratio": 85.0
+    }
+    inbound_protection = {
+        "lock_ar_out_target_on_discount": True,
+        "default_restored_ar_out_target": 75
+    }
+    baseline_map = {
+        "1026788829343318018": 45
+    }
+    new_target = determine_ar_out_target_update(
+        channel_data,
+        new_inbound_fee_ppm=0,
+        inbound_protection_config=inbound_protection,
+        baseline_map=baseline_map,
+        chan_id="1026788829343318018"
+    )
+    assert new_target == 45
+
+
+
     

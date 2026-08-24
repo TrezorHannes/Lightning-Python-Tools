@@ -35,6 +35,9 @@ logging.basicConfig(
 )
 
 
+baseline_file_path = os.path.join(parent_dir, "..", "data", "rebalance_targets_baseline.json")
+
+
 def load_config():
     config = configparser.ConfigParser()
     config.read(config_file_path)
@@ -46,6 +49,27 @@ def load_fee_config():
         with open(fee_config_file_path, "r") as f:
             return json.load(f)
     return {}
+
+
+def load_baseline_targets():
+    """Load persistent channel baseline targets map."""
+    if os.path.exists(baseline_file_path):
+        try:
+            with open(baseline_file_path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.error(f"Error reading baseline targets file: {e}")
+    return {}
+
+
+def save_baseline_targets(baseline_map):
+    """Save persistent channel baseline targets map."""
+    try:
+        os.makedirs(os.path.dirname(baseline_file_path), exist_ok=True)
+        with open(baseline_file_path, "w") as f:
+            json.dump(baseline_map, f, indent=4)
+    except Exception as e:
+        logging.error(f"Error saving baseline targets file: {e}")
 
 
 def fetch_all_open_channels(config):
@@ -67,7 +91,8 @@ def evaluate_channel_action(
     lock_target=100,
     restore_target=75,
     restore_liquidity_threshold=75.0,
-    lock_threshold=95
+    lock_threshold=95,
+    baseline_map=None
 ):
     """
     Evaluates whether a channel needs ar_out_target update.
@@ -76,6 +101,7 @@ def evaluate_channel_action(
         tuple: (action: str, new_target: int|None)
                action in ["LOCK", "RESTORE", "NOOP"]
     """
+    chan_id = str(channel.get("chan_id", ""))
     inbound_fee = channel.get("local_inbound_fee_rate") or 0
     current_out_target = channel.get("ar_out_target")
     if current_out_target is None:
@@ -88,13 +114,20 @@ def evaluate_channel_action(
     # Rule 1: Inbound discount active -> lock out from rebalancing donor candidacy
     if inbound_fee < 0:
         if current_out_target < lock_threshold:
+            # Capture current target as baseline before locking if not already captured
+            if baseline_map is not None and chan_id and chan_id not in baseline_map:
+                baseline_map[chan_id] = current_out_target
             return "LOCK", lock_target
 
     # Rule 2: Inbound discount removed & liquidity healthy -> restore baseline target
     elif inbound_fee >= 0:
         if current_out_target >= lock_threshold and local_ratio >= restore_liquidity_threshold:
-            if current_out_target != restore_target:
-                return "RESTORE", restore_target
+            channel_restore_target = restore_target
+            if baseline_map and chan_id in baseline_map:
+                channel_restore_target = baseline_map[chan_id]
+
+            if current_out_target != channel_restore_target:
+                return "RESTORE", channel_restore_target
 
     return "NOOP", None
 
@@ -104,7 +137,8 @@ def audit_channel_rebalance_targets(
     lock_target=100,
     restore_target=75,
     restore_liquidity_threshold=75.0,
-    lock_threshold=95
+    lock_threshold=95,
+    baseline_map=None
 ):
     """
     Audits a list of open channels and generates update plans.
@@ -113,13 +147,17 @@ def audit_channel_rebalance_targets(
         list of dicts containing audit actions.
     """
     plans = []
+    if baseline_map is None:
+        baseline_map = {}
+
     for c in channels:
         action, new_target = evaluate_channel_action(
             c,
             lock_target=lock_target,
             restore_target=restore_target,
             restore_liquidity_threshold=restore_liquidity_threshold,
-            lock_threshold=lock_threshold
+            lock_threshold=lock_threshold,
+            baseline_map=baseline_map
         )
         if action != "NOOP":
             capacity = c.get("capacity", 0)
@@ -194,11 +232,14 @@ def main():
         print(f"❌ Error fetching channels from LNDg: {e}")
         sys.exit(1)
 
+    baseline_map = load_baseline_targets()
+
     plans = audit_channel_rebalance_targets(
         channels,
         lock_target=lock_target,
         restore_target=restore_target,
-        restore_liquidity_threshold=restore_threshold
+        restore_liquidity_threshold=restore_threshold,
+        baseline_map=baseline_map
     )
 
     if not plans:
@@ -247,10 +288,11 @@ def main():
         if success:
             success_count += 1
 
-    if args.dry_run:
-        print(f"🔍 Dry run complete. {len(plans)} potential updates identified.")
-    else:
+    if not args.dry_run:
+        save_baseline_targets(baseline_map)
         print(f"✅ Successfully updated {success_count}/{len(plans)} channel targets in LNDg.")
+    else:
+        print(f"🔍 Dry run complete. {len(plans)} potential updates identified.")
 
 
 if __name__ == "__main__":

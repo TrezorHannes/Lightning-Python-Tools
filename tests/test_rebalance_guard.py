@@ -99,3 +99,32 @@ def test_audit_channel_rebalance_targets():
     assert plans[1]["chan_id"] == "3"
     assert plans[1]["action"] == "RESTORE"
     assert plans[1]["new_target"] == 75
+
+
+def test_evaluate_channel_action_restores_custom_channel_baseline():
+    """
+    Test that when a baseline map contains a custom target (e.g. 35 for Garlic),
+    it restores to 35 instead of generic default 75.
+    """
+    channel = {
+        "chan_id": "1026788829343318018",
+        "alias": "Garlic🧄",
+        "local_inbound_fee_rate": 0,
+        "ar_out_target": 100,
+        "local_balance": 2700000,
+        "capacity": 3000000, # 90%
+        "auto_rebalance": False
+    }
+    baseline_map = {
+        "1026788829343318018": 35
+    }
+    action, target = evaluate_channel_action(
+        channel,
+        lock_target=100,
+        restore_target=75,
+        restore_liquidity_threshold=75.0,
+        baseline_map=baseline_map
+    )
+    assert action == "RESTORE"
+    assert target == 35
+
