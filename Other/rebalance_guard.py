@@ -121,11 +121,14 @@ def evaluate_channel_action(
 
     # Rule 2: Inbound discount removed & liquidity healthy -> restore baseline target
     elif inbound_fee >= 0:
-        if current_out_target >= lock_threshold and local_ratio >= restore_liquidity_threshold:
+        if current_out_target >= lock_threshold:
             if baseline_map and chan_id in baseline_map:
                 channel_restore_target = baseline_map[chan_id]
-                if channel_restore_target < lock_threshold and current_out_target != channel_restore_target:
-                    return "RESTORE", channel_restore_target
+                if channel_restore_target < lock_threshold:
+                    # Dynamic Hysteresis: Require local balance to reach max(baseline + 15%, 60%)
+                    dynamic_threshold = min(max(channel_restore_target + 15.0, 60.0), 95.0)
+                    if local_ratio >= dynamic_threshold and current_out_target != channel_restore_target:
+                        return "RESTORE", channel_restore_target
 
     return "NOOP", None
 

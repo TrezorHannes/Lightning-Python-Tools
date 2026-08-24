@@ -185,13 +185,13 @@ def test_determine_ar_out_target_update_locks_on_discount():
 
 def test_determine_ar_out_target_update_restores_when_balanced():
     """
-    Test that when inbound discount is removed and local balance is high,
+    Test that when inbound discount is removed and local balance is high (>= 90% for baseline 75),
     a locked ar_out_target (100) is restored to its recorded baseline.
     """
     from fee_adjuster import determine_ar_out_target_update
     channel_data = {
         "ar_out_target": 100,
-        "local_balance_ratio": 82.0
+        "local_balance_ratio": 92.0
     }
     inbound_protection = {
         "lock_ar_out_target_on_discount": True,

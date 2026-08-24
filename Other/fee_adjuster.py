@@ -708,11 +708,14 @@ def determine_ar_out_target_update(
                 baseline_map[chan_key] = current_out_target
             return lock_target
     elif new_inbound_fee_ppm >= 0:
-        if current_out_target >= lock_target and local_balance_ratio >= restore_threshold:
+        if current_out_target >= lock_target:
             if baseline_map and chan_key in baseline_map:
                 channel_restore_target = baseline_map[chan_key]
-                if channel_restore_target < lock_target and current_out_target != channel_restore_target:
-                    return channel_restore_target
+                if channel_restore_target < lock_target:
+                    # Dynamic Hysteresis: Require local balance to reach max(baseline + 15%, 60%)
+                    dynamic_threshold = min(max(channel_restore_target + 15.0, 60.0), 95.0)
+                    if local_balance_ratio >= dynamic_threshold and current_out_target != channel_restore_target:
+                        return channel_restore_target
 
     return None
 
