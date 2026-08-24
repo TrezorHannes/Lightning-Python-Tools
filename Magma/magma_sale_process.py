@@ -655,14 +655,25 @@ def execute_lnd_command(
         return None, err_msg
 
 
+# Bound for the mempool.space fee lookup. Without an explicit timeout, requests
+# blocks indefinitely on an unresponsive endpoint.
+MEMPOOL_API_TIMEOUT_SECONDS = 15
+
+
 def get_fast_fee():
-    response = requests.get(MEMPOOL_FEES_API_URL)
-    data = response.json()
-    if data:
-        fast_fee = data["fastestFee"]
-        return fast_fee
-    else:
+    try:
+        response = requests.get(MEMPOOL_FEES_API_URL, timeout=MEMPOOL_API_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        fast_fee = response.json().get("fastestFee")
+    except Exception as e:
+        logging.exception(f"Failed to fetch fee rate from mempool API: {e}")
         return None
+
+    if isinstance(fast_fee, bool) or not isinstance(fast_fee, (int, float)) or fast_fee <= 0:
+        logging.error(f"Invalid fastestFee from mempool API: {fast_fee!r}")
+        return None
+
+    return fast_fee
 
 
 def get_node_connection_details(peer_pubkey: str) -> list[dict]:
