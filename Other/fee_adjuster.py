@@ -1272,7 +1272,7 @@ def main():
                     "Managed By",
                 ]
                 for p in guard_plans:
-                    managed = "LNDg af.py" if p["channel"].get("auto_fees") else "fee_adjuster"
+                    managed = "LNDg af.py" if p.get("auto_fees") else "fee_adjuster"
                     action_str = f"🔒 {p['action']}" if p["action"] == "LOCK" else f"🔓 {p['action']}"
                     table.add_row([
                         action_str,
