@@ -28,7 +28,8 @@ Below is a list of available scripts and their primary functions. Scripts marked
 
 **Other:**
 - `swap_wallet.py`: [one-off] Sends a specified amount of Lightning funds to a given LN address. Allows customization of total amount, amount per transaction, interval between transactions, maximum fee rate, and an optional message for the payments.
-- `fee_adjuster.py`: [systemd service, cronjob] Automatically adjusts channel fees based on Amboss API data and user-defined settings. Requires a running LNDg instance to retrieve local channel details. Configure via `feeConfig.json` and `config.ini`. Install using `sudo ./Other/install_fee_adjuster_service.sh` or run as a cron job.
+- `fee_adjuster.py`: [systemd service, cronjob] Automatically adjusts channel fees based on Amboss API data and user-defined settings. Includes dynamic inbound fee discounts, fee bands, stuck channel adjustments, and inbound rebalance donor locking. Requires a running LNDg instance. Configure via `feeConfig.json` and `config.ini`. Install using `sudo ./Other/install_fee_adjuster_service.sh` or run as a cron job.
+- `rebalance_guard.py`: [command-line output, cronjob] Audits all open LNDg channels across both native Auto-Fees (`af.py`) and `fee_adjuster.py`. Protects refilling channels with active inbound discounts by setting `ar_out_target = 100%` (preventing LNDg from draining them as outbound rebalance donors), and automatically restores baseline targets when liquidity recovers. Run with `--dry-run` to preview actions.
 - `boltz_swap-out.py`: [command-line output, one-off] Automates Lightning Network (LN) to Liquid Bitcoin (L-BTC) swaps using Boltz for submarine swaps (swapping out).
 
 ### === Installation Instructions ===

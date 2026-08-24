@@ -219,4 +219,21 @@ def test_determine_ar_out_target_update_no_change_needed():
     # Already 100 while discounted -> None
     assert determine_ar_out_target_update(channel_data, new_inbound_fee_ppm=-250, inbound_protection_config=inbound_protection) is None
 
+
+def test_determine_ar_out_target_update_disabled_lock():
+    """
+    Test that if lock_ar_out_target_on_discount is False, no locking action is taken.
+    """
+    from fee_adjuster import determine_ar_out_target_update
+    channel_data = {
+        "ar_out_target": 45,
+        "local_balance_ratio": 15.0
+    }
+    inbound_protection = {
+        "lock_ar_out_target_on_discount": False,
+        "default_restored_ar_out_target": 75
+    }
+    assert determine_ar_out_target_update(channel_data, new_inbound_fee_ppm=-250, inbound_protection_config=inbound_protection) is None
+
+
     

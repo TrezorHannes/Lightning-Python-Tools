@@ -4,12 +4,11 @@
     "write_charge_lnd_file": true,
     "update_channel_notes": true,
     "inbound_protection": {
-        "enabled": true,
-        "max_inbound_discount_ppm": 250,
         "lock_ar_out_target_on_discount": true,
         "lock_target": 100,
         "default_restored_ar_out_target": 75,
-        "restore_liquidity_threshold": 75.0
+        "restore_liquidity_threshold": 75.0,
+        "max_inbound_discount_ppm": null
     },
     "groups": {
         "sink": {

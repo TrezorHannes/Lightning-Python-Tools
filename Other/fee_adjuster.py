@@ -640,19 +640,23 @@ def determine_ar_out_target_update(
     """
     Determines if ar_out_target needs to be updated to prevent rebalancing feedback loops.
 
-    - If new_inbound_fee_ppm < 0 (inbound discount offered) and current ar_out_target < 100:
-      locks target to 100 to prevent channel from being used as an outbound rebalance source.
+    - If new_inbound_fee_ppm < 0 (inbound discount offered) and current ar_out_target < lock_target:
+      locks target to lock_target (default 100) to prevent channel from being used as an outbound rebalance source.
     - If new_inbound_fee_ppm >= 0, local liquidity >= restore_threshold (default 75%),
-      and current ar_out_target == 100:
+      and current ar_out_target >= lock_target:
       restores ar_out_target to baseline (default 75 or configured default).
 
     Returns:
         int: New target value (e.g. 100 or 75) if update needed, else None.
     """
-    if not inbound_protection_config or not inbound_protection_config.get("enabled", True):
-        return None
+    if inbound_protection_config is None:
+        inbound_protection_config = {}
 
     lock_enabled = inbound_protection_config.get("lock_ar_out_target_on_discount", True)
+    if not lock_enabled:
+        return None
+
+    lock_target = inbound_protection_config.get("lock_target", 100)
     default_restored_target = inbound_protection_config.get("default_restored_ar_out_target", 75)
     restore_threshold = inbound_protection_config.get("restore_liquidity_threshold", 75.0)
 
@@ -662,11 +666,11 @@ def determine_ar_out_target_update(
 
     local_balance_ratio = channel_data.get("local_balance_ratio", 0)
 
-    if new_inbound_fee_ppm < 0 and lock_enabled:
-        if current_out_target < 100:
-            return 100
-    elif new_inbound_fee_ppm >= 0 and lock_enabled:
-        if current_out_target == 100 and local_balance_ratio >= restore_threshold:
+    if new_inbound_fee_ppm < 0:
+        if current_out_target < lock_target:
+            return lock_target
+    elif new_inbound_fee_ppm >= 0:
+        if current_out_target >= lock_target and local_balance_ratio >= restore_threshold:
             if current_out_target != default_restored_target:
                 return default_restored_target
 
@@ -1411,7 +1415,7 @@ def main():
                 inbound_protection_config = node_definitions.get("inbound_protection", {})
                 max_inbound_discount_ppm = fee_conditions.get(
                     "max_inbound_discount_ppm",
-                    inbound_protection_config.get("max_inbound_discount_ppm", 250),
+                    inbound_protection_config.get("max_inbound_discount_ppm", None),
                 )
 
                 calculated_inbound_ppm_for_peer = 0
