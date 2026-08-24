@@ -108,6 +108,13 @@ class LNDGAPIError(Exception):
 
 # Get the path to the parent directory
 parent_dir = os.path.dirname(os.path.abspath(__file__))
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
+try:
+    from rebalance_guard import audit_channel_rebalance_targets, update_lndg_channel_target
+except ImportError:
+    from Other.rebalance_guard import audit_channel_rebalance_targets, update_lndg_channel_target
 
 # Construct the path to the config.ini file
 config_file_path = os.path.join(parent_dir, "..", "config.ini")
@@ -1226,6 +1233,76 @@ def main():
             terminal_output_enabled = True
             lndg_fee_update_enabled = False
             skip_charge_lnd_file_write = True
+
+        # --- Global Rebalance Guard Audit (Audits all open channels across LNDg) ---
+        inbound_protection = node_definitions.get("inbound_protection", {})
+        if inbound_protection.get("lock_ar_out_target_on_discount", True):
+            lock_target = inbound_protection.get("lock_target", 100)
+            restore_target = inbound_protection.get("default_restored_ar_out_target", 75)
+            restore_threshold = inbound_protection.get("restore_liquidity_threshold", 75.0)
+            baseline_map = load_baseline_targets()
+
+            # Pre-fetch and cache all open channels from LNDg
+            _, all_channels_data = fetch_all_channels(config)
+            all_channels_list = [
+                dict(c_data, chan_id=c_id)
+                for c_id, c_data in all_channels_data.items()
+            ]
+
+            guard_plans = audit_channel_rebalance_targets(
+                all_channels_list,
+                lock_target=lock_target,
+                restore_target=restore_target,
+                restore_liquidity_threshold=restore_threshold,
+                baseline_map=baseline_map,
+            )
+
+            if guard_plans and (terminal_output_enabled or args.debug):
+                table = PrettyTable()
+                table.field_names = [
+                    "Action",
+                    "Chan ID",
+                    "Alias",
+                    "Local %",
+                    "Out Fee",
+                    "In Fee",
+                    "oTarget",
+                    "New Target",
+                    "Managed By",
+                ]
+                for p in guard_plans:
+                    managed = "LNDg af.py" if p["channel"].get("auto_fees") else "fee_adjuster"
+                    action_str = f"🔒 {p['action']}" if p["action"] == "LOCK" else f"🔓 {p['action']}"
+                    table.add_row([
+                        action_str,
+                        str(p["chan_id"])[:12] + "...",
+                        str(p["alias"])[:18],
+                        f"{p['local_ratio']:.1f}%",
+                        f"{p['outbound_fee']} ppm",
+                        f"{p['inbound_fee']} ppm",
+                        f"{p['old_target']}%",
+                        f"{p['new_target']}%",
+                        managed,
+                    ])
+
+                print("=" * 80)
+                print(" 🛡️  Global Rebalance Guard Audit (All Open Channels)")
+                print(f" Mode: {'SIMULATION / DEBUG' if args.debug else 'LIVE EXECUTION'}")
+                print(f" Lock Target: {lock_target}% | Restore Target: {restore_target}%")
+                print("=" * 80)
+                print(table)
+                print(f"Total Rebalance Guard adjustments: {len(guard_plans)} channels\n")
+
+            if not args.debug and lndg_fee_update_enabled and guard_plans:
+                for p in guard_plans:
+                    update_lndg_channel_target(
+                        p["chan_id"],
+                        p["new_target"],
+                        config,
+                        dry_run=False
+                    )
+                save_baseline_targets(baseline_map)
+                logging.info(f"RebalanceGuard applied {len(guard_plans)} target adjustments.")
 
         for node in node_definitions["nodes"]:
             pubkey = node["pubkey"]
