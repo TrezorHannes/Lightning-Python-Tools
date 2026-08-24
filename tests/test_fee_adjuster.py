@@ -186,7 +186,7 @@ def test_determine_ar_out_target_update_locks_on_discount():
 def test_determine_ar_out_target_update_restores_when_balanced():
     """
     Test that when inbound discount is removed and local balance is high,
-    a locked ar_out_target (100) is restored to baseline (e.g. 75).
+    a locked ar_out_target (100) is restored to its recorded baseline.
     """
     from fee_adjuster import determine_ar_out_target_update
     channel_data = {
@@ -194,12 +194,42 @@ def test_determine_ar_out_target_update_restores_when_balanced():
         "local_balance_ratio": 82.0
     }
     inbound_protection = {
-        "enabled": True,
         "lock_ar_out_target_on_discount": True,
         "default_restored_ar_out_target": 75
     }
-    new_target = determine_ar_out_target_update(channel_data, new_inbound_fee_ppm=0, inbound_protection_config=inbound_protection)
+    baseline_map = {"chan_123": 75}
+    new_target = determine_ar_out_target_update(
+        channel_data,
+        new_inbound_fee_ppm=0,
+        inbound_protection_config=inbound_protection,
+        baseline_map=baseline_map,
+        chan_id="chan_123"
+    )
     assert new_target == 75
+
+
+def test_determine_ar_out_target_update_ignores_unmanaged_100():
+    """
+    Test that an intentionally 100% channel (e.g. bfx-lnd0) without a lower baseline is not modified.
+    """
+    from fee_adjuster import determine_ar_out_target_update
+    channel_data = {
+        "ar_out_target": 100,
+        "local_balance_ratio": 85.0
+    }
+    inbound_protection = {
+        "lock_ar_out_target_on_discount": True,
+        "default_restored_ar_out_target": 75
+    }
+    new_target = determine_ar_out_target_update(
+        channel_data,
+        new_inbound_fee_ppm=0,
+        inbound_protection_config=inbound_protection,
+        baseline_map={},
+        chan_id="bfx_0"
+    )
+    assert new_target is None
+
 
 
 def test_determine_ar_out_target_update_no_change_needed():

@@ -22,7 +22,7 @@ def test_evaluate_channel_action_locks_discounted_channel():
 def test_evaluate_channel_action_restores_balanced_channel():
     """
     If a channel has no inbound discount (>=0), local liquidity >= 75%,
-    and its ar_out_target is currently locked at 100%, it should be restored.
+    and its ar_out_target is currently locked at 100% with a recorded baseline, it should be restored.
     """
     channel = {
         "chan_id": "1046355738178945025",
@@ -33,9 +33,34 @@ def test_evaluate_channel_action_restores_balanced_channel():
         "capacity": 5000000, # 98%
         "auto_rebalance": False
     }
-    action, target = evaluate_channel_action(channel, lock_target=100, restore_target=75, restore_liquidity_threshold=75.0)
+    baseline_map = {"1046355738178945025": 75}
+    action, target = evaluate_channel_action(
+        channel,
+        lock_target=100,
+        restore_target=75,
+        restore_liquidity_threshold=75.0,
+        baseline_map=baseline_map
+    )
     assert action == "RESTORE"
     assert target == 75
+
+def test_evaluate_channel_action_ignores_unmanaged_100_percent_channel():
+    """
+    If a channel has ar_out_target = 100% intentionally (e.g. bfx-lnd0)
+    and was not locked by the guard (not in baseline_map), it must remain NOOP.
+    """
+    channel = {
+        "chan_id": "1012176319780093953",
+        "alias": "bfx-lnd0",
+        "local_inbound_fee_rate": 0,
+        "ar_out_target": 100,
+        "local_balance": 4000000,
+        "capacity": 5000000, # 80%
+        "auto_rebalance": False
+    }
+    action, target = evaluate_channel_action(channel, lock_target=100, restore_target=75, restore_liquidity_threshold=75.0, baseline_map={})
+    assert action == "NOOP"
+    assert target is None
 
 def test_evaluate_channel_action_no_op_for_healthy_channel():
     """
@@ -90,7 +115,8 @@ def test_audit_channel_rebalance_targets():
             "is_open": True
         }
     ]
-    plans = audit_channel_rebalance_targets(channels, lock_target=100, restore_target=75)
+    baseline_map = {"3": 75}
+    plans = audit_channel_rebalance_targets(channels, lock_target=100, restore_target=75, baseline_map=baseline_map)
     assert len(plans) == 2
     assert plans[0]["chan_id"] == "1"
     assert plans[0]["action"] == "LOCK"

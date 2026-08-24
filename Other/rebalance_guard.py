@@ -122,12 +122,10 @@ def evaluate_channel_action(
     # Rule 2: Inbound discount removed & liquidity healthy -> restore baseline target
     elif inbound_fee >= 0:
         if current_out_target >= lock_threshold and local_ratio >= restore_liquidity_threshold:
-            channel_restore_target = restore_target
             if baseline_map and chan_id in baseline_map:
                 channel_restore_target = baseline_map[chan_id]
-
-            if current_out_target != channel_restore_target:
-                return "RESTORE", channel_restore_target
+                if channel_restore_target < lock_threshold and current_out_target != channel_restore_target:
+                    return "RESTORE", channel_restore_target
 
     return "NOOP", None
 

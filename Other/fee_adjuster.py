@@ -702,12 +702,10 @@ def determine_ar_out_target_update(
             return lock_target
     elif new_inbound_fee_ppm >= 0:
         if current_out_target >= lock_target and local_balance_ratio >= restore_threshold:
-            channel_restore_target = default_restored_target
             if baseline_map and chan_key in baseline_map:
                 channel_restore_target = baseline_map[chan_key]
-
-            if current_out_target != channel_restore_target:
-                return channel_restore_target
+                if channel_restore_target < lock_target and current_out_target != channel_restore_target:
+                    return channel_restore_target
 
     return None
 
