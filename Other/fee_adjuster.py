@@ -1286,13 +1286,13 @@ def main():
                         managed,
                     ])
 
-                print("=" * 80)
-                print(" 🛡️  Global Rebalance Guard Audit (All Open Channels)")
-                print(f" Mode: {'SIMULATION / DEBUG' if args.debug else 'LIVE EXECUTION'}")
-                print(f" Lock Target: {lock_target}% | Restore Target: {restore_target}%")
-                print("=" * 80)
-                print(table)
-                print(f"Total Rebalance Guard adjustments: {len(guard_plans)} channels\n")
+                print("=" * 80, flush=True)
+                print(" 🛡️  Global Rebalance Guard Audit (All Open Channels)", flush=True)
+                print(f" Mode: {'SIMULATION / DEBUG' if args.debug else 'LIVE EXECUTION'}", flush=True)
+                print(f" Lock Target: {lock_target}% | Restore Target: {restore_target}%", flush=True)
+                print("=" * 80, flush=True)
+                print(table, flush=True)
+                print(f"Total Rebalance Guard adjustments: {len(guard_plans)} channels\n", flush=True)
 
             if not args.debug and lndg_fee_update_enabled and guard_plans:
                 for p in guard_plans:
