@@ -1243,11 +1243,12 @@ def main():
             baseline_map = load_baseline_targets()
 
             # Pre-fetch and cache all open channels from LNDg
-            _, all_channels_data = fetch_all_channels(config)
-            all_channels_list = [
-                dict(c_data, chan_id=c_id)
-                for c_id, c_data in all_channels_data.items()
-            ]
+            cached_channels = fetch_all_channels(config)
+            all_channels_list = []
+            for pub, chans in cached_channels.items():
+                for c_id, c_data in chans.items():
+                    c_dict = dict(c_data, chan_id=c_id)
+                    all_channels_list.append(c_dict)
 
             guard_plans = audit_channel_rebalance_targets(
                 all_channels_list,
