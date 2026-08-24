@@ -104,4 +104,119 @@ def test_premium_applied_regardless_of_stuck(fee_conditions):
     
     assert init_band == 4
     assert adj_factor == 1.40
+
+
+def test_inbound_fee_discount_without_cap():
+    """
+    Test standard inbound fee discount calculation without max cap.
+    Band 4 (0-20% local), Outbound Fee = 2000 ppm, ar_max_cost = 75%.
+    Expected raw discount = -round(2000 * 0.75 * 0.90) = -1350 ppm.
+    """
+    from fee_adjuster import calculate_inbound_fee_discount_ppm
+    discount = calculate_inbound_fee_discount_ppm(
+        calculated_final_outgoing_fee_ppm=2000,
+        initial_raw_band=4,
+        ar_max_cost_percent=75,
+        max_inbound_discount_ppm=None
+    )
+    assert discount == -1350
+
+
+def test_inbound_fee_discount_with_max_cap():
+    """
+    Test inbound fee discount calculation with max_inbound_discount_ppm cap.
+    Raw discount would be -1350 ppm, but with max_inbound_discount_ppm = 250,
+    it must be clamped to -250 ppm.
+    """
+    from fee_adjuster import calculate_inbound_fee_discount_ppm
+    discount = calculate_inbound_fee_discount_ppm(
+        calculated_final_outgoing_fee_ppm=2000,
+        initial_raw_band=4,
+        ar_max_cost_percent=75,
+        max_inbound_discount_ppm=250
+    )
+    assert discount == -250
+
+
+def test_inbound_fee_discount_within_cap_unchanged():
+    """
+    Test that discounts smaller than max cap are preserved.
+    Band 2 (40-60% local), Outbound Fee = 300 ppm, ar_max_cost = 50%.
+    Raw discount = -round(300 * 0.50 * 0.20) = -30 ppm.
+    With cap of 250 ppm, discount must remain -30 ppm.
+    """
+    from fee_adjuster import calculate_inbound_fee_discount_ppm
+    discount = calculate_inbound_fee_discount_ppm(
+        calculated_final_outgoing_fee_ppm=300,
+        initial_raw_band=2,
+        ar_max_cost_percent=50,
+        max_inbound_discount_ppm=250
+    )
+    assert discount == -30
+
+
+def test_inbound_fee_discount_high_liquidity_is_zero():
+    """
+    Test that Band 0 and Band 1 (high local liquidity) never receive inbound discounts.
+    """
+    from fee_adjuster import calculate_inbound_fee_discount_ppm
+    assert calculate_inbound_fee_discount_ppm(2000, 0, 75, 250) == 0
+    assert calculate_inbound_fee_discount_ppm(2000, 1, 75, 250) == 0
+
+
+def test_determine_ar_out_target_update_locks_on_discount():
+    """
+    Test that when a negative inbound fee is set and current ar_out_target < 100,
+    the target is locked to 100% to prevent rebalancer drain.
+    """
+    from fee_adjuster import determine_ar_out_target_update
+    channel_data = {
+        "ar_out_target": 45,
+        "local_balance_ratio": 15.0
+    }
+    inbound_protection = {
+        "enabled": True,
+        "lock_ar_out_target_on_discount": True,
+        "default_restored_ar_out_target": 75
+    }
+    new_target = determine_ar_out_target_update(channel_data, new_inbound_fee_ppm=-250, inbound_protection_config=inbound_protection)
+    assert new_target == 100
+
+
+def test_determine_ar_out_target_update_restores_when_balanced():
+    """
+    Test that when inbound discount is removed and local balance is high,
+    a locked ar_out_target (100) is restored to baseline (e.g. 75).
+    """
+    from fee_adjuster import determine_ar_out_target_update
+    channel_data = {
+        "ar_out_target": 100,
+        "local_balance_ratio": 82.0
+    }
+    inbound_protection = {
+        "enabled": True,
+        "lock_ar_out_target_on_discount": True,
+        "default_restored_ar_out_target": 75
+    }
+    new_target = determine_ar_out_target_update(channel_data, new_inbound_fee_ppm=0, inbound_protection_config=inbound_protection)
+    assert new_target == 75
+
+
+def test_determine_ar_out_target_update_no_change_needed():
+    """
+    Test that if channel already has appropriate target, no update is requested (returns None).
+    """
+    from fee_adjuster import determine_ar_out_target_update
+    channel_data = {
+        "ar_out_target": 100,
+        "local_balance_ratio": 15.0
+    }
+    inbound_protection = {
+        "enabled": True,
+        "lock_ar_out_target_on_discount": True,
+        "default_restored_ar_out_target": 75
+    }
+    # Already 100 while discounted -> None
+    assert determine_ar_out_target_update(channel_data, new_inbound_fee_ppm=-250, inbound_protection_config=inbound_protection) is None
+
     

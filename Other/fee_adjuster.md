@@ -17,10 +17,28 @@ and local liquidity using data from the Amboss API and LNDg API.
 - stuck_channel_adjustment: (Optional) Gradually reduces fees for channels without recent forwards.
   - enabled: true/false.
   - stuck_time_period: Number of days defining one 'stuck period' interval (e.g., 7).
-  - min_local_balance_for_stuck_discount: (Optional) If the peer's aggregate local balance ratio is below this threshold (e.g., 0.2 for 20%), the stuck discount will not be applied.
-  - min_updates_for_discount: (Optional) If the channel's `num_updates` is below this threshold, the fee band discount will not be applied. This is useful to prevent applying a discount to a newly opened channel.
+- inbound_protection: (Optional) Configures protection against unprofitable rebalance feedback loops.
+  - enabled: true/false.
+  - max_inbound_discount_ppm: Hard cap on negative inbound fee discounts (default: 250 ppm).
+  - lock_ar_out_target_on_discount: Automatically sets ar_out_target = 100% when an inbound discount is active to prevent rebalance drainage.
+  - default_restored_ar_out_target: Restores ar_out_target (e.g. 75%) once channel balance is restored and discount is removed.
+  - restore_liquidity_threshold: Local liquidity ratio required before unlocking (default: 75.0%).
 
-### Groups and group_adjustment_percentage:
+### Inbound Discount Protection & Rebalance Guard:
+When inbound discounts are offered on depleted channels, `fee_adjuster.py` and `rebalance_guard.py` ensure:
+1. Inbound discounts are capped at `max_inbound_discount_ppm` to prevent routing payments at net losses against exit channels.
+2. The channel is locked (`ar_out_target = 100%`) while offering discounts so LNDg will not cannibalize refilling liquidity as a rebalance donor.
+3. When local liquidity recovers and discounts are lifted, standard `ar_out_target` settings are restored.
+
+### Standalone Rebalance Guard Tool:
+`rebalance_guard.py` audits all open channels in LNDg across both native `af.py` and `fee_adjuster.py` channels:
+```bash
+# Dry run check
+python3 Other/rebalance_guard.py --dry-run
+
+# Live execution
+python3 Other/rebalance_guard.py
+```
 Allows tailored fee strategies for nodes in specific categories (e.g., "sink", "expensive").
 
 ### Fee Bands:
