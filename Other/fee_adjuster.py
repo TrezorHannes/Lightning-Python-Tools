@@ -1265,7 +1265,7 @@ def main():
                 print("=" * 80, flush=True)
                 print(" 🛡️  Global Rebalance Guard Audit (All Open Channels)", flush=True)
                 print(f" Mode: {'SIMULATION / DEBUG' if args.debug else 'LIVE EXECUTION'}", flush=True)
-                print(f" Lock Target: {lock_target}% | Restore Target: {restore_target}%", flush=True)
+                print(f" Lock Target: {lock_target}% | Restore Target: Previous oTarget (Recorded Baseline)", flush=True)
                 print("=" * 80, flush=True)
                 if guard_plans:
                     table = PrettyTable()
