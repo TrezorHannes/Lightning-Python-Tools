@@ -108,6 +108,13 @@ class LNDGAPIError(Exception):
 
 # Get the path to the parent directory
 parent_dir = os.path.dirname(os.path.abspath(__file__))
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
+try:
+    from rebalance_guard import audit_channel_rebalance_targets, update_lndg_channel_target
+except ImportError:
+    from Other.rebalance_guard import audit_channel_rebalance_targets, update_lndg_channel_target
 
 # Construct the path to the config.ini file
 config_file_path = os.path.join(parent_dir, "..", "config.ini")
@@ -527,6 +534,9 @@ def fetch_all_channels(config):
                 fees_updated = result.get("fees_updated", "")
                 auto_fees = result.get("auto_fees", False)
                 ar_max_cost = result.get("ar_max_cost")
+                ar_out_target = result.get("ar_out_target", 100)
+                ar_in_target = result.get("ar_in_target", 90)
+                auto_rebalance = result.get("auto_rebalance", False)
                 local_inbound_fee_rate = result.get("local_inbound_fee_rate")
                 num_updates = result.get("num_updates", 0)
 
@@ -555,6 +565,9 @@ def fetch_all_channels(config):
                     "local_fee_rate": local_fee_rate,
                     "auto_fees": auto_fees,
                     "ar_max_cost": ar_max_cost,
+                    "ar_out_target": ar_out_target,
+                    "ar_in_target": ar_in_target,
+                    "auto_rebalance": auto_rebalance,
                     "local_inbound_fee_rate": local_inbound_fee_rate,
                     "num_updates": num_updates,
                 }
@@ -586,7 +599,10 @@ def get_channels_to_modify(pubkey, config):
 
 
 def calculate_inbound_fee_discount_ppm(
-    calculated_final_outgoing_fee_ppm, initial_raw_band, ar_max_cost_percent
+    calculated_final_outgoing_fee_ppm,
+    initial_raw_band,
+    ar_max_cost_percent,
+    max_inbound_discount_ppm=None,
 ):
     """
     Calculates the inbound fee discount in PPM.
@@ -617,7 +633,91 @@ def calculate_inbound_fee_discount_ppm(
             -calculated_final_outgoing_fee_ppm
         )  # Max possible discount to make effective fee 0
 
+    # Apply max_inbound_discount_ppm safety cap if specified
+    if max_inbound_discount_ppm is not None and max_inbound_discount_ppm > 0:
+        if abs(inbound_fee_discount_ppm) > max_inbound_discount_ppm:
+            inbound_fee_discount_ppm = -max_inbound_discount_ppm
+
     return inbound_fee_discount_ppm
+
+
+baseline_file_path = os.path.join(parent_dir, "..", "data", "rebalance_targets_baseline.json")
+
+
+def load_baseline_targets():
+    """Load persistent channel baseline targets map."""
+    if os.path.exists(baseline_file_path):
+        try:
+            with open(baseline_file_path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.error(f"Error reading baseline targets file: {e}")
+    return {}
+
+
+def save_baseline_targets(baseline_map):
+    """Save persistent channel baseline targets map."""
+    try:
+        os.makedirs(os.path.dirname(baseline_file_path), exist_ok=True)
+        with open(baseline_file_path, "w") as f:
+            json.dump(baseline_map, f, indent=4)
+    except Exception as e:
+        logging.error(f"Error saving baseline targets file: {e}")
+
+
+def determine_ar_out_target_update(
+    channel_data,
+    new_inbound_fee_ppm,
+    inbound_protection_config=None,
+    baseline_map=None,
+    chan_id=None,
+):
+    """
+    Determines if ar_out_target needs to be updated to prevent rebalancing feedback loops.
+
+    - If new_inbound_fee_ppm < 0 (inbound discount offered) and current ar_out_target < lock_target:
+      locks target to lock_target (default 100) to prevent channel from being used as an outbound rebalance source.
+    - If new_inbound_fee_ppm >= 0, local liquidity >= restore_threshold (default 75%),
+      and current ar_out_target >= lock_target:
+      restores ar_out_target to baseline (channel specific baseline or default 75).
+
+    Returns:
+        int: New target value (e.g. 100 or baseline) if update needed, else None.
+    """
+    if inbound_protection_config is None:
+        inbound_protection_config = {}
+
+    lock_enabled = inbound_protection_config.get("lock_ar_out_target_on_discount", True)
+    if not lock_enabled:
+        return None
+
+    lock_target = inbound_protection_config.get("lock_target", 100)
+    default_restored_target = inbound_protection_config.get("default_restored_ar_out_target", 75)
+    restore_threshold = inbound_protection_config.get("restore_liquidity_threshold", 75.0)
+
+    current_out_target = channel_data.get("ar_out_target")
+    if current_out_target is None:
+        current_out_target = 100
+
+    local_balance_ratio = channel_data.get("local_balance_ratio", 0)
+    chan_key = str(chan_id) if chan_id else str(channel_data.get("chan_id", ""))
+
+    if new_inbound_fee_ppm < 0:
+        if current_out_target < lock_target:
+            if baseline_map is not None and chan_key and chan_key not in baseline_map:
+                baseline_map[chan_key] = current_out_target
+            return lock_target
+    elif new_inbound_fee_ppm >= 0:
+        if current_out_target >= lock_target:
+            if baseline_map and chan_key in baseline_map:
+                channel_restore_target = baseline_map[chan_key]
+                if channel_restore_target < lock_target:
+                    # Dynamic Hysteresis: Require local balance to reach max(baseline + 15%, 60%)
+                    dynamic_threshold = min(max(channel_restore_target + 15.0, 60.0), 95.0)
+                    if local_balance_ratio >= dynamic_threshold and current_out_target != channel_restore_target:
+                        return channel_restore_target
+
+    return None
 
 
 # Write to LNDg
@@ -627,6 +727,7 @@ def update_lndg_fee(
     new_inbound_fee_rate_ppm,
     channel_data,
     config,
+    new_ar_out_target=None,
     log_api_response=False,
 ):
     lndg_api_url = config["lndg"]["lndg_api_url"]
@@ -634,20 +735,26 @@ def update_lndg_fee(
     password = config["credentials"]["lndg_password"]
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # First, update auto_fees if needed (for outgoing)
-    if channel_data["auto_fees"]:
+    # Update channel settings (auto_fees or ar_out_target) if needed
+    channel_update_payload = {}
+    if channel_data.get("auto_fees"):
+        channel_update_payload["auto_fees"] = False
+    if new_ar_out_target is not None and new_ar_out_target != channel_data.get("ar_out_target"):
+        channel_update_payload["ar_out_target"] = new_ar_out_target
+
+    if channel_update_payload:
+        channel_update_payload["chan_id"] = chan_id
         auto_fees_url = f"{lndg_api_url}/api/channels/{chan_id}/"
-        auto_fees_payload = {"chan_id": chan_id, "auto_fees": False}
         try:
             response = requests.put(
-                auto_fees_url, json=auto_fees_payload, auth=(username, password)
+                auto_fees_url, json=channel_update_payload, auth=(username, password)
             )
             response.raise_for_status()
             logging.info(
-                f"{timestamp}: Disabled auto_fees for channel {chan_id} (for outgoing)"
+                f"{timestamp}: Updated channel settings for {chan_id}: {json.dumps(channel_update_payload)}"
             )
         except requests.exceptions.RequestException as e:
-            logging.error(f"Error updating auto_fees for channel {chan_id}: {e}")
+            logging.error(f"Error updating channel settings for {chan_id}: {e}")
             # Continue to fee policy update even if this fails
 
     # Then, update the fee policy (outgoing and inbound)
@@ -1130,6 +1237,77 @@ def main():
             lndg_fee_update_enabled = False
             skip_charge_lnd_file_write = True
 
+        # --- Global Rebalance Guard Audit (Audits all open channels across LNDg) ---
+        inbound_protection = node_definitions.get("inbound_protection", {})
+        if inbound_protection.get("lock_ar_out_target_on_discount", True):
+            lock_target = inbound_protection.get("lock_target", 100)
+            restore_target = inbound_protection.get("default_restored_ar_out_target", 75)
+            restore_threshold = inbound_protection.get("restore_liquidity_threshold", 75.0)
+            baseline_map = load_baseline_targets()
+
+            # Pre-fetch and cache all open channels from LNDg
+            cached_channels = fetch_all_channels(config)
+            all_channels_list = []
+            for pub, chans in cached_channels.items():
+                for c_id, c_data in chans.items():
+                    c_dict = dict(c_data, chan_id=c_id)
+                    all_channels_list.append(c_dict)
+
+            guard_plans = audit_channel_rebalance_targets(
+                all_channels_list,
+                lock_target=lock_target,
+                restore_target=restore_target,
+                restore_liquidity_threshold=restore_threshold,
+                baseline_map=baseline_map,
+            )
+
+            if guard_plans and (terminal_output_enabled or args.debug):
+                table = PrettyTable()
+                table.field_names = [
+                    "Action",
+                    "Chan ID",
+                    "Alias",
+                    "Local %",
+                    "Out Fee",
+                    "In Fee",
+                    "oTarget",
+                    "New Target",
+                    "Managed By",
+                ]
+                for p in guard_plans:
+                    managed = "LNDg af.py" if p.get("auto_fees") else "fee_adjuster"
+                    action_str = f"🔒 {p['action']}" if p["action"] == "LOCK" else f"🔓 {p['action']}"
+                    table.add_row([
+                        action_str,
+                        str(p["chan_id"])[:12] + "...",
+                        str(p["alias"])[:18],
+                        f"{p['local_ratio']:.1f}%",
+                        f"{p['outbound_fee']} ppm",
+                        f"{p['inbound_fee']} ppm",
+                        f"{p['old_target']}%",
+                        f"{p['new_target']}%",
+                        managed,
+                    ])
+
+                print("=" * 80, flush=True)
+                print(" 🛡️  Global Rebalance Guard Audit (All Open Channels)", flush=True)
+                print(f" Mode: {'SIMULATION / DEBUG' if args.debug else 'LIVE EXECUTION'}", flush=True)
+                print(f" Lock Target: {lock_target}% | Restore Target: {restore_target}%", flush=True)
+                print("=" * 80, flush=True)
+                print(table, flush=True)
+                print(f"Total Rebalance Guard adjustments: {len(guard_plans)} channels\n", flush=True)
+
+            if not args.debug and lndg_fee_update_enabled and guard_plans:
+                for p in guard_plans:
+                    update_lndg_channel_target(
+                        p["chan_id"],
+                        p["new_target"],
+                        config,
+                        dry_run=False
+                    )
+                save_baseline_targets(baseline_map)
+                logging.info(f"RebalanceGuard applied {len(guard_plans)} target adjustments.")
+
         for node in node_definitions["nodes"]:
             pubkey = node["pubkey"]
             group_name = node.get("group")
@@ -1348,6 +1526,12 @@ def main():
                 # --- Inbound Fee Calculation (per peer, but uses channel's ar_max_cost if different) ---
                 # For aggregated peers, this assumes ar_max_cost would be similar or we'd use first channel's.
                 # The current loop is per-channel for updates, so this fits.
+                inbound_protection_config = node_definitions.get("inbound_protection", {})
+                max_inbound_discount_ppm = fee_conditions.get(
+                    "max_inbound_discount_ppm",
+                    inbound_protection_config.get("max_inbound_discount_ppm", None),
+                )
+                baseline_map = load_baseline_targets()
 
                 calculated_inbound_ppm_for_peer = 0
 
@@ -1357,7 +1541,10 @@ def main():
                     if first_chan_ar_max_cost is not None:
                         calculated_inbound_ppm_for_peer = (
                             calculate_inbound_fee_discount_ppm(
-                                final_rate, initial_raw_band, first_chan_ar_max_cost
+                                final_rate,
+                                initial_raw_band,
+                                first_chan_ar_max_cost,
+                                max_inbound_discount_ppm=max_inbound_discount_ppm,
                             )
                         )
 
@@ -1377,13 +1564,29 @@ def main():
                     ):
                         current_chan_calculated_inbound_ppm = (
                             calculate_inbound_fee_discount_ppm(
-                                final_rate, initial_raw_band, chan_ar_max_cost
+                                final_rate,
+                                initial_raw_band,
+                                chan_ar_max_cost,
+                                max_inbound_discount_ppm=max_inbound_discount_ppm,
                             )
                         )
+
+                    # Check for ar_out_target update to prevent rebalance feedback loops
+                    new_ar_out_target = determine_ar_out_target_update(
+                        channel_data,
+                        current_chan_calculated_inbound_ppm,
+                        inbound_protection_config=inbound_protection_config,
+                        baseline_map=baseline_map,
+                        chan_id=chan_id,
+                    )
 
                     # Determine if an update to LNDg is needed based on deltas
                     should_update_lndg_for_this_channel = False
                     update_decision_reason = "delta<=threshold"
+
+                    if new_ar_out_target is not None:
+                        should_update_lndg_for_this_channel = True
+                        update_decision_reason = f"ar_out_target->{new_ar_out_target}%"
 
                     # Emit a compact calc summary line before decision
                     band_names_short = ["D+", "D", "N", "P", "P+"]
@@ -1461,7 +1664,7 @@ def main():
                     if lndg_fee_update_enabled and should_update_lndg_for_this_channel:
                         try:
                             logging.info(
-                                "UpdateDecision | chan_id=%s final=%d current=%d delta=%d threshold=%d reason=%s inbound_check=%s",
+                                "UpdateDecision | chan_id=%s final=%d current=%d delta=%d threshold=%d reason=%s inbound_check=%s new_ar_target=%s",
                                 chan_id,
                                 final_rate,
                                 current_outbound_fee_on_channel,
@@ -1469,6 +1672,7 @@ def main():
                                 fee_delta_threshold,
                                 update_decision_reason,
                                 "enabled" if inbound_auto_fee_enabled_for_node else "disabled",
+                                str(new_ar_out_target),
                             )
                             update_lndg_fee(
                                 chan_id,
@@ -1476,9 +1680,12 @@ def main():
                                 current_chan_calculated_inbound_ppm,
                                 channel_data,
                                 config,
+                                new_ar_out_target=new_ar_out_target,
                                 log_api_response=True,
                             )
                             updated_any_channel = True
+                            if new_ar_out_target is not None:
+                                save_baseline_targets(baseline_map)
                         except LNDGAPIError as api_err:
                             logging.error(
                                 f"Failed LNDg update for {chan_id}: {api_err}"
