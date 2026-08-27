@@ -1,31 +1,30 @@
-
 import sys
 import os
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch, mock_open
 
 # --- FIXTURE: Mock Global Side Effects ---
 @pytest.fixture(scope="module", autouse=True)
 def mock_dependencies():
-    """
-    Patcher fixture that runs BEFORE the test module logic is fully utilized.
-    Since 'import magma_sale_process' has side effects, we patch sys.modules 
-    so the import uses our mocks.
-    """
     mock_telebot = MagicMock()
     mock_telebot.TeleBot = MagicMock()
     mock_configparser = MagicMock()
     mock_logging = MagicMock()
     mock_schedule = MagicMock()
     
-    # Mock config dict
     mock_config_data = {
         "telegram": {"magma_bot_token": "fake_token", "telegram_user_id": "123"},
         "credentials": {"amboss_authorization": "fake_auth"},
         "system": {"full_path_bos": "/path/to/bos"},
-        "magma": {"invoice_expiry_seconds": "1800", "max_fee_percentage_of_invoice": "0.9", "channel_fee_rate_ppm": "350"},
+        "magma": {
+            "invoice_expiry_seconds": "1800",
+            "max_fee_percentage_of_invoice": "0.9",
+            "channel_fee_rate_ppm": "350",
+            "auto_approve_buyer_conditions": "true",
+            "auto_approve_min_seller_score": "80.0",
+        },
         "urls": {"mempool_fees_api": "https://mempool.space/api/v1/fees/recommended"},
-        "pubkey": {"banned_magma_pubkeys": ""},
+        "pubkey": {"banned_magma_pubkeys": "banned_pubkey_1,banned_pubkey_2"},
         "paths": {"lncli_path": "lncli"}
     }
     
@@ -34,6 +33,7 @@ def mock_dependencies():
     mock_config_instance.get = MagicMock(side_effect=lambda section, option, fallback=None: mock_config_data.get(section, {}).get(option, fallback))
     mock_config_instance.getint = MagicMock(return_value=10)
     mock_config_instance.getfloat = MagicMock(return_value=0.5)
+    mock_config_instance.has_option = MagicMock(return_value=True)
     mock_configparser.ConfigParser.return_value = mock_config_instance
 
     module_patches = {
@@ -42,46 +42,27 @@ def mock_dependencies():
         'configparser': mock_configparser,
         'schedule': mock_schedule,
         'logging.handlers': MagicMock(),
-        # We don't actully want to strictly mock logging or it suppresses output, but we prevent file handler creation
     }
 
-    from unittest.mock import patch, mock_open
-    
-    # Apply patches
     with patch.dict(sys.modules, module_patches):
         with patch("builtins.open", mock_open(read_data="[magma]\nfoo=bar")):
             with patch("os.makedirs"):
-                 # Normally we'd import here.
-                 # However, since we are inside a fixture, and pytest collects modules first,
-                 # we need to ensure the import happens strictly under this context.
-                 # But python imports are cached.
-                 
-                 # To make this robust, we import inside the test functions OR use 'importlib.reload' if needed.
-                 # But since we use autouse=True scope=module, tests in this file will "see" the mocked modules 
-                 # if we import right here or if we import at top level BUT rely on this fixture running first?
-                 # No, top level imports happen at collection time.
-                 # So we MUST move the import `import magma_sale_process` INTO the test functions or a fixture that returns the module.
                  yield
 
 @pytest.fixture
 def magma_module(mock_dependencies):
-    """
-    Imports and returns the magma_sale_process module ensuring it is mocked.
-    """
-    # Verify we can import it now
-    # We might need to handle sys.path if pyproject.toml didn't kick in yet or for safety
     if os.path.abspath(os.path.join(os.path.dirname(__file__), '../../Magma')) not in sys.path:
          sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../Magma')))
     
     import magma_sale_process
-    # Reset vital mocks
     magma_sale_process.requests = MagicMock()
+    magma_sale_process.AMBOSS_TOKEN = "fake_auth"
     return magma_sale_process
 
 # --- TESTS ---
 
 def test_get_node_alias_success(magma_module):
-    """Test retrieving node alias successfully."""
+    """Test retrieving node alias successfully from Space endpoint."""
     mock_response = {"data": {"getNodeAlias": "TestNode"}}
     
     mock_post = MagicMock()
@@ -92,6 +73,7 @@ def test_get_node_alias_success(magma_module):
     alias = magma_module.get_node_alias("pubkey123")
     assert alias == "TestNode"
 
+
 def test_get_node_alias_failure(magma_module):
     """Test retrieving node alias when API fails."""
     mock_post = MagicMock()
@@ -100,6 +82,74 @@ def test_get_node_alias_failure(magma_module):
 
     alias = magma_module.get_node_alias("pubkey123")
     assert alias == "ErrorFetchingAlias"
+
+
+def test_extract_order_info_new_api(magma_module):
+    """Test extracting normalized fields from live-verified Magma MarketOrder schema."""
+    sample_order = {
+        "id": "order_001",
+        "status": "WAITING_FOR_SELLER_APPROVAL",
+        "amount": {
+            "satoshi": {
+                "sats": "5000000",
+                "btc": "0.05",
+                "usd": "3000"
+            }
+        },
+        "fees": {
+            "fixed": {"sats": "1000"},
+            "variable": {"sats": "2500"},
+            "seller": {"sats": "3500"},
+            "amboss": {"sats": "500"},
+            "buyer": {"sats": "4000"}
+        },
+        "promises": {
+            "locked_min_block_length": 4320
+        },
+        "destination": {
+            "pubkey": "03deadbeef1234567890",
+            "alias": "LightningBuyer"
+        },
+        "channel_id": "892345x123x1",
+        "created_at": "2026-08-27T12:00:00Z"
+    }
+
+    info = magma_module.extract_order_info(sample_order)
+
+    assert info["id"] == "order_001"
+    assert info["status"] == "WAITING_FOR_SELLER_APPROVAL"
+    assert info["customer_pubkey"] == "03deadbeef1234567890"
+    assert info["buyer_alias"] == "LightningBuyer"
+    assert info["channel_size"] == 5000000
+    assert info["seller_invoice_amount"] == 3500
+    assert info["fixed_fee"] == 1000
+    assert info["variable_fee"] == 2500
+    assert info["amboss_fee"] == 500
+    assert info["min_block_length"] == 4320
+
+
+def test_extract_order_info_legacy_fallback(magma_module):
+    """Test extracting normalized fields when encountering legacy flat dict fields."""
+    legacy_order = {
+        "id": "legacy_001",
+        "status": "WAITING_FOR_CHANNEL_OPEN",
+        "size": 2000000,
+        "seller_invoice_amount": 1500,
+        "fixed_fee": 500,
+        "variable_fee": 1000,
+        "account": "02abcdef123456",
+        "locked_min_block_length": 2016
+    }
+
+    info = magma_module.extract_order_info(legacy_order)
+
+    assert info["id"] == "legacy_001"
+    assert info["status"] == "WAITING_FOR_CHANNEL_OPEN"
+    assert info["customer_pubkey"] == "02abcdef123456"
+    assert info["channel_size"] == 2000000
+    assert info["seller_invoice_amount"] == 1500
+    assert info["min_block_length"] == 2016
+
 
 def test_execute_lncli_addinvoice_success(magma_module, mocker):
     """Test generating an invoice calls lncli correctly."""
@@ -114,14 +164,12 @@ def test_execute_lncli_addinvoice_success(magma_module, mocker):
     assert r_hash == "hash123"
     assert pay_req == "lnbc..."
     
-    # Strict Argument Checking
     mock_popen.assert_called_once()
     args = mock_popen.call_args[0][0]
-    
-    # Check that --amt matches the passed amount 1000
     assert "--amt" in args
     amt_index = args.index("--amt")
     assert args[amt_index + 1] == "1000"
+
 
 def test_execute_lncli_addinvoice_failure(magma_module, mocker):
     """Test error handling when lncli fails."""
@@ -135,9 +183,22 @@ def test_execute_lncli_addinvoice_failure(magma_module, mocker):
     assert r_hash.startswith("Error")
     assert pay_req is None
 
+
 def test_accept_order_success(magma_module):
-    """Test accepting an order on Amboss."""
-    mock_response = {"data": {"sellerAcceptOrder": True}} 
+    """Test accepting an order on Amboss Magma."""
+    mock_response = {
+        "data": {
+            "market": {
+                "order": {
+                    "seller": {
+                        "accept": {
+                            "success": True
+                        }
+                    }
+                }
+            }
+        }
+    }
     mock_post = MagicMock()
     mock_post.json.return_value = mock_response
     mock_post.raise_for_status.return_value = None
@@ -146,15 +207,232 @@ def test_accept_order_success(magma_module):
     result = magma_module.accept_order("order123", "lnbc123")
     assert result == mock_response
 
+    call_args = magma_module.requests.post.call_args
+    assert call_args[0][0] == magma_module.MAGMA_GRAPHQL_URL
+    payload = call_args[1]["json"]
+    assert payload["variables"]["input"]["order_id"] == "order123"
+    assert payload["variables"]["input"]["payment_request"] == "lnbc123"
+
+
 def test_reject_order_success(magma_module):
-    """Test rejecting an order on Amboss."""
-    mock_response = {"data": {"sellerRejectOrder": True}}
+    """Test rejecting an order on Amboss Magma."""
+    mock_response = {
+        "data": {
+            "market": {
+                "order": {
+                    "seller": {
+                        "reject": {
+                            "success": True
+                        }
+                    }
+                }
+            }
+        }
+    }
     mock_post = MagicMock()
     mock_post.json.return_value = mock_response
     magma_module.requests.post = MagicMock(return_value=mock_post)
 
     result = magma_module.reject_order("order123")
     assert result == mock_response
+
+    call_args = magma_module.requests.post.call_args
+    assert call_args[0][0] == magma_module.MAGMA_GRAPHQL_URL
+    payload = call_args[1]["json"]
+    assert payload["variables"]["input"]["order_id"] == "order123"
+
+
+def test_confirm_channel_point_to_amboss_success(magma_module):
+    """Test confirming a channel point on Amboss Magma."""
+    mock_response = {
+        "data": {
+            "market": {
+                "order": {
+                    "seller": {
+                        "add_transaction": {
+                            "success": True
+                        }
+                    }
+                }
+            }
+        }
+    }
+    mock_post = MagicMock()
+    mock_post.json.return_value = mock_response
+    mock_post.raise_for_status.return_value = None
+    magma_module.requests.post = MagicMock(return_value=mock_post)
+
+    result = magma_module.confirm_channel_point_to_amboss("order123", "5e8a3f...c4f1:0")
+    assert result == mock_response
+
+    call_args = magma_module.requests.post.call_args
+    assert call_args[0][0] == magma_module.MAGMA_GRAPHQL_URL
+    payload = call_args[1]["json"]
+    assert payload["variables"]["input"]["order_id"] == "order123"
+    assert payload["variables"]["input"]["tx_id"] == "5e8a3f...c4f1:0"
+
+
+def test_confirm_channel_point_to_amboss_critical_error(magma_module, mocker):
+    """Test that Amboss API error in confirm_channel_point writes to critical error flag."""
+    mock_response = {
+        "errors": [{"message": "Invalid transaction outpoint"}]
+    }
+    mock_post = MagicMock()
+    mock_post.json.return_value = mock_response
+    mock_post.raise_for_status.return_value = None
+    magma_module.requests.post = MagicMock(return_value=mock_post)
+
+    mock_file = mocker.patch("builtins.open", mock_open())
+    mocker.patch.object(magma_module, "send_telegram_notification")
+
+    result = magma_module.confirm_channel_point_to_amboss("order123", "bad_tx:0")
+    assert "errors" in result
+    mock_file.assert_called()
+
+
+def test_get_offers_awaiting_seller_approval_success(magma_module):
+    """Test fetching sales awaiting seller approval."""
+    mock_response = {
+        "data": {
+            "user": {
+                "market": {
+                    "orders": {
+                        "sales": {
+                            "total": 1,
+                            "list": [
+                                {
+                                    "id": "order_pending_01",
+                                    "status": "WAITING_FOR_SELLER_APPROVAL",
+                                    "amount": {"satoshi": {"sats": "2000000"}},
+                                    "fees": {"seller": {"sats": "5000"}},
+                                    "destination": {"pubkey": "02goodpubkey123", "alias": "GoodBuyer"}
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+    }
+    mock_post = MagicMock()
+    mock_post.json.return_value = mock_response
+    mock_post.raise_for_status.return_value = None
+    magma_module.requests.post = MagicMock(return_value=mock_post)
+
+    offer = magma_module.get_offers_awaiting_seller_approval()
+    assert offer is not None
+    assert offer["id"] == "order_pending_01"
+
+
+def test_get_offers_awaiting_seller_approval_banned_pubkey_auto_reject(magma_module, mocker):
+    """Test that banned buyer pubkeys are automatically rejected."""
+    mock_response = {
+        "data": {
+            "user": {
+                "market": {
+                    "orders": {
+                        "sales": {
+                            "total": 1,
+                            "list": [
+                                {
+                                    "id": "order_banned_01",
+                                    "status": "WAITING_FOR_SELLER_APPROVAL",
+                                    "amount": {"satoshi": {"sats": "2000000"}},
+                                    "fees": {"seller": {"sats": "5000"}},
+                                    "destination": {"pubkey": "banned_pubkey_1", "alias": "BadActor"}
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+    }
+    mock_post = MagicMock()
+    mock_post.json.return_value = mock_response
+    mock_post.raise_for_status.return_value = None
+    magma_module.requests.post = MagicMock(return_value=mock_post)
+
+    mock_reject = mocker.patch.object(
+        magma_module,
+        "reject_order",
+        return_value={"data": {"market": {"order": {"seller": {"reject": {"success": True}}}}}}
+    )
+    mocker.patch.object(magma_module, "send_telegram_notification")
+
+    offer = magma_module.get_offers_awaiting_seller_approval()
+    assert offer is None
+    mock_reject.assert_called_once_with("order_banned_01")
+
+
+def test_get_orders_awaiting_channel_open_success(magma_module):
+    """Test fetching sales awaiting channel open."""
+    mock_response = {
+        "data": {
+            "user": {
+                "market": {
+                    "orders": {
+                        "sales": {
+                            "total": 1,
+                            "list": [
+                                {
+                                    "id": "order_channel_open_01",
+                                    "status": "WAITING_FOR_CHANNEL_OPEN",
+                                    "amount": {"satoshi": {"sats": "5000000"}},
+                                    "fees": {"seller": {"sats": "10000"}},
+                                    "destination": {"pubkey": "03peerpubkey456", "alias": "PeerNode"}
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+    }
+    mock_post = MagicMock()
+    mock_post.json.return_value = mock_response
+    mock_post.raise_for_status.return_value = None
+    magma_module.requests.post = MagicMock(return_value=mock_post)
+
+    order = magma_module.get_orders_awaiting_channel_open()
+    assert order is not None
+    assert order["id"] == "order_channel_open_01"
+
+
+def test_get_order_details_from_amboss_direct(magma_module):
+    """Test fetching order details by ID via get_order query."""
+    mock_response = {
+        "data": {
+            "user": {
+                "market": {
+                    "orders": {
+                        "get_order": {
+                            "id": "order_specific_01",
+                            "status": "WAITING_FOR_CHANNEL_OPEN",
+                            "amount": {"satoshi": {"sats": "3000000"}},
+                            "fees": {"seller": {"sats": "7000"}},
+                            "destination": {"pubkey": "03pubkey789", "alias": "TargetBuyer"}
+                        }
+                    }
+                }
+            }
+        }
+    }
+    mock_post = MagicMock()
+    mock_post.json.return_value = mock_response
+    mock_post.raise_for_status.return_value = None
+    magma_module.requests.post = MagicMock(return_value=mock_post)
+
+    details = magma_module.get_order_details_from_amboss("order_specific_01")
+    assert details is not None
+    assert details["id"] == "order_specific_01"
+
+
+def test_calculate_transaction_size(magma_module):
+    """Test SegWit P2WPKH transaction virtual size calculation."""
+    assert magma_module.calculate_transaction_size(1) == 154.0
+    assert magma_module.calculate_transaction_size(2) == 211.5
+
 
 def test_execute_lnd_command_success(magma_module, mocker):
     """Test successfully opening a channel."""
@@ -170,13 +448,12 @@ def test_execute_lnd_command_success(magma_module, mocker):
     assert txid == "txid123"
     assert err is None
     
-    # Strict Argument Checking
     args = mock_run.call_args[0][0]
     assert "openchannel" in args
-    
     assert "--fee_rate_ppm" in args
     fee_index = args.index("--fee_rate_ppm")
     assert args[fee_index + 1] == "500"
+
 
 def test_execute_lnd_command_failure(magma_module, mocker):
     """Test failure opening a channel."""

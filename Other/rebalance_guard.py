@@ -223,7 +223,7 @@ def main():
     print("=" * 80)
     print(" 🛡️  LNDg Rebalance Guard")
     print(f" Mode: {'DRY RUN' if args.dry_run else 'LIVE EXECUTION'}")
-    print(f" Lock Target: {lock_target}% | Restore Target: {restore_target}% | Restore Threshold: {restore_threshold}%")
+    print(f" Lock Target: {lock_target}% | Restore Target: Previous oTarget (Recorded Baseline)")
     print("=" * 80)
 
     try:

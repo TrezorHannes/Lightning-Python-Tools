@@ -83,6 +83,7 @@ BANNED_PUBKEYS = config.get("pubkey", "banned_magma_pubkeys", fallback="").split
 TOKEN = config["telegram"]["magma_bot_token"]
 AMBOSS_TOKEN = config["credentials"]["amboss_authorization"]
 CHAT_ID = config["telegram"]["telegram_user_id"]
+bot = telebot.TeleBot(TOKEN)
 
 FULL_PATH_BOS = config["system"]["full_path_bos"]
 LNCLI_PATH = config.get("paths", "lncli_path", fallback="lncli")
@@ -121,36 +122,147 @@ logging.getLogger("telebot").setLevel(logging.WARNING)
 CRITICAL_ERROR_FILE_PATH = os.path.join(parent_dir, "..", "logs", "magma_sale_process-critical-error.flag") # Reverted
 
 
-# --- GraphQL Query for Offer Orders ---
-# Fetches all fields typically needed when processing or listing offer orders.
-OFFER_ORDER_FIELDS_QUERY_PART = """
-    list {
-      id
-      size
-      status
-      account # Expected to be the buyer's pubkey
-      seller_invoice_amount
-      endpoints { # Contains 'destination' which is also buyer's pubkey
-        destination
+# --- GraphQL Endpoints ---
+MAGMA_GRAPHQL_URL = "https://magma.amboss.tech/graphql"
+AMBOSS_SPACE_GRAPHQL_URL = "https://api.amboss.space/graphql"
+
+# --- GraphQL Queries/Mutations for Amboss Magma API ---
+GET_SALES_QUERY = """
+query GetSales($input: OrderInput, $page: PageInput) {
+  user {
+    market {
+      orders {
+        sales(input: $input, page: $page) {
+          total
+          pagination {
+            limit
+            offset
+          }
+          list {
+            id
+            status
+            amount {
+              satoshi {
+                sats
+              }
+            }
+            destination {
+              pubkey
+              alias
+            }
+            source {
+              pubkey
+              alias
+            }
+            fees {
+              fixed {
+                sats
+              }
+              variable {
+                sats
+              }
+              seller {
+                sats
+              }
+              amboss {
+                sats
+              }
+            }
+            channel_id
+            created_at
+          }
+        }
       }
     }
+  }
+}
 """
 
-GET_USER_MARKET_OFFER_ORDERS_QUERY = f"""
-    query GetUserMarketOfferOrders {{
-      getUser {{
-        market {{
-          offer_orders {{
-            {OFFER_ORDER_FIELDS_QUERY_PART}
-          }}
-        }}
-      }}
-    }}
+GET_ORDER_DETAILS_QUERY = """
+query GetOrderDetails($orderId: String!) {
+  user {
+    market {
+      orders {
+        get_order(order_id: $orderId) {
+          id
+          status
+          amount {
+            satoshi {
+              sats
+            }
+          }
+          destination {
+            pubkey
+            alias
+          }
+          fees {
+            fixed {
+              sats
+            }
+            variable {
+              sats
+            }
+            seller {
+              sats
+            }
+            amboss {
+              sats
+            }
+          }
+          promises {
+            locked_min_block_length
+          }
+          transaction_id
+          channel_id
+          created_at
+        }
+      }
+    }
+  }
+}
 """
-# Note: get_order_details_from_amboss uses a slightly different query name "ListUserMarketOfferOrdersForDetails"
-# but the structure is the same. We can align this. For now, the payload in get_order_details_from_amboss
-# will be updated to use GET_USER_MARKET_OFFER_ORDERS_QUERY.
 
+ACCEPT_ORDER_MUTATION = """
+mutation SellerAcceptOrder($input: SellerAcceptOrdersInput!) {
+  market {
+    order {
+      seller {
+        accept(input: $input) {
+          success
+        }
+      }
+    }
+  }
+}
+"""
+
+REJECT_ORDER_MUTATION = """
+mutation SellerRejectOrder($input: SellerRejectOrdersInput!) {
+  market {
+    order {
+      seller {
+        reject(input: $input) {
+          success
+        }
+      }
+    }
+  }
+}
+"""
+
+ADD_TRANSACTION_MUTATION = """
+mutation SellerAddTransaction($input: SellerAddTransactionInput!) {
+  market {
+    order {
+      seller {
+        add_transaction(input: $input) {
+          success
+        }
+      }
+    }
+  }
+}
+"""
 
 # Code
 bot = telebot.TeleBot(TOKEN)
@@ -172,7 +284,6 @@ TELEGRAM_POLL_MAX_DELAY_SECONDS = 300  # Cap at 5 minutes
 TELEGRAM_POLL_BACKOFF_MULTIPLIER = 2
 
 # --- State for pending user confirmations ---
-# Structure: {order_id: {"message_id": int, "timestamp": float, "details": dict}}
 pending_user_confirmations = {}
 processed_banned_offer_ids = set()
 
@@ -190,44 +301,102 @@ def send_telegram_notification(text, level="info", **kwargs):
     else:
         logging.info(log_message)
     try:
-        # Ensure Markdown is used if not specified and message contains typical Markdown chars
         if 'parse_mode' not in kwargs and any(c in text for c in ['`', '*', '_']):
             kwargs['parse_mode'] = 'Markdown'
-        return bot.send_message(CHAT_ID, text=text, **kwargs) # Return the message object
+        return bot.send_message(CHAT_ID, text=text, **kwargs)
     except Exception as e:
         logging.error(f"Failed to send Telegram message: {e}")
         return None
 
-def _execute_amboss_graphql_request(payload: dict, operation_name: str ="AmbossGraphQL"):
+def extract_order_info(order: dict) -> dict:
+    """Extracts normalized order fields from a Magma MarketOrder object or legacy payload."""
+    if not order:
+        return {}
+    
+    order_id = order.get("id")
+    status = order.get("status")
+    
+    # Destination / Buyer Pubkey & Alias
+    dest = order.get("destination")
+    if isinstance(dest, dict):
+        buyer_pubkey = dest.get("pubkey")
+        buyer_alias = dest.get("alias")
+    else:
+        buyer_pubkey = order.get("account") or (order.get("endpoints", {}).get("destination") if isinstance(order.get("endpoints"), dict) else None)
+        buyer_alias = None
+    
+    # Amount / Size
+    amount_obj = order.get("amount")
+    if isinstance(amount_obj, dict) and "satoshi" in amount_obj:
+        size_sats = int(amount_obj.get("satoshi", {}).get("sats", 0))
+    elif isinstance(amount_obj, (int, str)) and str(amount_obj).isdigit():
+        size_sats = int(amount_obj)
+    elif "size" in order:
+        size_sats = int(order.get("size", 0))
+    else:
+        size_sats = 0
+        
+    # Fees
+    fees_obj = order.get("fees")
+    if isinstance(fees_obj, dict):
+        seller_invoice_sats = int(fees_obj.get("seller", {}).get("sats", 0))
+        fixed_fee_sats = int(fees_obj.get("fixed", {}).get("sats", 0))
+        variable_fee_sats = int(fees_obj.get("variable", {}).get("sats", 0))
+        amboss_fee_sats = int(fees_obj.get("amboss", {}).get("sats", 0))
+    else:
+        seller_invoice_sats = int(order.get("seller_invoice_amount", 0))
+        fixed_fee_sats = int(order.get("fixed_fee", 0))
+        variable_fee_sats = int(order.get("variable_fee", 0))
+        amboss_fee_sats = int(order.get("amboss_fee", 0))
+
+    # Promises
+    promises_obj = order.get("promises")
+    if isinstance(promises_obj, dict):
+        min_block_length = int(promises_obj.get("locked_min_block_length", 0))
+    else:
+        min_block_length = int(order.get("locked_min_block_length", 0))
+
+    return {
+        "id": order_id,
+        "status": status,
+        "customer_pubkey": buyer_pubkey,
+        "buyer_alias": buyer_alias,
+        "channel_size": size_sats,
+        "seller_invoice_amount": seller_invoice_sats,
+        "fixed_fee": fixed_fee_sats,
+        "variable_fee": variable_fee_sats,
+        "amboss_fee": amboss_fee_sats,
+        "min_block_length": min_block_length,
+        "created_at": order.get("created_at"),
+        "raw_order": order
+    }
+def _execute_amboss_graphql_request(
+    payload: dict,
+    operation_name: str = "AmbossGraphQL",
+    endpoint_url: str = MAGMA_GRAPHQL_URL,
+):
     """
-    Executes a GraphQL request to the Amboss API.
+    Executes a GraphQL request to the Amboss or Magma API.
     Handles common request logic, headers, timeouts, and basic error handling.
-    Args:
-        payload (dict): The GraphQL payload (e.g., {"query": "...", "variables": {...}}).
-        operation_name (str): A descriptive name for the operation for logging.
-    Returns:
-        dict or None: The JSON response data part if successful, else None.
     """
-    url = "https://api.amboss.space/graphql"
+    url = endpoint_url
     headers = {
         "content-type": "application/json",
         "Authorization": f"Bearer {AMBOSS_TOKEN}",
     }
-    logging.debug(f"Executing {operation_name} with payload: {json.dumps(payload, indent=2 if logging.getLogger().getEffectiveLevel() == logging.DEBUG else None)}") # Pretty print payload if debug
+    logging.debug(f"Executing {operation_name} against {url} with payload: {json.dumps(payload, indent=2 if logging.getLogger().getEffectiveLevel() == logging.DEBUG else None)}")
 
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=20) # Standard timeout
-        response.raise_for_status()  # Raises HTTPError for bad responses (4xx or 5xx)
+        response = requests.post(url, json=payload, headers=headers, timeout=20)
+        response.raise_for_status()
         
         response_json = response.json()
         
         if response_json.get("errors"):
             logging.error(f"GraphQL errors during {operation_name}: {response_json.get('errors')}")
-            # Do not create CRITICAL_ERROR_FILE_PATH here for query errors, let caller decide.
-            # Example: if confirm_channel_point_to_amboss gets a specific Amboss error, it might create it.
-            return None # Indicate GraphQL level error
+            return None
             
-        return response_json.get("data") # Return only the 'data' part
+        return response_json.get("data")
 
     except requests.exceptions.Timeout:
         logging.error(f"Timeout during {operation_name} to Amboss.")
@@ -244,28 +413,45 @@ def _execute_amboss_graphql_request(payload: dict, operation_name: str ="AmbossG
 
 def get_order_details_from_amboss(order_id):
     """
-    Fetches specific order details from Amboss by its ID.
-    This involves fetching the user's list of market offer orders and filtering by ID.
+    Fetches specific order details from Amboss Magma by its ID.
+    Queries the dedicated get_order endpoint or falls back to sales list.
     """
-    logging.info(f"Fetching details for order ID: {order_id} from Amboss...")
-    payload = {"query": GET_USER_MARKET_OFFER_ORDERS_QUERY}
+    logging.info(f"Fetching details for order ID: {order_id} from Amboss Magma...")
+    payload = {
+        "query": GET_ORDER_DETAILS_QUERY,
+        "variables": {"orderId": order_id}
+    }
     
-    data = _execute_amboss_graphql_request(payload, f"GetOrderDetails-{order_id}")
+    data = _execute_amboss_graphql_request(payload, f"GetOrderDetails-{order_id}", endpoint_url=MAGMA_GRAPHQL_URL)
 
-    if not data:
-        return None # Error already logged by helper
+    if data:
+        order = (
+            data.get("user", {}).get("market", {}).get("orders", {}).get("get_order")
+            or data.get("getUser", {}).get("market", {}).get("orders", {}).get("get_order")
+            or data.get("getOrder")
+        )
+        if order:
+            logging.info(f"Successfully found details for order {order_id}: {order}")
+            return order
 
-    market_data = data.get("getUser", {}).get("market", {})
-    offer_orders_list = market_data.get("offer_orders", {}).get("list", [])
-    
-    for offer in offer_orders_list:
-        if offer.get("id") == order_id:
-            logging.info(f"Successfully found details for order {order_id}: {offer}")
-            return offer
-    
-    logging.warning(f"Order ID {order_id} not found in your Amboss market orders list.")
+    # Fallback to query sales list if direct get_order didn't return
+    sales_payload = {
+        "query": GET_SALES_QUERY,
+        "variables": {"page": {"limit": 50, "offset": 0}}
+    }
+    fallback_data = _execute_amboss_graphql_request(sales_payload, f"GetSalesFallback-{order_id}", endpoint_url=MAGMA_GRAPHQL_URL)
+    if fallback_data:
+        sales_list = (
+            fallback_data.get("user", {}).get("market", {}).get("orders", {}).get("sales", {}).get("list", [])
+            or fallback_data.get("getUser", {}).get("market", {}).get("offer_orders", {}).get("list", [])
+        )
+        for offer in sales_list:
+            if offer.get("id") == order_id:
+                logging.info(f"Successfully found details for order {order_id} in sales list: {offer}")
+                return offer
+
+    logging.warning(f"Order ID {order_id} not found in Amboss Magma.")
     return None
-
 
 def get_node_alias(pubkey: str) -> str:
     """Fetches the alias for a given node pubkey using the getNodeAlias query."""
@@ -282,7 +468,7 @@ def get_node_alias(pubkey: str) -> str:
         "variables": {"pubkey": pubkey}
     }
     
-    data = _execute_amboss_graphql_request(payload, f"GetNodeAlias-{pubkey[:10]}")
+    data = _execute_amboss_graphql_request(payload, f"GetNodeAlias-{pubkey[:10]}", endpoint_url=AMBOSS_SPACE_GRAPHQL_URL)
 
     if not data:
         return "ErrorFetchingAlias" # Error already logged by helper
@@ -354,7 +540,7 @@ def get_node_extended_details(pubkey: str) -> dict:
         "variables": {"pubkey": pubkey}
     }
 
-    data = _execute_amboss_graphql_request(payload, f"GetNodeExtendedInfo-{pubkey[:10]}")
+    data = _execute_amboss_graphql_request(payload, f"GetNodeExtendedInfo-{pubkey[:10]}", endpoint_url=AMBOSS_SPACE_GRAPHQL_URL)
 
     if not data or not data.get("getNode"):
         logging.warning(f"No extended details returned for pubkey {pubkey} from Amboss.")
@@ -413,103 +599,98 @@ def execute_lncli_addinvoice(amt, memo, expiry):
 
 
 def accept_order(order_id, payment_request):
-    """Accepts an order on Amboss."""
-    logging.info(f"Accepting order {order_id} on Amboss with payment request: {payment_request[:30]}...")
+    """Accepts an order on Amboss Magma."""
+    logging.info(f"Accepting order {order_id} on Amboss Magma with payment request: {payment_request[:30]}...")
     payload = {
-        "query": """
-            mutation AcceptOrder($sellerAcceptOrderId: String!, $request: String!) {
-              sellerAcceptOrder(id: $sellerAcceptOrderId, request: $request)
+        "query": ACCEPT_ORDER_MUTATION,
+        "variables": {
+            "input": {
+                "order_id": order_id,
+                "payment_request": payment_request
             }
-        """,
-        "variables": {"sellerAcceptOrderId": order_id, "request": payment_request}
+        }
     }
-    # This is a mutation, so we expect the full response, not just 'data' part directly from helper
-    # because the success/failure is often indicated by the presence of 'sellerAcceptOrder' field itself
-    # or specific errors.
-    url = "https://api.amboss.space/graphql"
+    url = MAGMA_GRAPHQL_URL
     headers = {
         "content-type": "application/json",
         "Authorization": f"Bearer {AMBOSS_TOKEN}",
     }
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=60) # Increased timeout
+        response = requests.post(url, json=payload, headers=headers, timeout=60)
         response.raise_for_status()
         response_json = response.json()
-        logging.info(f"Amboss sellerAcceptOrder response for {order_id}: {response_json}")
-        return response_json # Return the full JSON response for the caller to interpret
+        logging.info(f"Amboss Magma seller accept response for {order_id}: {response_json}")
+        return response_json
     except requests.exceptions.Timeout:
-        logging.error(f"Timeout while accepting Amboss order {order_id}.")
+        logging.error(f"Timeout while accepting Amboss Magma order {order_id}.")
         return {"errors": [{"message": "Timeout during Amboss API call"}]}
     except requests.exceptions.RequestException as e:
-        logging.error(f"API request error accepting Amboss order {order_id}: {e}")
+        logging.error(f"API request error accepting Amboss Magma order {order_id}: {e}")
         return {"errors": [{"message": f"RequestException: {e}"}]}
     except json.JSONDecodeError as e:
-        logging.error(f"Failed to decode JSON response when accepting Amboss order {order_id}: {e}")
+        logging.error(f"Failed to decode JSON response when accepting Amboss Magma order {order_id}: {e}")
         return {"errors": [{"message": f"JSONDecodeError: {e}"}]}
     except Exception as e:
         logging.exception(f"Unexpected error in accept_order for {order_id}:")
         return {"errors": [{"message": f"Unexpected error: {e}"}]}
 
-
 def reject_order(order_id):
-    """Rejects an order on Amboss."""
-    logging.info(f"Rejecting order {order_id} on Amboss...")
+    """Rejects an order on Amboss Magma."""
+    logging.info(f"Rejecting order {order_id} on Amboss Magma...")
     payload = {
-        "query": """
-            mutation SellerRejectOrder($sellerRejectOrderId: String!) {
-              sellerRejectOrder(id: $sellerRejectOrderId)
+        "query": REJECT_ORDER_MUTATION,
+        "variables": {
+            "input": {
+                "order_id": order_id
             }
-        """,
-        "variables": {"sellerRejectOrderId": order_id}
+        }
     }
-    # Similar to accept_order, mutations might need specific handling of the full response
-    url = "https://api.amboss.space/graphql"
+    url = MAGMA_GRAPHQL_URL
     headers = {
         "content-type": "application/json",
         "Authorization": f"Bearer {AMBOSS_TOKEN}",
     }
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=60) # Increased timeout
+        response = requests.post(url, json=payload, headers=headers, timeout=60)
         response.raise_for_status()
         response_json = response.json()
-        logging.info(f"Amboss sellerRejectOrder response for {order_id}: {response_json}")
+        logging.info(f"Amboss Magma seller reject response for {order_id}: {response_json}")
         return response_json
     except requests.exceptions.Timeout:
-        logging.error(f"Timeout while rejecting Amboss order {order_id}.")
+        logging.error(f"Timeout while rejecting Amboss Magma order {order_id}.")
         return {"errors": [{"message": "Timeout during Amboss API call"}]}
     except requests.exceptions.RequestException as e:
-        logging.error(f"API request error rejecting Amboss order {order_id}: {e}")
+        logging.error(f"API request error rejecting Amboss Magma order {order_id}: {e}")
         return {"errors": [{"message": f"RequestException: {e}"}]}
     except json.JSONDecodeError as e:
-        logging.error(f"Failed to decode JSON response when rejecting Amboss order {order_id}: {e}")
+        logging.error(f"Failed to decode JSON response when rejecting Amboss Magma order {order_id}: {e}")
         return {"errors": [{"message": f"JSONDecodeError: {e}"}]}
     except Exception as e:
         logging.exception(f"Unexpected error in reject_order for {order_id}:")
         return {"errors": [{"message": f"Unexpected error: {e}"}]}
 
-
 def confirm_channel_point_to_amboss(order_id, transaction):
-    """Confirms the channel point (funding transaction) to Amboss."""
-    logging.info(f"Confirming channel point {transaction} to Amboss for order {order_id}...")
+    """Confirms the channel point (funding transaction) to Amboss Magma."""
+    logging.info(f"Confirming channel point {transaction} to Amboss Magma for order {order_id}...")
     payload = {
-        "query": """
-            mutation ConfirmChannelPoint($sellerAddTransactionId: String!, $transaction: String!) {
-              sellerAddTransaction(id: $sellerAddTransactionId, transaction: $transaction)
+        "query": ADD_TRANSACTION_MUTATION,
+        "variables": {
+            "input": {
+                "order_id": order_id,
+                "tx_id": transaction
             }
-        """,
-        "variables": {"sellerAddTransactionId": order_id, "transaction": transaction},
+        },
     }
-    # This is a critical mutation. The full response is needed.
-    url = "https://api.amboss.space/graphql"
+    url = MAGMA_GRAPHQL_URL
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {AMBOSS_TOKEN}",
     }
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=60) # Increased timeout
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
         response.raise_for_status()
         response_json = response.json()
-        logging.info(f"Amboss sellerAddTransaction response for {order_id}: {response_json}")
+        logging.info(f"Amboss Magma add_transaction response for {order_id}: {response_json}")
 
         if "errors" in response_json:
             error_message = response_json["errors"][0].get("message", "Unknown Amboss API error")
@@ -519,31 +700,25 @@ def confirm_channel_point_to_amboss(order_id, transaction):
                 "This is a critical failure from Amboss. Halting bot to prevent further issues."
             )
             logging.critical(log_content)
-            # This is a case where Amboss itself failed a critical step.
-            # We will create the critical error flag here as it might indicate a broader Amboss issue
-            # or a problem with our API key / permissions for mutations.
             with open(CRITICAL_ERROR_FILE_PATH, "a") as err_file:
                 err_file.write(f"{datetime.now()}: {log_content}\n")
             send_telegram_notification(f"🔥 CRITICAL: Failed to confirm channel to Amboss for order `{order_id}` due to API error: `{error_message}`. Bot halted. Manual check required.", level="error", parse_mode="Markdown")
-            # Return the error structure for the caller
             return response_json 
         else:
-            return response_json # Success
+            return response_json
             
     except requests.exceptions.Timeout:
         logging.error(f"Timeout while confirming channel point to Amboss for order {order_id}.")
-        # Do not create critical flag for a simple timeout on one order confirmation.
         return {"errors": [{"message": "Timeout during Amboss API call"}]}
     except requests.exceptions.RequestException as e:
         logging.error(f"API request error confirming channel point to Amboss for order {order_id}: {e}")
         return {"errors": [{"message": f"RequestException: {e}"}]}
     except json.JSONDecodeError as e:
-        logging.error(f"Failed to decode JSON response confirming channel point to Amboss for order {order_id}: {e}")
+        logging.error(f"Failed to decode JSON response when confirming channel point for order {order_id}: {e}")
         return {"errors": [{"message": f"JSONDecodeError: {e}"}]}
     except Exception as e:
         logging.exception(f"Unexpected error in confirm_channel_point_to_amboss for {order_id}:")
         return {"errors": [{"message": f"Unexpected error: {e}"}]}
-
 
 def get_channel_point(hash_to_find):
     def execute_lightning_command():
@@ -975,17 +1150,25 @@ def calculate_utxos_required_and_fees(amount_input, fee_per_vbyte):
     return utxos_needed, fee_cost, related_outpoints
 
 
-def get_orders_awaiting_channel_open(): # Renamed from check_channel
+def get_orders_awaiting_channel_open():
     logging.info("Checking for Magma orders awaiting channel open (WAITING_FOR_CHANNEL_OPEN)...")
-    payload = {"query": GET_USER_MARKET_OFFER_ORDERS_QUERY}
+    payload = {
+        "query": GET_SALES_QUERY,
+        "variables": {
+            "input": {"status": ["WAITING_FOR_CHANNEL_OPEN"]},
+            "page": {"limit": 25, "offset": 0}
+        }
+    }
     
-    data = _execute_amboss_graphql_request(payload, "GetOrdersAwaitingChannelOpen")
+    data = _execute_amboss_graphql_request(payload, "GetOrdersAwaitingChannelOpen", endpoint_url=MAGMA_GRAPHQL_URL)
 
     if not data:
-        return None # Error already logged by helper
+        return None
 
-    market = data.get("getUser", {}).get("market", {})
-    offer_orders = market.get("offer_orders", {}).get("list", [])
+    sales_data = data.get("user", {}).get("market", {}).get("orders", {}).get("sales", {})
+    offer_orders = sales_data.get("list", [])
+    if not offer_orders:
+        offer_orders = data.get("getUser", {}).get("market", {}).get("offer_orders", {}).get("list", [])
     
     orders_to_open = [
         offer for offer in offer_orders if offer.get("status") == "WAITING_FOR_CHANNEL_OPEN"
@@ -1003,37 +1186,41 @@ def get_orders_awaiting_channel_open(): # Renamed from check_channel
     return found_offer
 
 
-def get_offers_awaiting_seller_approval(): # Renamed from check_offers
+def get_offers_awaiting_seller_approval():
     global processed_banned_offer_ids
     logging.info("Checking for Magma offers awaiting seller approval (WAITING_FOR_SELLER_APPROVAL)...")
-    payload = {"query": GET_USER_MARKET_OFFER_ORDERS_QUERY}
+    payload = {
+        "query": GET_SALES_QUERY,
+        "variables": {
+            "input": {"status": ["WAITING_FOR_SELLER_APPROVAL"]},
+            "page": {"limit": 25, "offset": 0}
+        }
+    }
 
-    data = _execute_amboss_graphql_request(payload, "GetOffersAwaitingSellerApproval")
+    data = _execute_amboss_graphql_request(payload, "GetOffersAwaitingSellerApproval", endpoint_url=MAGMA_GRAPHQL_URL)
 
     if not data:
         return None
 
-    market_data = data.get("getUser", {}).get("market", {})
-    offer_orders_list = market_data.get("offer_orders", {}).get("list", [])
+    sales_data = data.get("user", {}).get("market", {}).get("orders", {}).get("sales", {})
+    offer_orders_list = sales_data.get("list", [])
+    if not offer_orders_list:
+        offer_orders_list = data.get("getUser", {}).get("market", {}).get("offer_orders", {}).get("list", [])
 
     for offer in offer_orders_list:
-        offer_id = offer.get("id")
-        current_status = offer.get("status")
-        destination_pubkey = offer.get('account') or offer.get("endpoints", {}).get("destination")
+        order_info = extract_order_info(offer)
+        offer_id = order_info.get("id")
+        current_status = order_info.get("status")
+        destination_pubkey = order_info.get("customer_pubkey")
 
         logging.debug(f"Offer ID: {offer_id}, Status: {current_status}, Buyer Pubkey: {destination_pubkey}")
 
-        # Primary filter: Only consider offers genuinely awaiting seller approval
         if current_status != "WAITING_FOR_SELLER_APPROVAL":
             logging.debug(f"Offer {offer_id} has status '{current_status}', not 'WAITING_FOR_SELLER_APPROVAL'. Skipping.")
-            # If it was a previously auto-rejected banned offer, we might want to ensure it's removed from our temporary set
-            # if Amboss now confirms its non-pending status. This prevents the set from growing indefinitely if Amboss updates.
             if offer_id in processed_banned_offer_ids and current_status in ["SELLER_REJECTED", "CANCELLED", "EXPIRED", "ERROR", "COMPLETED"]:
                 logging.info(f"Offer {offer_id} (previously auto-rejected) now has terminal status '{current_status}'. Removing from processed_banned_offer_ids.")
                 processed_banned_offer_ids.discard(offer_id)
             continue
-
-        # At this point, offer.status is "WAITING_FOR_SELLER_APPROVAL"
 
         if destination_pubkey in BANNED_PUBKEYS:
             if offer_id not in processed_banned_offer_ids:
@@ -1042,7 +1229,16 @@ def get_offers_awaiting_seller_approval(): # Renamed from check_offers
                 )
                 reject_response = reject_order(offer_id)
 
-                if reject_response and not reject_response.get("errors") and reject_response.get("data", {}).get("sellerRejectOrder"):
+                is_rejected = (
+                    reject_response
+                    and not reject_response.get("errors")
+                    and (
+                        reject_response.get("data", {}).get("market", {}).get("order", {}).get("seller", {}).get("reject", {}).get("success") is True
+                        or reject_response.get("data", {}).get("sellerRejectOrder")
+                    )
+                )
+
+                if is_rejected:
                     send_telegram_notification(
                         f"🗑️ Auto-rejected offer `{offer_id}` (was WAITING_FOR_SELLER_APPROVAL) from banned pubkey: `{destination_pubkey}`.",
                         level="warning", parse_mode="Markdown"
@@ -1060,17 +1256,14 @@ def get_offers_awaiting_seller_approval(): # Renamed from check_offers
                         f"did not confirm success or failed. Response: {reject_response}. Will retry processing next cycle."
                     )
             else:
-                logging.debug(f"Offer {offer_id} from banned pubkey {destination_pubkey} was already processed for auto-rejection in this session (still WAITING_FOR_SELLER_APPROVAL). Skipping.")
-            continue # This offer (from banned pubkey, now handled or previously handled) should not be returned for manual approval
+                logging.debug(f"Offer {offer_id} from banned pubkey {destination_pubkey} was already attempted for auto-rejection. Skipping action this cycle.")
+            continue
 
-        # If we reach here, the offer is "WAITING_FOR_SELLER_APPROVAL" and NOT from a banned pubkey.
-        # This is a candidate for manual user approval.
-        logging.info(f"Found valid, unbanned offer awaiting approval: {offer_id}")
-        return offer # Return the first such offer
+        logging.info(f"Found actionable offer WAITING_FOR_SELLER_APPROVAL: {offer_id}")
+        return offer
 
-    logging.info("No unbanned offers found currently in 'WAITING_FOR_SELLER_APPROVAL' status.")
+    logging.info("No actionable offers found awaiting seller approval.")
     return None
-
 
 def open_channel(pubkey, size, invoice):
     # get fastest fee
@@ -1191,7 +1384,14 @@ def _complete_offer_approval_process(order_id, order_details):
     accept_result = accept_order(order_id, invoice_request)
     logging.info(f"Order {order_id} Amboss acceptance result: {accept_result}")
 
-    if "data" in accept_result and "sellerAcceptOrder" in accept_result["data"] and accept_result["data"]["sellerAcceptOrder"]:
+    is_accepted = (
+        "data" in accept_result
+        and (
+            accept_result["data"].get("market", {}).get("order", {}).get("seller", {}).get("accept", {}).get("success") is True
+            or accept_result["data"].get("sellerAcceptOrder") is True
+        )
+    )
+    if is_accepted:
         success_message = f"⏳ Order `{order_id}` accepted on Amboss. Invoice sent. Monitoring for buyer payment."
         send_telegram_notification(success_message, parse_mode="Markdown")
         logging.info(success_message)
@@ -1374,20 +1574,17 @@ def process_new_offers():
         logging.info("No new Magma offers found requiring seller approval at this time.")
         return
 
-    order_id = new_offer_from_amboss['id']
+    order_info = extract_order_info(new_offer_from_amboss)
+    order_id = order_info.get('id')
     
     # If it's already pending user confirmation, we've already asked. Let timeout or callback handle it.
     if order_id in pending_user_confirmations:
-        logging.info(f"Offer {order_id} is already awaiting user confirmation. Skipping new prompt.")
+        logging.info(f"Offer {order_id} is already pending user confirmation. Skipping asking again.")
         return
 
-    # This is a genuinely new offer we haven't prompted for yet.
-    seller_invoice_amount = new_offer_from_amboss['seller_invoice_amount']
-    current_status = new_offer_from_amboss['status']
-    # 'account' is often the buyer's pubkey in Amboss market data,
-    # 'destination' under endpoints is also usually the buyer's pubkey. Prefer 'account' if available.
-    destination_pubkey = new_offer_from_amboss.get('account') or \
-                         new_offer_from_amboss.get("endpoints", {}).get("destination")
+    seller_invoice_amount = order_info.get('seller_invoice_amount')
+    current_status = order_info.get('status')
+    destination_pubkey = order_info.get('customer_pubkey')
 
 
     # Pre-check for banned pubkey before even asking user
@@ -1538,10 +1735,13 @@ def process_paid_order(order_details):
             send_telegram_notification("🔥 Critical internal error: Invalid data for processing paid order. Check logs.", level="error")
             return
 
-        order_id = order_details.get('id', 'MISSING_ID')
-        customer_pubkey = order_details.get('account')
-        channel_size_str = order_details.get('size')
-        seller_invoice_amount_str = order_details.get('seller_invoice_amount')
+        order_info = extract_order_info(order_details)
+        order_id = order_info.get('id', 'MISSING_ID')
+        customer_pubkey = order_info.get('customer_pubkey')
+        channel_size = order_info.get('channel_size')
+        seller_invoice_amount = order_info.get('seller_invoice_amount')
+        channel_size_str = str(channel_size) if channel_size else None
+        seller_invoice_amount_str = str(seller_invoice_amount) if seller_invoice_amount else None
 
         if not all([order_id != 'MISSING_ID', customer_pubkey, channel_size_str, seller_invoice_amount_str]):
             logging.error(f"Missing critical fields in order_details for order {order_id}: Pubkey={customer_pubkey}, Size={channel_size_str}, InvoiceAmount={seller_invoice_amount_str}")
