@@ -61,17 +61,17 @@ def fee_module(mock_fee_dependencies):
 # --- TESTS ---
 
 def test_extract_market_offer_info_new_api(fee_module):
-    """Test extracting normalized fields from new Magma MarketOffer schema."""
+    """Test extracting normalized fields from live-verified SimpleMarketOffer schema."""
     sample_offer = {
         "id": "off_001",
         "status": "ENABLED",
         "side": "SELL",
-        "account": {"pubkey": "03othernode999"},
-        "size": {
-            "min": {"satoshi": {"sats": "2000000"}},
-            "max": {"satoshi": {"sats": "5000000"}},
-            "total": {"satoshi": {"sats": "10000000"}},
-            "locked": {"satoshi": {"sats": "3000000"}}
+        "node": {"pubkey": "03othernode999", "alias": "PeerAlias"},
+        "total_amount": {
+            "satoshi": {"sats": "10000000"}
+        },
+        "locked_amount": {
+            "satoshi": {"sats": "3000000"}
         },
         "fees": {
             "fixed": {"sats": "1000"},
@@ -92,8 +92,7 @@ def test_extract_market_offer_info_new_api(fee_module):
     assert info["status"] == "ENABLED"
     assert info["side"] == "SELL"
     assert info["account"] == "03othernode999"
-    assert info["min_size"] == 2000000
-    assert info["max_size"] == 5000000
+    assert info["node_alias"] == "PeerAlias"
     assert info["total_size"] == 10000000
     assert info["locked_size"] == 3000000
     assert info["available_size"] == 7000000
@@ -123,8 +122,9 @@ def test_fetch_public_magma_offers_filtering(fee_module):
                                 "id": "off_valid",
                                 "status": "ENABLED",
                                 "side": "SELL",
-                                "account": {"pubkey": "03peer999"},
-                                "size": {"min": {"satoshi": {"sats": "2000000"}}, "max": {"satoshi": {"sats": "5000000"}}, "total": {"satoshi": {"sats": "5000000"}}},
+                                "node": {"pubkey": "03peer999", "alias": "PeerNode"},
+                                "total_amount": {"satoshi": {"sats": "5000000"}},
+                                "locked_amount": {"satoshi": {"sats": "0"}},
                                 "fees": {"fixed": {"sats": "500"}, "variable": {"sats": "300"}},
                                 "promises": {"min_block_length": 4320},
                                 "seller_score": 90.0
@@ -134,8 +134,9 @@ def test_fetch_public_magma_offers_filtering(fee_module):
                                 "id": "off_own",
                                 "status": "ENABLED",
                                 "side": "SELL",
-                                "account": {"pubkey": "03mypubkey123456"},
-                                "size": {"min": {"satoshi": {"sats": "2000000"}}, "max": {"satoshi": {"sats": "5000000"}}, "total": {"satoshi": {"sats": "5000000"}}},
+                                "node": {"pubkey": "03mypubkey123456", "alias": "MyNode"},
+                                "total_amount": {"satoshi": {"sats": "5000000"}},
+                                "locked_amount": {"satoshi": {"sats": "0"}},
                                 "fees": {"fixed": {"sats": "500"}, "variable": {"sats": "300"}},
                                 "promises": {"min_block_length": 4320},
                                 "seller_score": 95.0
@@ -145,8 +146,9 @@ def test_fetch_public_magma_offers_filtering(fee_module):
                                 "id": "off_low_score",
                                 "status": "ENABLED",
                                 "side": "SELL",
-                                "account": {"pubkey": "03lowscore111"},
-                                "size": {"min": {"satoshi": {"sats": "2000000"}}, "max": {"satoshi": {"sats": "5000000"}}, "total": {"satoshi": {"sats": "5000000"}}},
+                                "node": {"pubkey": "03lowscore111", "alias": "LowScoreNode"},
+                                "total_amount": {"satoshi": {"sats": "5000000"}},
+                                "locked_amount": {"satoshi": {"sats": "0"}},
                                 "fees": {"fixed": {"sats": "500"}, "variable": {"sats": "300"}},
                                 "promises": {"min_block_length": 4320},
                                 "seller_score": 60.0
@@ -184,13 +186,9 @@ def test_fetch_my_current_offers(fee_module):
                                     "id": "my_off_01",
                                     "status": "ENABLED",
                                     "side": "SELL",
-                                    "account": {"pubkey": "03mypubkey123456"},
-                                    "size": {
-                                        "min": {"satoshi": {"sats": "5000000"}},
-                                        "max": {"satoshi": {"sats": "5000000"}},
-                                        "total": {"satoshi": {"sats": "15000000"}},
-                                        "locked": {"satoshi": {"sats": "5000000"}}
-                                    },
+                                    "node": {"pubkey": "03mypubkey123456", "alias": "MyNode"},
+                                    "total_amount": {"satoshi": {"sats": "15000000"}},
+                                    "locked_amount": {"satoshi": {"sats": "5000000"}},
                                     "fees": {"fixed": {"sats": "1000"}, "variable": {"sats": "400"}},
                                     "promises": {"min_block_length": 4320},
                                     "seller_score": 98.0

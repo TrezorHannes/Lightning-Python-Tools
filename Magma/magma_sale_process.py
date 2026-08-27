@@ -83,6 +83,7 @@ BANNED_PUBKEYS = config.get("pubkey", "banned_magma_pubkeys", fallback="").split
 TOKEN = config["telegram"]["magma_bot_token"]
 AMBOSS_TOKEN = config["credentials"]["amboss_authorization"]
 CHAT_ID = config["telegram"]["telegram_user_id"]
+bot = telebot.TeleBot(TOKEN)
 
 FULL_PATH_BOS = config["system"]["full_path_bos"]
 LNCLI_PATH = config.get("paths", "lncli_path", fallback="lncli")
@@ -122,18 +123,16 @@ CRITICAL_ERROR_FILE_PATH = os.path.join(parent_dir, "..", "logs", "magma_sale_pr
 
 
 # --- GraphQL Endpoints ---
-AMBOSS_SPACE_GRAPHQL_URL = "https://api.amboss.space/graphql"
 MAGMA_GRAPHQL_URL = "https://magma.amboss.tech/graphql"
+AMBOSS_SPACE_GRAPHQL_URL = "https://api.amboss.space/graphql"
 
-# --- GraphQL Queries and Mutations for Magma Selling ---
-
-# Query seller sales (orders)
+# --- GraphQL Queries/Mutations for Amboss Magma API ---
 GET_SALES_QUERY = """
-query GetSales(: SalesInput, : PageInput) {
+query GetSales($input: OrderInput, $page: PageInput) {
   user {
     market {
       orders {
-        sales(input: , page: ) {
+        sales(input: $input, page: $page) {
           total
           pagination {
             limit
@@ -142,35 +141,35 @@ query GetSales(: SalesInput, : PageInput) {
           list {
             id
             status
-            created_at
             amount {
               satoshi {
                 sats
-                btc
-                usd
               }
-            }
-            fees {
-              fixed { sats }
-              variable { sats }
-              amboss { sats }
-              seller { sats }
-              buyer { sats }
-            }
-            promises {
-              locked_min_block_length
-              locked_base_fee_cap { sats }
-              locked_fee_rate_cap { sats }
             }
             destination {
               pubkey
               alias
             }
-            payment {
-              lightning {
-                invoice
+            source {
+              pubkey
+              alias
+            }
+            fees {
+              fixed {
+                sats
+              }
+              variable {
+                sats
+              }
+              seller {
+                sats
+              }
+              amboss {
+                sats
               }
             }
+            channel_id
+            created_at
           }
         }
       }
@@ -180,43 +179,42 @@ query GetSales(: SalesInput, : PageInput) {
 """
 
 GET_ORDER_DETAILS_QUERY = """
-query GetOrderDetails(: String!) {
+query GetOrderDetails($orderId: String!) {
   user {
     market {
       orders {
-        get_order(order_id: ) {
+        get_order(order_id: $orderId) {
           id
           status
-          payment_status
-          created_at
           amount {
             satoshi {
               sats
-              btc
-              usd
             }
-          }
-          fees {
-            fixed { sats }
-            variable { sats }
-            amboss { sats }
-            seller { sats }
-            buyer { sats }
-          }
-          promises {
-            locked_min_block_length
-            locked_base_fee_cap { sats }
-            locked_fee_rate_cap { sats }
           }
           destination {
             pubkey
             alias
           }
-          payment {
-            lightning {
-              invoice
+          fees {
+            fixed {
+              sats
+            }
+            variable {
+              sats
+            }
+            seller {
+              sats
+            }
+            amboss {
+              sats
             }
           }
+          promises {
+            locked_min_block_length
+          }
+          transaction_id
+          channel_id
+          created_at
         }
       }
     }
@@ -225,11 +223,11 @@ query GetOrderDetails(: String!) {
 """
 
 ACCEPT_ORDER_MUTATION = """
-mutation AcceptOrder(: SellerAcceptOrdersInput!) {
+mutation SellerAcceptOrder($input: SellerAcceptOrdersInput!) {
   market {
     order {
       seller {
-        accept(input: ) {
+        accept(input: $input) {
           success
         }
       }
@@ -239,11 +237,11 @@ mutation AcceptOrder(: SellerAcceptOrdersInput!) {
 """
 
 REJECT_ORDER_MUTATION = """
-mutation RejectOrder(: SellerRejectOrdersInput!) {
+mutation SellerRejectOrder($input: SellerRejectOrdersInput!) {
   market {
     order {
       seller {
-        reject(input: ) {
+        reject(input: $input) {
           success
         }
       }
@@ -253,11 +251,11 @@ mutation RejectOrder(: SellerRejectOrdersInput!) {
 """
 
 ADD_TRANSACTION_MUTATION = """
-mutation AddTransaction(: SellerAddTransactionInput!) {
+mutation SellerAddTransaction($input: SellerAddTransactionInput!) {
   market {
     order {
       seller {
-        add_transaction(input: ) {
+        add_transaction(input: $input) {
           success
         }
       }
@@ -265,11 +263,6 @@ mutation AddTransaction(: SellerAddTransactionInput!) {
   }
 }
 """
-
-# Legacy query alias for backwards compatibility
-GET_USER_MARKET_OFFER_ORDERS_QUERY = GET_SALES_QUERY
-
-
 
 # Code
 bot = telebot.TeleBot(TOKEN)
@@ -291,7 +284,6 @@ TELEGRAM_POLL_MAX_DELAY_SECONDS = 300  # Cap at 5 minutes
 TELEGRAM_POLL_BACKOFF_MULTIPLIER = 2
 
 # --- State for pending user confirmations ---
-# Structure: {order_id: {"message_id": int, "timestamp": float, "details": dict}}
 pending_user_confirmations = {}
 processed_banned_offer_ids = set()
 
@@ -309,10 +301,9 @@ def send_telegram_notification(text, level="info", **kwargs):
     else:
         logging.info(log_message)
     try:
-        # Ensure Markdown is used if not specified and message contains typical Markdown chars
         if 'parse_mode' not in kwargs and any(c in text for c in ['`', '*', '_']):
             kwargs['parse_mode'] = 'Markdown'
-        return bot.send_message(CHAT_ID, text=text, **kwargs) # Return the message object
+        return bot.send_message(CHAT_ID, text=text, **kwargs)
     except Exception as e:
         logging.error(f"Failed to send Telegram message: {e}")
         return None
@@ -379,7 +370,6 @@ def extract_order_info(order: dict) -> dict:
         "created_at": order.get("created_at"),
         "raw_order": order
     }
-
 def _execute_amboss_graphql_request(
     payload: dict,
     operation_name: str = "AmbossGraphQL",

@@ -78,26 +78,38 @@ query GetPublicOffers($page: PageInput) {
         list {
           id
           status
-          side
-          account {
+          node {
             pubkey
+            alias
           }
-          size {
-            min { satoshi { sats } }
-            max { satoshi { sats } }
-            total { satoshi { sats } }
+          total_amount {
+            satoshi {
+              sats
+            }
+          }
+          locked_amount {
+            satoshi {
+              sats
+            }
           }
           fees {
-            fixed { sats }
-            variable { sats }
-            amboss { sats }
+            fixed {
+              sats
+            }
+            variable {
+              sats
+            }
+            amboss {
+              sats
+            }
           }
           promises {
             min_block_length
             base_fee_cap
             fee_rate_cap
           }
-          seller_score
+          filled_orders
+          created_at
         }
       }
     }
@@ -119,17 +131,26 @@ query ListMyOffers($page: PageInput) {
           list {
             id
             status
-            side
-            size {
-              min { satoshi { sats } }
-              max { satoshi { sats } }
-              total { satoshi { sats } }
-              locked { satoshi { sats } }
+            total_amount {
+              satoshi {
+                sats
+              }
+            }
+            locked_amount {
+              satoshi {
+                sats
+              }
             }
             fees {
-              fixed { sats }
-              variable { sats }
-              amboss { sats }
+              fixed {
+                sats
+              }
+              variable {
+                sats
+              }
+              amboss {
+                sats
+              }
             }
             promises {
               min_block_length
@@ -181,7 +202,6 @@ mutation ToggleOffer($input: ToggleOfferInput!) {
   }
 }
 """
-
 # --- Logging Setup ---
 def setup_logging():
     if not os.path.exists(LOG_DIR):
@@ -330,7 +350,7 @@ def _execute_amboss_graphql_request(
 
 
 def extract_market_offer_info(offer: dict) -> dict:
-    """Extracts normalized fields from a public or private Magma MarketOffer object."""
+    """Extracts normalized fields from a public or private Magma MarketOffer/SimpleMarketOffer object."""
     if not offer:
         return {}
     
@@ -338,16 +358,27 @@ def extract_market_offer_info(offer: dict) -> dict:
     status = str(offer.get("status", "UNKNOWN")).upper()
     side = str(offer.get("side", "SELL")).upper()
     
-    # Account / Pubkey
-    acc = offer.get("account")
-    if isinstance(acc, dict):
-        pubkey = acc.get("pubkey")
+    # Node / Account / Pubkey
+    node_obj = offer.get("node")
+    if isinstance(node_obj, dict):
+        pubkey = node_obj.get("pubkey")
+        alias = node_obj.get("alias")
     else:
-        pubkey = acc
+        acc = offer.get("account")
+        if isinstance(acc, dict):
+            pubkey = acc.get("pubkey")
+        else:
+            pubkey = acc or offer.get("node_pubkey")
+        alias = None
         
-    # Sizes
-    size_obj = offer.get("size")
-    if isinstance(size_obj, dict):
+    # Sizes / Amounts
+    if "total_amount" in offer and isinstance(offer.get("total_amount"), dict):
+        total_size = int(offer.get("total_amount", {}).get("satoshi", {}).get("sats", 0))
+        locked_size = int(offer.get("locked_amount", {}).get("satoshi", {}).get("sats", 0)) if "locked_amount" in offer else 0
+        min_size = int(offer.get("min_amount", {}).get("satoshi", {}).get("sats", total_size)) if "min_amount" in offer else total_size
+        max_size = int(offer.get("max_amount", {}).get("satoshi", {}).get("sats", total_size)) if "max_amount" in offer else total_size
+    elif "size" in offer and isinstance(offer.get("size"), dict):
+        size_obj = offer.get("size", {})
         min_size = int(size_obj.get("min", {}).get("satoshi", {}).get("sats", 0))
         max_size = int(size_obj.get("max", {}).get("satoshi", {}).get("sats", 0))
         total_size = int(size_obj.get("total", {}).get("satoshi", {}).get("sats", 0))
@@ -384,14 +415,14 @@ def extract_market_offer_info(offer: dict) -> dict:
         base_fee_cap = offer.get("base_fee_cap")
         fee_rate_cap = offer.get("fee_rate_cap")
         
-    seller_score = float(offer.get("seller_score", 0.0))
+    seller_score = float(offer.get("seller_score", 100.0))
 
     return {
         "id": offer_id,
         "status": status,
         "side": side,
         "account": pubkey,
-        "node_alias": pubkey,
+        "node_alias": alias or pubkey,
         "min_size": min_size,
         "max_size": max_size,
         "total_size": total_size,
@@ -406,8 +437,6 @@ def extract_market_offer_info(offer: dict) -> dict:
         "seller_score": seller_score,
         "raw_offer": offer
     }
-
-
 # --- LND Interaction ---
 def get_lncli_utxos(current_general_config):
     """

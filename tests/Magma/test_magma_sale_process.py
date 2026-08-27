@@ -6,11 +6,6 @@ from unittest.mock import MagicMock, patch, mock_open
 # --- FIXTURE: Mock Global Side Effects ---
 @pytest.fixture(scope="module", autouse=True)
 def mock_dependencies():
-    """
-    Patcher fixture that runs BEFORE the test module logic is fully utilized.
-    Since 'import magma_sale_process' has side effects, we patch sys.modules 
-    so the import uses our mocks.
-    """
     mock_telebot = MagicMock()
     mock_telebot.TeleBot = MagicMock()
     mock_configparser = MagicMock()
@@ -56,14 +51,12 @@ def mock_dependencies():
 
 @pytest.fixture
 def magma_module(mock_dependencies):
-    """
-    Imports and returns the magma_sale_process module ensuring it is mocked.
-    """
     if os.path.abspath(os.path.join(os.path.dirname(__file__), '../../Magma')) not in sys.path:
          sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../Magma')))
     
     import magma_sale_process
     magma_sale_process.requests = MagicMock()
+    magma_sale_process.AMBOSS_TOKEN = "fake_auth"
     return magma_sale_process
 
 # --- TESTS ---
@@ -92,7 +85,7 @@ def test_get_node_alias_failure(magma_module):
 
 
 def test_extract_order_info_new_api(magma_module):
-    """Test extracting normalized fields from new Magma API GraphQL response."""
+    """Test extracting normalized fields from live-verified Magma MarketOrder schema."""
     sample_order = {
         "id": "order_001",
         "status": "WAITING_FOR_SELLER_APPROVAL",
@@ -111,14 +104,13 @@ def test_extract_order_info_new_api(magma_module):
             "buyer": {"sats": "4000"}
         },
         "promises": {
-            "locked_min_block_length": 4320,
-            "locked_base_fee_cap": {"sats": "1000"},
-            "locked_fee_rate_cap": {"sats": "500"}
+            "locked_min_block_length": 4320
         },
         "destination": {
             "pubkey": "03deadbeef1234567890",
             "alias": "LightningBuyer"
         },
+        "channel_id": "892345x123x1",
         "created_at": "2026-08-27T12:00:00Z"
     }
 
@@ -438,9 +430,7 @@ def test_get_order_details_from_amboss_direct(magma_module):
 
 def test_calculate_transaction_size(magma_module):
     """Test SegWit P2WPKH transaction virtual size calculation."""
-    # 1 input: 57.5 + 86 + 10.5 = 154.0 vbytes
     assert magma_module.calculate_transaction_size(1) == 154.0
-    # 2 inputs: 115.0 + 86 + 10.5 = 211.5 vbytes
     assert magma_module.calculate_transaction_size(2) == 211.5
 
 
