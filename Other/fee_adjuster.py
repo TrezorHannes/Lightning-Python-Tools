@@ -1261,41 +1261,43 @@ def main():
                 baseline_map=baseline_map,
             )
 
-            if guard_plans and (terminal_output_enabled or args.debug):
-                table = PrettyTable()
-                table.field_names = [
-                    "Action",
-                    "Chan ID",
-                    "Alias",
-                    "Local %",
-                    "Out Fee",
-                    "In Fee",
-                    "oTarget",
-                    "New Target",
-                    "Managed By",
-                ]
-                for p in guard_plans:
-                    managed = "LNDg af.py" if p.get("auto_fees") else "fee_adjuster"
-                    action_str = f"🔒 {p['action']}" if p["action"] == "LOCK" else f"🔓 {p['action']}"
-                    table.add_row([
-                        action_str,
-                        str(p["chan_id"])[:12] + "...",
-                        str(p["alias"])[:18],
-                        f"{p['local_ratio']:.1f}%",
-                        f"{p['outbound_fee']} ppm",
-                        f"{p['inbound_fee']} ppm",
-                        f"{p['old_target']}%",
-                        f"{p['new_target']}%",
-                        managed,
-                    ])
-
+            if terminal_output_enabled or args.debug:
                 print("=" * 80, flush=True)
                 print(" 🛡️  Global Rebalance Guard Audit (All Open Channels)", flush=True)
                 print(f" Mode: {'SIMULATION / DEBUG' if args.debug else 'LIVE EXECUTION'}", flush=True)
                 print(f" Lock Target: {lock_target}% | Restore Target: {restore_target}%", flush=True)
                 print("=" * 80, flush=True)
-                print(table, flush=True)
-                print(f"Total Rebalance Guard adjustments: {len(guard_plans)} channels\n", flush=True)
+                if guard_plans:
+                    table = PrettyTable()
+                    table.field_names = [
+                        "Action",
+                        "Chan ID",
+                        "Alias",
+                        "Local %",
+                        "Out Fee",
+                        "In Fee",
+                        "oTarget",
+                        "New Target",
+                        "Managed By",
+                    ]
+                    for p in guard_plans:
+                        managed = "LNDg af.py" if p.get("auto_fees") else "fee_adjuster"
+                        action_str = f"🔒 {p['action']}" if p["action"] == "LOCK" else f"🔓 {p['action']}"
+                        table.add_row([
+                            action_str,
+                            str(p["chan_id"])[:12] + "...",
+                            str(p["alias"])[:18],
+                            f"{p['local_ratio']:.1f}%",
+                            f"{p['outbound_fee']} ppm",
+                            f"{p['inbound_fee']} ppm",
+                            f"{p['old_target']}%",
+                            f"{p['new_target']}%",
+                            managed,
+                        ])
+                    print(table, flush=True)
+                    print(f"Total Rebalance Guard adjustments: {len(guard_plans)} channels\n", flush=True)
+                else:
+                    print(f"Audited {len(all_channels_list)} open channels: ✅ All rebalance targets in sync (0 adjustments needed).\n", flush=True)
 
             if not args.debug and lndg_fee_update_enabled and guard_plans:
                 for p in guard_plans:
