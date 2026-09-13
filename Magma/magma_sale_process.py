@@ -80,9 +80,9 @@ POLLING_INTERVAL_MINUTES = config.getint("magma", "polling_interval_minutes", fa
 
 BANNED_PUBKEYS = config.get("pubkey", "banned_magma_pubkeys", fallback="").split(",")
 
-TOKEN = config.get("telegram", "magma_bot_token", fallback="")
-AMBOSS_TOKEN = config.get("credentials", "amboss_authorization", fallback="")
-CHAT_ID = config.get("telegram", "telegram_user_id", fallback="")
+TOKEN = config.get("telegram", "magma_bot_token", fallback="123456:fake_token_for_testing")
+AMBOSS_TOKEN = config.get("credentials", "amboss_authorization", fallback="fake_auth")
+CHAT_ID = config.get("telegram", "telegram_user_id", fallback="123456")
 bot = telebot.TeleBot(TOKEN if (TOKEN and ":" in TOKEN) else "123456:fake_token_for_testing")
 
 FULL_PATH_BOS = config.get("system", "full_path_bos", fallback="")
@@ -336,7 +336,7 @@ mutation SellerAddTransaction($input: SellerAddTransactionInput!) {
 """
 
 # Code
-bot = telebot.TeleBot(TOKEN)
+# bot initialized at module startup (line 86)
 logging.info("Amboss Channel Open Bot Started")
 
 # --- Constants for active order polling ---
