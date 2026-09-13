@@ -415,18 +415,34 @@ def extract_order_info(order: dict) -> dict:
     # Fees
     fees_obj = order.get("fees")
     if isinstance(fees_obj, dict):
-        seller_invoice_sats = int(fees_obj.get("seller", {}).get("sats", 0))
-        fixed_fee_sats = int(fees_obj.get("fixed", {}).get("sats", 0))
-        variable_fee_sats = int(fees_obj.get("variable", {}).get("sats", 0))
-        amboss_fee_sats = int(fees_obj.get("amboss", {}).get("sats", 0))
-        # Amboss documentation: fees.seller is 0 for unsettled orders; fallback to fixed + variable fee sum
-        if seller_invoice_sats == 0 and (fixed_fee_sats > 0 or variable_fee_sats > 0):
-            seller_invoice_sats = fixed_fee_sats + variable_fee_sats
+        seller_invoice_sats = int(fees_obj.get("seller", {}).get("sats", 0) or 0)
+        fixed_fee_sats = int(fees_obj.get("fixed", {}).get("sats", 0) or 0)
+        variable_fee_sats = int(fees_obj.get("variable", {}).get("sats", 0) or 0)
+        amboss_fee_sats = int(fees_obj.get("amboss", {}).get("sats", 0) or 0)
     else:
-        seller_invoice_sats = int(order.get("seller_invoice_amount", 0))
-        fixed_fee_sats = int(order.get("fixed_fee", 0))
-        variable_fee_sats = int(order.get("variable_fee", 0))
-        amboss_fee_sats = int(order.get("amboss_fee", 0))
+        seller_invoice_sats = int(order.get("seller_invoice_amount", 0) or 0)
+        fixed_fee_sats = int(order.get("fixed_fee", 0) or 0)
+        variable_fee_sats = int(order.get("variable_fee", 0) or 0)
+        amboss_fee_sats = int(order.get("amboss_fee", 0) or 0)
+
+    # Check top-level fee fallbacks if fixed/variable were 0
+    if fixed_fee_sats == 0:
+        fixed_val = order.get("fixed_fee") or order.get("fixed")
+        if isinstance(fixed_val, dict):
+            fixed_fee_sats = int(fixed_val.get("sats", 0) or 0)
+        elif isinstance(fixed_val, (int, str)) and str(fixed_val).isdigit():
+            fixed_fee_sats = int(fixed_val)
+
+    if variable_fee_sats == 0:
+        var_val = order.get("variable_fee") or order.get("variable")
+        if isinstance(var_val, dict):
+            variable_fee_sats = int(var_val.get("sats", 0) or 0)
+        elif isinstance(var_val, (int, str)) and str(var_val).isdigit():
+            variable_fee_sats = int(var_val)
+
+    # Amboss documentation: fees.seller is 0 for unsettled orders; fallback to fixed + variable fee sum
+    if seller_invoice_sats == 0 and (fixed_fee_sats > 0 or variable_fee_sats > 0):
+        seller_invoice_sats = fixed_fee_sats + variable_fee_sats
 
     # Promises
     promises_obj = order.get("promises")
@@ -1528,7 +1544,10 @@ def handle_order_decision_callback(call):
 
         # Immediately acknowledge the callback to stop the client-side loading animation
         decision_text_verb = "Approved" if action == "approve" else "Rejected"
-        bot.answer_callback_query(call.id, text=f"Order {order_id} {decision_text_verb}. Processing...")
+        try:
+            bot.answer_callback_query(call.id, text=f"Order {order_id} {decision_text_verb}. Processing...")
+        except Exception as e:
+            logging.warning(f"Could not answer callback query {call.id} for order {order_id}: {e}")
 
         order_original_details = confirmation_details_entry.get("details", {})
         order_info = extract_order_info(order_original_details)
