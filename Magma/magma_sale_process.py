@@ -103,16 +103,87 @@ logs_dir = os.path.join(parent_dir, "..", "logs")
 if not os.path.exists(logs_dir):
     os.makedirs(logs_dir, exist_ok=True)
 
+class TelegramLoggingHandler(logging.Handler):
+    """
+    Custom logging handler that dispatches ERROR and CRITICAL log records to Telegram.
+    Includes formatted message and exception traceback with recursion protection,
+    suppression of network polling exceptions, and message boundary truncation.
+    """
+    def __init__(self, bot=None, chat_id=None, level=logging.ERROR):
+        super().__init__(level=level)
+        self.bot = bot
+        self.chat_id = chat_id
+        self._is_handling = False
+
+    def emit(self, record):
+        if self._is_handling:
+            return
+
+        # Suppress logging from external network/telegram libraries to avoid cascade loops
+        if record.name in ("telebot", "urllib3", "requests") or record.name.startswith(("telebot.", "urllib3.", "requests.")):
+            return
+
+        # Suppress messages that are already sent via send_telegram_notification
+        formatted_msg = record.getMessage()
+        if formatted_msg.startswith("Telegram NOTIFICATION:"):
+            return
+
+        target_bot = self.bot if self.bot is not None else bot
+        target_chat_id = self.chat_id if self.chat_id is not None else CHAT_ID
+
+        if not target_bot or not target_chat_id:
+            return
+
+        self._is_handling = True
+        try:
+            timestamp = datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S")
+            level_name = record.levelname
+            origin = f"{record.module}.{record.funcName}:{record.lineno}"
+
+            lines = [
+                f"🚨 *[{level_name}]* `{origin}` at `{timestamp}`",
+                f"{formatted_msg}"
+            ]
+
+            tb_str = ""
+            if record.exc_info:
+                import traceback
+                tb_str = "".join(traceback.format_exception(*record.exc_info))
+                lines.append(f"```\n{tb_str}\n```")
+
+            full_message = "\n".join(lines)
+            if len(full_message) > 3800:
+                full_message = full_message[:3790] + "\n...[truncated]```"
+
+            try:
+                target_bot.send_message(target_chat_id, text=full_message, parse_mode="Markdown")
+            except Exception:
+                try:
+                    plain_message = f"🚨 [{level_name}] {origin} at {timestamp}\n{formatted_msg}"
+                    if record.exc_info:
+                        plain_message += f"\n\n{tb_str}"
+                    if len(plain_message) > 3800:
+                        plain_message = plain_message[:3790] + "\n...[truncated]"
+                    target_bot.send_message(target_chat_id, text=plain_message)
+                except Exception:
+                    pass
+        except Exception:
+            self.handleError(record)
+        finally:
+            self._is_handling = False
+
 handler = RotatingFileHandler(
     LOG_FILE_PATH, maxBytes=10 * 1024 * 1024, backupCount=5  # 10 MB
 )
+telegram_handler = TelegramLoggingHandler(bot=bot, chat_id=CHAT_ID, level=logging.ERROR)
 
 # Set up logging configuration
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[handler],
+    handlers=[handler, telegram_handler],
 )
+logging.getLogger().addHandler(telegram_handler)
 
 # Adjust logging levels for third-party libraries
 logging.getLogger("requests").setLevel(logging.WARNING)
@@ -321,9 +392,12 @@ def extract_order_info(order: dict) -> dict:
     if isinstance(dest, dict):
         buyer_pubkey = dest.get("pubkey")
         buyer_alias = dest.get("alias")
+    elif "customer_pubkey" in order:
+        buyer_pubkey = order.get("customer_pubkey")
+        buyer_alias = order.get("buyer_alias")
     else:
         buyer_pubkey = order.get("account") or (order.get("endpoints", {}).get("destination") if isinstance(order.get("endpoints"), dict) else None)
-        buyer_alias = None
+        buyer_alias = order.get("buyer_alias")
     
     # Amount / Size
     amount_obj = order.get("amount")
@@ -331,6 +405,8 @@ def extract_order_info(order: dict) -> dict:
         size_sats = int(amount_obj.get("satoshi", {}).get("sats", 0))
     elif isinstance(amount_obj, (int, str)) and str(amount_obj).isdigit():
         size_sats = int(amount_obj)
+    elif "channel_size" in order:
+        size_sats = int(order.get("channel_size", 0))
     elif "size" in order:
         size_sats = int(order.get("size", 0))
     else:
@@ -343,6 +419,9 @@ def extract_order_info(order: dict) -> dict:
         fixed_fee_sats = int(fees_obj.get("fixed", {}).get("sats", 0))
         variable_fee_sats = int(fees_obj.get("variable", {}).get("sats", 0))
         amboss_fee_sats = int(fees_obj.get("amboss", {}).get("sats", 0))
+        # Amboss documentation: fees.seller is 0 for unsettled orders; fallback to fixed + variable fee sum
+        if seller_invoice_sats == 0 and (fixed_fee_sats > 0 or variable_fee_sats > 0):
+            seller_invoice_sats = fixed_fee_sats + variable_fee_sats
     else:
         seller_invoice_sats = int(order.get("seller_invoice_amount", 0))
         fixed_fee_sats = int(order.get("fixed_fee", 0))
@@ -353,6 +432,8 @@ def extract_order_info(order: dict) -> dict:
     promises_obj = order.get("promises")
     if isinstance(promises_obj, dict):
         min_block_length = int(promises_obj.get("locked_min_block_length", 0))
+    elif "min_block_length" in order:
+        min_block_length = int(order.get("min_block_length", 0))
     else:
         min_block_length = int(order.get("locked_min_block_length", 0))
 
@@ -368,7 +449,7 @@ def extract_order_info(order: dict) -> dict:
         "amboss_fee": amboss_fee_sats,
         "min_block_length": min_block_length,
         "created_at": order.get("created_at"),
-        "raw_order": order
+        "raw_order": order.get("raw_order", order)
     }
 def _execute_amboss_graphql_request(
     payload: dict,
@@ -1359,9 +1440,16 @@ def bos_confirm_income(amount, peer_pubkey):
 
 def _complete_offer_approval_process(order_id, order_details):
     """Generates invoice, accepts on Amboss, and starts payment polling."""
-    seller_invoice_amount = order_details['seller_invoice_amount']
-    buyer_alias = order_details.get("buyer_alias", "N/A") 
+    order_info = extract_order_info(order_details)
+    seller_invoice_amount = order_info.get('seller_invoice_amount') or (order_details.get('seller_invoice_amount') if isinstance(order_details, dict) else 0)
+    buyer_alias = (order_details.get("buyer_alias") if isinstance(order_details, dict) else None) or order_info.get("buyer_alias", "N/A") 
     
+    if not seller_invoice_amount or seller_invoice_amount <= 0:
+        error_msg = f"🔥 Cannot approve order `{order_id}`: invalid or missing seller_invoice_amount ({seller_invoice_amount})."
+        logging.error(error_msg)
+        send_telegram_notification(error_msg, level="error", parse_mode="Markdown")
+        return
+
     send_telegram_notification(f"✅ Order `{order_id}` approved by you ({buyer_alias}).\nGenerating invoice for {seller_invoice_amount} sats...", parse_mode="Markdown")
     invoice_hash_or_error, invoice_request = execute_lncli_addinvoice( # Modified to return error message
         seller_invoice_amount,
@@ -1442,10 +1530,11 @@ def handle_order_decision_callback(call):
         decision_text_verb = "Approved" if action == "approve" else "Rejected"
         bot.answer_callback_query(call.id, text=f"Order {order_id} {decision_text_verb}. Processing...")
 
-        order_original_details = confirmation_details_entry["details"]
-        buyer_alias = order_original_details.get("buyer_alias", "N/A")
-        buyer_pubkey = order_original_details.get('account') or order_original_details.get("endpoints", {}).get("destination", "Unknown")
-        amount = order_original_details['seller_invoice_amount']
+        order_original_details = confirmation_details_entry.get("details", {})
+        order_info = extract_order_info(order_original_details)
+        buyer_alias = order_original_details.get("buyer_alias") or order_info.get("buyer_alias", "N/A")
+        buyer_pubkey = order_info.get("customer_pubkey") or "Unknown"
+        amount = order_info.get("seller_invoice_amount", 0)
 
         decision_emoji = "✅" if action == "approve" else "❌"
         
@@ -1467,11 +1556,12 @@ def handle_order_decision_callback(call):
 
         if action == "approve":
             send_telegram_notification(f"▶️ Proceeding with approved order `{order_id}` ({buyer_alias}).", parse_mode="Markdown")
-            if order_original_details.get("status") == "WAITING_FOR_SELLER_APPROVAL":
+            current_status = order_info.get("status")
+            if current_status == "WAITING_FOR_SELLER_APPROVAL":
                 # Run long-running task in a separate thread to avoid blocking Telegram polling
-                threading.Thread(target=_complete_offer_approval_process, args=(order_id, order_original_details), name=f"Approve-{order_id}").start()
+                threading.Thread(target=_complete_offer_approval_process, args=(order_id, order_info), name=f"Approve-{order_id}").start()
             else:
-                msg = f"⚠️ Order `{order_id}` status changed to `{order_original_details.get('status')}` before user approval ({action}) could be fully processed. No action taken."
+                msg = f"⚠️ Order `{order_id}` status changed to `{current_status}` before user approval ({action}) could be fully processed. No action taken."
                 logging.warning(msg)
                 send_telegram_notification(msg, level="warning", parse_mode="Markdown")
 
@@ -1486,57 +1576,62 @@ def handle_order_decision_callback(call):
             bot.answer_callback_query(call.id, text="Error processing your decision.")
         except:
             pass
-        send_telegram_notification("🔥 Error processing user decision from Telegram button. Check logs.", level="error", parse_mode="Markdown")
+        send_telegram_notification(f"🔥 Error processing user decision from Telegram button: {e}", level="error", parse_mode="Markdown")
 
 
 def _handle_timeout_for_offer(order_id, confirmation_info):
     """Handles the logic when an offer confirmation times out."""
     logging.info(f"Order {order_id} timed out waiting for user confirmation. Defaulting to approve.")
-    
-    order_details = confirmation_info['details']
-    buyer_alias = order_details.get("buyer_alias", "N/A")
-    buyer_pubkey = order_details.get('account') or order_details.get("endpoints", {}).get("destination", "Unknown")
-    amount = order_details['seller_invoice_amount']
-
-    send_telegram_notification(
-        f"⏳ Offer Timeout & Auto-Approved:\n"
-        f"ID: `{order_id}`\n"
-        f"💰 Amount: {amount} sats\n"
-        f"👤 Buyer: `{buyer_alias}` ({buyer_pubkey[:10]}...)\n"
-        f"No response in 5 min.",
-        level="warning",
-        parse_mode="Markdown"
-    )
     try:
-        bot.edit_message_text(
-            chat_id=CHAT_ID,
-            message_id=confirmation_info["message_id"],
-            text=(
-                f"✅ Auto-Approved (Timeout):\n"
-                f"ID: `{order_id}`\n"
-                f"💰 Amount: {amount} sats\n"
-                f"👤 Buyer: `{buyer_alias}` ({buyer_pubkey[:10]}...)"
-            ),
-            reply_markup=None,
+        order_details = confirmation_info.get('details', {}) if confirmation_info else {}
+        order_info = extract_order_info(order_details) if order_details else {}
+        buyer_alias = (order_details.get("buyer_alias") if isinstance(order_details, dict) else None) or order_info.get("buyer_alias", "N/A")
+        buyer_pubkey = order_info.get("customer_pubkey") or "Unknown"
+        amount = order_info.get("seller_invoice_amount", 0)
+
+        send_telegram_notification(
+            f"⏳ Offer Timeout & Auto-Approved:\n"
+            f"ID: `{order_id}`\n"
+            f"💰 Amount: {amount} sats\n"
+            f"👤 Buyer: `{buyer_alias}` ({buyer_pubkey[:10]}...)\n"
+            f"No response in 5 min.",
+            level="warning",
             parse_mode="Markdown"
         )
-    except Exception as e:
-        logging.error(f"Error editing Telegram message for timed-out order {order_id}: {e}")
-    
-    order_details_fresh = get_order_details_from_amboss(order_id) 
-    if order_details_fresh:
-        # Add buyer_alias to fresh details if needed for _complete_offer_approval_process
-        order_details_fresh['buyer_alias'] = buyer_alias # Carry over known alias
-        if order_details_fresh.get("status") == "WAITING_FOR_SELLER_APPROVAL":
-             _complete_offer_approval_process(order_id, order_details_fresh)
+        try:
+            if confirmation_info and "message_id" in confirmation_info:
+                bot.edit_message_text(
+                    chat_id=CHAT_ID,
+                    message_id=confirmation_info["message_id"],
+                    text=(
+                        f"✅ Auto-Approved (Timeout):\n"
+                        f"ID: `{order_id}`\n"
+                        f"💰 Amount: {amount} sats\n"
+                        f"👤 Buyer: `{buyer_alias}` ({buyer_pubkey[:10]}...)"
+                    ),
+                    reply_markup=None,
+                    parse_mode="Markdown"
+                )
+        except Exception as e:
+            logging.error(f"Error editing Telegram message for timed-out order {order_id}: {e}")
+        
+        order_details_fresh = get_order_details_from_amboss(order_id) 
+        if order_details_fresh:
+            fresh_info = extract_order_info(order_details_fresh)
+            fresh_info['buyer_alias'] = buyer_alias # Carry over known alias
+            if fresh_info.get("status") == "WAITING_FOR_SELLER_APPROVAL":
+                 _complete_offer_approval_process(order_id, fresh_info)
+            else:
+                msg = f"⚠️ Order `{order_id}` (timed out) status changed to `{fresh_info.get('status')}` before auto-approval. No action taken."
+                logging.warning(msg)
+                send_telegram_notification(msg, level="warning", parse_mode="Markdown")
         else:
-            msg = f"⚠️ Order `{order_id}` (timed out) status changed to `{order_details_fresh.get('status')}` before auto-approval. No action taken."
-            logging.warning(msg)
-            send_telegram_notification(msg, level="warning", parse_mode="Markdown")
-    else:
-        msg = f"🔥 Could not fetch details for timed-out order `{order_id}` for auto-approval. Manual check required."
-        logging.error(msg)
-        send_telegram_notification(msg, level="error", parse_mode="Markdown")
+            msg = f"🔥 Could not fetch details for timed-out order `{order_id}` for auto-approval. Manual check required."
+            logging.error(msg)
+            send_telegram_notification(msg, level="error", parse_mode="Markdown")
+    except Exception as e:
+        logging.exception(f"Unexpected error in _handle_timeout_for_offer for order {order_id}: {e}")
+        send_telegram_notification(f"🔥 Error during timeout auto-approval for order `{order_id}`: {e}", level="error", parse_mode="Markdown")
 
 
 def check_pending_confirmations_timeouts():
@@ -1678,14 +1773,12 @@ def process_new_offers():
     sent_message = send_telegram_notification(prompt_message, reply_markup=markup, parse_mode="Markdown")
 
     if sent_message:
-        # Store comprehensive details in pending_user_confirmations for rich messages on timeout/callback
-        pending_confirmation_data = new_offer_from_amboss.copy()
-        pending_confirmation_data['buyer_alias'] = buyer_alias # Add the fetched alias
-
+        # Store comprehensive normalized details in pending_user_confirmations for rich messages on timeout/callback
+        order_info['buyer_alias'] = buyer_alias
         pending_user_confirmations[order_id] = {
             "message_id": sent_message.message_id,
             "timestamp": time.time(),
-            "details": pending_confirmation_data 
+            "details": order_info
         }
         logging.info(f"Offer {order_id} (Buyer: {buyer_alias}) presented to user for confirmation. Awaiting response or timeout.")
     else:
@@ -2008,11 +2101,13 @@ if __name__ == "__main__":
     main_handler = RotatingFileHandler(
         log_file_path_for_main, maxBytes=10 * 1024 * 1024, backupCount=5  # 10 MB
     )
+    main_telegram_handler = TelegramLoggingHandler(bot=bot, chat_id=CHAT_ID, level=logging.ERROR)
     logging.basicConfig(
         level=logging.INFO, # Default to INFO, can be overridden by config later if needed
         format="%(asctime)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s", # Added funcName and lineno
-        handlers=[main_handler],
+        handlers=[main_handler, main_telegram_handler],
     )
+    logging.getLogger().addHandler(main_telegram_handler)
     # Adjust logging levels for third-party libraries
     logging.getLogger("requests").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)

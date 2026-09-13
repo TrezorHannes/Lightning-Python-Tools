@@ -1,5 +1,6 @@
 import sys
 import os
+import logging
 import pytest
 from unittest.mock import MagicMock, patch, mock_open
 
@@ -7,7 +8,10 @@ from unittest.mock import MagicMock, patch, mock_open
 @pytest.fixture(scope="module", autouse=True)
 def mock_dependencies():
     mock_telebot = MagicMock()
-    mock_telebot.TeleBot = MagicMock()
+    bot_mock = MagicMock()
+    bot_mock.callback_query_handler = MagicMock(return_value=lambda f: f)
+    bot_mock.message_handler = MagicMock(return_value=lambda f: f)
+    mock_telebot.TeleBot = MagicMock(return_value=bot_mock)
     mock_configparser = MagicMock()
     mock_logging = MagicMock()
     mock_schedule = MagicMock()
@@ -468,3 +472,281 @@ def test_execute_lnd_command_failure(magma_module, mocker):
     
     assert txid is None
     assert "not enough funds" in err
+
+
+def test_extract_order_info_unsettled_zero_seller_fee_fallback(magma_module):
+    """Test unsettled orders where fees.seller.sats is 0 fall back to fixed + variable fee sum."""
+    unsettled_order = {
+        "id": "order_unsettled_001",
+        "status": "WAITING_FOR_SELLER_APPROVAL",
+        "amount": {"satoshi": {"sats": "2000000"}},
+        "fees": {
+            "fixed": {"sats": "1000"},
+            "variable": {"sats": "5000"},
+            "seller": {"sats": "0"},
+            "amboss": {"sats": "200"}
+        },
+        "destination": {"pubkey": "03buyer123", "alias": "FastBuyer"}
+    }
+    info = magma_module.extract_order_info(unsettled_order)
+    assert info["id"] == "order_unsettled_001"
+    assert info["seller_invoice_amount"] == 6000
+    assert info["customer_pubkey"] == "03buyer123"
+    assert info["channel_size"] == 2000000
+
+
+def test_extract_order_info_idempotency(magma_module):
+    """Test that extract_order_info is idempotent when given an already normalized dictionary."""
+    sample_order = {
+        "id": "order_norm_001",
+        "status": "WAITING_FOR_SELLER_APPROVAL",
+        "amount": {"satoshi": {"sats": "4000000"}},
+        "fees": {
+            "fixed": {"sats": "1500"},
+            "variable": {"sats": "3500"},
+            "seller": {"sats": "5000"},
+            "amboss": {"sats": "500"}
+        },
+        "destination": {"pubkey": "02idempotent456", "alias": "IdemNode"}
+    }
+    first_pass = magma_module.extract_order_info(sample_order)
+    second_pass = magma_module.extract_order_info(first_pass)
+
+    assert second_pass["id"] == "order_norm_001"
+    assert second_pass["customer_pubkey"] == "02idempotent456"
+    assert second_pass["buyer_alias"] == "IdemNode"
+    assert second_pass["channel_size"] == 4000000
+    assert second_pass["seller_invoice_amount"] == 5000
+    assert second_pass["fixed_fee"] == 1500
+    assert second_pass["variable_fee"] == 3500
+
+
+def test_handle_order_decision_callback_approve_success(magma_module, mocker):
+    """Test approving order via Telegram callback processes GraphQL order without KeyError."""
+    raw_graphql_order = {
+        "id": "order_approve_001",
+        "status": "WAITING_FOR_SELLER_APPROVAL",
+        "amount": {"satoshi": {"sats": "3000000"}},
+        "fees": {"seller": {"sats": "12000"}, "fixed": {"sats": "2000"}, "variable": {"sats": "10000"}},
+        "destination": {"pubkey": "03approver123456", "alias": "ApproverNode"},
+        "buyer_alias": "ApproverNode"
+    }
+    magma_module.pending_user_confirmations["order_approve_001"] = {
+        "message_id": 1234,
+        "timestamp": 1000.0,
+        "details": raw_graphql_order
+    }
+
+    mock_complete = mocker.patch.object(magma_module, "_complete_offer_approval_process")
+    mocker.patch.object(magma_module, "send_telegram_notification")
+
+    mock_call = MagicMock()
+    mock_call.id = "cb_id_1"
+    mock_call.data = "decide_order:approve:order_approve_001"
+    mock_call.message.chat.id = 5555
+    mock_call.message.message_id = 1234
+
+    magma_module.handle_order_decision_callback(mock_call)
+
+    magma_module.bot.answer_callback_query.assert_called_with("cb_id_1", text="Order order_approve_001 Approved. Processing...")
+    magma_module.bot.edit_message_text.assert_called()
+    edit_text = magma_module.bot.edit_message_text.call_args[1]["text"]
+    assert "12000 sats" in edit_text
+    assert "ApproverNode" in edit_text
+    assert "03approver" in edit_text
+
+    assert "order_approve_001" not in magma_module.pending_user_confirmations
+
+    import time
+    time.sleep(0.05)
+    assert mock_complete.called
+    called_order_id, called_details = mock_complete.call_args[0]
+    assert called_order_id == "order_approve_001"
+    assert called_details["seller_invoice_amount"] == 12000
+
+
+def test_handle_order_decision_callback_reject_success(magma_module, mocker):
+    """Test rejecting order via Telegram callback rejects order on Amboss."""
+    raw_graphql_order = {
+        "id": "order_reject_001",
+        "status": "WAITING_FOR_SELLER_APPROVAL",
+        "amount": {"satoshi": {"sats": "2000000"}},
+        "fees": {"seller": {"sats": "8000"}},
+        "destination": {"pubkey": "02rejector123", "alias": "RejectNode"},
+        "buyer_alias": "RejectNode"
+    }
+    magma_module.pending_user_confirmations["order_reject_001"] = {
+        "message_id": 4321,
+        "timestamp": 1000.0,
+        "details": raw_graphql_order
+    }
+    mock_reject = mocker.patch.object(magma_module, "reject_order")
+    mocker.patch.object(magma_module, "send_telegram_notification")
+
+    mock_call = MagicMock()
+    mock_call.id = "cb_id_2"
+    mock_call.data = "decide_order:reject:order_reject_001"
+    mock_call.message.chat.id = 5555
+    mock_call.message.message_id = 4321
+
+    magma_module.handle_order_decision_callback(mock_call)
+
+    magma_module.bot.answer_callback_query.assert_called_with("cb_id_2", text="Order order_reject_001 Rejected. Processing...")
+    magma_module.bot.edit_message_text.assert_called()
+    assert "order_reject_001" not in magma_module.pending_user_confirmations
+
+    import time
+    time.sleep(0.05)
+    assert mock_reject.called
+    assert mock_reject.call_args[0][0] == "order_reject_001"
+
+
+def test_handle_timeout_for_offer_auto_approve(magma_module, mocker):
+    """Test timeout auto-approval workflow with GraphQL payload and fresh order fetch."""
+    raw_graphql_order = {
+        "id": "order_timeout_001",
+        "status": "WAITING_FOR_SELLER_APPROVAL",
+        "amount": {"satoshi": {"sats": "5000000"}},
+        "fees": {"seller": {"sats": "15000"}, "fixed": {"sats": "3000"}, "variable": {"sats": "12000"}},
+        "destination": {"pubkey": "02timeoutbuyer", "alias": "TimeoutBuyer"},
+        "buyer_alias": "TimeoutBuyer"
+    }
+    confirmation_info = {
+        "message_id": 7777,
+        "timestamp": 500.0,
+        "details": raw_graphql_order
+    }
+
+    fresh_order = {
+        "id": "order_timeout_001",
+        "status": "WAITING_FOR_SELLER_APPROVAL",
+        "amount": {"satoshi": {"sats": "5000000"}},
+        "fees": {"seller": {"sats": "15000"}},
+        "destination": {"pubkey": "02timeoutbuyer", "alias": "TimeoutBuyer"}
+    }
+
+    mocker.patch.object(magma_module, "get_order_details_from_amboss", return_value=fresh_order)
+    mock_complete = mocker.patch.object(magma_module, "_complete_offer_approval_process")
+    mocker.patch.object(magma_module, "send_telegram_notification")
+
+    magma_module._handle_timeout_for_offer("order_timeout_001", confirmation_info)
+
+    magma_module.bot.edit_message_text.assert_called()
+    edit_text = magma_module.bot.edit_message_text.call_args[1]["text"]
+    assert "Auto-Approved (Timeout)" in edit_text
+    assert "15000 sats" in edit_text
+
+    assert mock_complete.called
+    called_id, called_fresh = mock_complete.call_args[0]
+    assert called_id == "order_timeout_001"
+    assert called_fresh["seller_invoice_amount"] == 15000
+    assert called_fresh["customer_pubkey"] == "02timeoutbuyer"
+
+
+def test_handle_timeout_for_offer_exception_resilience(magma_module, mocker):
+    """Test timeout auto-approval handles exceptions without terminating the scheduler loop."""
+    broken_confirmation_info = {
+        "message_id": 8888,
+        "timestamp": 500.0,
+        "details": None
+    }
+    mock_send = mocker.patch.object(magma_module, "send_telegram_notification")
+
+    # Must NOT raise exception
+    magma_module._handle_timeout_for_offer("order_broken_001", broken_confirmation_info)
+    assert mock_send.called
+
+
+def test_complete_offer_approval_process_raw_and_normalized(magma_module, mocker):
+    """Test _complete_offer_approval_process works seamlessly with raw GraphQL order."""
+    raw_graphql_order = {
+        "id": "order_proc_001",
+        "status": "WAITING_FOR_SELLER_APPROVAL",
+        "amount": {"satoshi": {"sats": "1000000"}},
+        "fees": {"seller": {"sats": "4500"}},
+        "destination": {"pubkey": "03buyerproc", "alias": "ProcNode"},
+        "buyer_alias": "ProcNode"
+    }
+
+    mocker.patch.object(magma_module, "execute_lncli_addinvoice", return_value=("hash_p", "lnbc4500..."))
+    mocker.patch.object(magma_module, "accept_order", return_value={
+        "data": {"market": {"order": {"seller": {"accept": {"success": True}}}}}
+    })
+    mock_wait = mocker.patch.object(magma_module, "wait_for_buyer_payment")
+    mocker.patch.object(magma_module, "send_telegram_notification")
+
+    magma_module._complete_offer_approval_process("order_proc_001", raw_graphql_order)
+
+    assert magma_module.execute_lncli_addinvoice.called
+    assert magma_module.execute_lncli_addinvoice.call_args[0][0] == 4500
+    assert magma_module.accept_order.called
+    assert magma_module.accept_order.call_args[0] == ("order_proc_001", "lnbc4500...")
+    assert mock_wait.called
+    assert mock_wait.call_args[0][0] == "order_proc_001"
+
+
+def test_telegram_logging_handler_captures_errors_and_tracebacks(magma_module):
+    """Test TelegramLoggingHandler dispatches ERROR/CRITICAL logs and tracebacks to Telegram."""
+    handler = magma_module.TelegramLoggingHandler(bot=magma_module.bot, chat_id=123)
+
+    # 1. Error without exc_info
+    record1 = logging.LogRecord(
+        name="magma_sale_process",
+        level=logging.ERROR,
+        pathname="magma_sale_process.py",
+        lineno=100,
+        msg="Critical database failure: %s",
+        args=("disk full",),
+        exc_info=None
+    )
+    handler.emit(record1)
+    magma_module.bot.send_message.assert_called()
+    sent_text1 = magma_module.bot.send_message.call_args[1]["text"]
+    assert "Critical database failure: disk full" in sent_text1
+    assert "ERROR" in sent_text1
+
+    # 2. Error with exc_info (traceback)
+    try:
+        raise ValueError("Simulated failure for traceback testing")
+    except ValueError:
+        import sys
+        exc_info = sys.exc_info()
+
+    record2 = logging.LogRecord(
+        name="magma_sale_process",
+        level=logging.ERROR,
+        pathname="magma_sale_process.py",
+        lineno=105,
+        msg="Caught unexpected exception",
+        args=(),
+        exc_info=exc_info
+    )
+    handler.emit(record2)
+    sent_text2 = magma_module.bot.send_message.call_args[1]["text"]
+    assert "Caught unexpected exception" in sent_text2
+    assert "Simulated failure for traceback testing" in sent_text2
+    assert "Traceback" in sent_text2
+
+
+def test_telegram_logging_handler_recursion_and_filters(magma_module):
+    """Test TelegramLoggingHandler guards against recursion and suppresses excluded logs."""
+    handler = magma_module.TelegramLoggingHandler(bot=magma_module.bot, chat_id=123)
+    magma_module.bot.send_message.reset_mock()
+
+    # Filter telebot/urllib3/requests logs
+    for noisy_logger in ["telebot", "urllib3", "requests", "telebot.apihelper"]:
+        rec = logging.LogRecord(name=noisy_logger, level=logging.ERROR, pathname="foo.py", lineno=1, msg="Network drop", args=(), exc_info=None)
+        handler.emit(rec)
+    assert not magma_module.bot.send_message.called
+
+    # Filter notifications already being sent
+    rec_notif = logging.LogRecord(name="magma_sale_process", level=logging.ERROR, pathname="foo.py", lineno=1, msg="Telegram NOTIFICATION: 🔥 Error occurred", args=(), exc_info=None)
+    handler.emit(rec_notif)
+    assert not magma_module.bot.send_message.called
+
+    # Recursion guard: bot.send_message fails with exception
+    magma_module.bot.send_message.side_effect = Exception("Telegram API down")
+    rec_error = logging.LogRecord(name="magma_sale_process", level=logging.ERROR, pathname="foo.py", lineno=1, msg="Some real error", args=(), exc_info=None)
+    # Should not raise exception
+    handler.emit(rec_error)
+    magma_module.bot.send_message.side_effect = None
