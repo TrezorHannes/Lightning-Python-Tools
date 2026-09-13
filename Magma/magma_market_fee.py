@@ -60,56 +60,106 @@ LNCLI_PATH = "lncli"
 DRY_RUN_MODE = False
 MY_NODE_PUBKEY = None  # Loaded from general_config [info] NODE
 
-# --- GraphQL Queries/Mutations ---
+# --- GraphQL Endpoints ---
+MAGMA_GRAPHQL_URL = "https://magma.amboss.tech/graphql"
+AMBOSS_SPACE_GRAPHQL_URL = "https://api.amboss.space/graphql"
+
+# --- GraphQL Queries/Mutations for Magma Liquidity Market ---
 GET_PUBLIC_MAGMA_OFFERS_QUERY = """
-query GetPublicOffers {
-  getOffers {
-    list {
-      id
-      offer_type
-      base_fee
-      fee_rate
-      max_size
-      min_block_length
-      min_size
-      seller_score
-      status
-      side
-      total_size
-      account # Pubkey of seller
-      # orders { locked_size } # Not currently used in public market analysis
-      # tags { name } # Not currently used in analysis
+query GetPublicOffers($page: PageInput) {
+  market {
+    offer {
+      offers(page: $page) {
+        total
+        pagination {
+          limit
+          offset
+        }
+        list {
+          id
+          status
+          node {
+            pubkey
+            alias
+          }
+          total_amount {
+            satoshi {
+              sats
+            }
+          }
+          locked_amount {
+            satoshi {
+              sats
+            }
+          }
+          fees {
+            fixed {
+              sats
+            }
+            variable {
+              sats
+            }
+            amboss {
+              sats
+            }
+          }
+          promises {
+            min_block_length
+            base_fee_cap
+            fee_rate_cap
+          }
+          filled_orders
+          created_at
+        }
+      }
     }
-    # pageInfo { hasNextPage endCursor } # For pagination if needed later
   }
 }
 """
 
 GET_MY_MAGMA_OFFERS_QUERY = """
-query MyOffers {
-  getUser {
+query ListMyOffers($page: PageInput) {
+  user {
     market {
       offers {
-        list {
-          id
-          status
-          offer_type
-          base_fee
-          # base_fee_cap # Not directly used by script logic for now
-          fee_rate
-          # fee_rate_cap # Not directly used by script logic for now
-          max_size
-          min_block_length
-          min_size
-          total_size
-          orders { locked_size } # Crucial for available_size calculation
-          # conditions { condition } # Not used
-          # seller_score # Not relevant for own offers in this context
-          side
-          account # Our own pubkey
-          # amboss_fee_rate # Not used
-          # onchain_multiplier # Not used
-          # onchain_priority # Not used
+        offers(page: $page) {
+          total
+          pagination {
+            limit
+            offset
+          }
+          list {
+            id
+            status
+            total_amount {
+              satoshi {
+                sats
+              }
+            }
+            locked_amount {
+              satoshi {
+                sats
+              }
+            }
+            fees {
+              fixed {
+                sats
+              }
+              variable {
+                sats
+              }
+              amboss {
+                sats
+              }
+            }
+            promises {
+              min_block_length
+              base_fee_cap
+              fee_rate_cap
+            }
+            filled_orders
+            created_at
+          }
         }
       }
     }
@@ -118,27 +168,40 @@ query MyOffers {
 """
 
 CREATE_MAGMA_OFFER_MUTATION = """
-mutation CreateOffer($input: CreateOffer!) {
-  createOffer(input: $input)
-}
-"""
-
-UPDATE_MAGMA_OFFER_MUTATION = """
-mutation UpdateOfferDetails($id: String!, $input: UpdateOfferDetailsInput!) {
-  updateOfferDetails(id: $id, input: $input) {
-    base_fee fee_rate min_block_length min_size max_size total_size status # Include status if API returns it
+mutation CreateOffer($input: CreateOfferInput!) {
+  market {
+    offer {
+      create(input: $input) {
+        offer_id
+      }
+    }
   }
 }
 """
 
-# Using toggleOffer instead of deleteOffer
-TOGGLE_MAGMA_OFFER_MUTATION = """
-mutation ToggleOffer($toggleOfferId: String!) {
-  toggleOffer(id: $toggleOfferId) # Returns Boolean
+UPDATE_MAGMA_OFFER_MUTATION = """
+mutation UpdateOffer($input: UpdateOfferInput!) {
+  market {
+    offer {
+      update(input: $input) {
+        success
+      }
+    }
+  }
 }
 """
 
-
+TOGGLE_MAGMA_OFFER_MUTATION = """
+mutation ToggleOffer($input: ToggleOfferInput!) {
+  market {
+    offer {
+      toggle(input: $input) {
+        status
+      }
+    }
+  }
+}
+"""
 # --- Logging Setup ---
 def setup_logging():
     if not os.path.exists(LOG_DIR):
@@ -206,39 +269,52 @@ def send_telegram_notification(text, level="info"):
 
 # --- Amboss API Interaction ---
 def _execute_amboss_graphql_request(
-    payload: dict, operation_name: str = "AmbossGraphQL"
+    payload: dict,
+    operation_name: str = "AmbossGraphQL",
+    endpoint_url: str = MAGMA_GRAPHQL_URL,
 ):
+    """
+    Executes a GraphQL request to the Amboss / Magma API.
+    Handles DRY_RUN_MODE simulation for mutations.
+    """
     if not AMBOSS_TOKEN:
         logging.error("Amboss API token not configured.")
         return None
 
     is_mutation = operation_name.lower().startswith(
-        ("create", "update", "delete", "toggle")
+        ("create", "update", "delete", "toggle", "mutation")
     )
     if DRY_RUN_MODE and is_mutation:
         logging.info(
             f"DRY RUN: Preventing API call for {operation_name}. Payload: {json.dumps(payload, indent=2)}"
         )
-        if "Create" in operation_name:
-            return {"createOffer": f"dry-run-id-for-{operation_name}"}
-        if "Update" in operation_name:
+        if "create" in operation_name.lower():
             return {
+                "market": {"offer": {"create": {"offer_id": f"dry-run-id-for-{operation_name}"}}},
+                "createOffer": f"dry-run-id-for-{operation_name}",
+            }
+        if "update" in operation_name.lower():
+            return {
+                "market": {"offer": {"update": {"success": True}}},
                 "updateOfferDetails": {
                     "id": "dry-run-updated-id",
                     "status": "dry_run_simulated_update",
-                }
+                },
             }
-        if "Toggle" in operation_name:
-            return {"toggleOffer": True}  # Simulate successful toggle
+        if "toggle" in operation_name.lower():
+            return {
+                "market": {"offer": {"toggle": {"status": "ENABLED"}}},
+                "toggleOffer": True,
+            }
         return {"dryRunSimulatedSuccess": True}
 
-    url = "https://api.amboss.space/graphql"
+    url = endpoint_url
     headers = {
         "content-type": "application/json",
         "Authorization": f"Bearer {AMBOSS_TOKEN}",
     }
     logging.debug(
-        f"Executing {operation_name} with payload: {json.dumps(payload, indent=2 if logging.getLogger().getEffectiveLevel() == logging.DEBUG else None)}"
+        f"Executing {operation_name} against {url} with payload: {json.dumps(payload, indent=2 if logging.getLogger().getEffectiveLevel() == logging.DEBUG else None)}"
     )
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=30)
@@ -255,7 +331,7 @@ def _execute_amboss_graphql_request(
         return None
     except requests.exceptions.HTTPError as e:
         logging.error(
-            f"HTTP error during {operation_name} to Amboss: {e}. Response: {e.response.text}"
+            f"HTTP error during {operation_name} to Amboss: {e}. Response: {getattr(e.response, 'text', '')}"
         )
         return None
     except requests.exceptions.RequestException as e:
@@ -273,6 +349,94 @@ def _execute_amboss_graphql_request(
         return None
 
 
+def extract_market_offer_info(offer: dict) -> dict:
+    """Extracts normalized fields from a public or private Magma MarketOffer/SimpleMarketOffer object."""
+    if not offer:
+        return {}
+    
+    offer_id = offer.get("id", "N/A_ID")
+    status = str(offer.get("status", "UNKNOWN")).upper()
+    side = str(offer.get("side", "SELL")).upper()
+    
+    # Node / Account / Pubkey
+    node_obj = offer.get("node")
+    if isinstance(node_obj, dict):
+        pubkey = node_obj.get("pubkey")
+        alias = node_obj.get("alias")
+    else:
+        acc = offer.get("account")
+        if isinstance(acc, dict):
+            pubkey = acc.get("pubkey")
+        else:
+            pubkey = acc or offer.get("node_pubkey")
+        alias = None
+        
+    # Sizes / Amounts
+    if "total_amount" in offer and isinstance(offer.get("total_amount"), dict):
+        total_size = int(offer.get("total_amount", {}).get("satoshi", {}).get("sats", 0))
+        locked_size = int(offer.get("locked_amount", {}).get("satoshi", {}).get("sats", 0)) if "locked_amount" in offer else 0
+        min_size = int(offer.get("min_amount", {}).get("satoshi", {}).get("sats", total_size)) if "min_amount" in offer else total_size
+        max_size = int(offer.get("max_amount", {}).get("satoshi", {}).get("sats", total_size)) if "max_amount" in offer else total_size
+    elif "size" in offer and isinstance(offer.get("size"), dict):
+        size_obj = offer.get("size", {})
+        min_size = int(size_obj.get("min", {}).get("satoshi", {}).get("sats", 0))
+        max_size = int(size_obj.get("max", {}).get("satoshi", {}).get("sats", 0))
+        total_size = int(size_obj.get("total", {}).get("satoshi", {}).get("sats", 0))
+        locked_size = int(size_obj.get("locked", {}).get("satoshi", {}).get("sats", 0)) if "locked" in size_obj else 0
+    else:
+        min_size = int(offer.get("min_size", 0))
+        max_size = int(offer.get("max_size", 0))
+        total_size = int(offer.get("total_size", 0))
+        orders_data = offer.get("orders")
+        if isinstance(orders_data, dict):
+            locked_size = int(orders_data.get("locked_size", 0))
+        else:
+            locked_size = int(offer.get("locked_size", 0))
+            
+    # Fees
+    fees_obj = offer.get("fees")
+    if isinstance(fees_obj, dict):
+        base_fee = int(fees_obj.get("fixed", {}).get("sats", 0))
+        fee_rate = int(fees_obj.get("variable", {}).get("sats", 0))
+        amboss_fee = int(fees_obj.get("amboss", {}).get("sats", 0))
+    else:
+        base_fee = int(offer.get("base_fee", 0))
+        fee_rate = int(offer.get("fee_rate", 0))
+        amboss_fee = int(offer.get("amboss_fee_rate", 0))
+
+    # Promises
+    promises_obj = offer.get("promises")
+    if isinstance(promises_obj, dict):
+        min_block_length = int(promises_obj.get("min_block_length", 0))
+        base_fee_cap = promises_obj.get("base_fee_cap")
+        fee_rate_cap = promises_obj.get("fee_rate_cap")
+    else:
+        min_block_length = int(offer.get("min_block_length", 0))
+        base_fee_cap = offer.get("base_fee_cap")
+        fee_rate_cap = offer.get("fee_rate_cap")
+        
+    seller_score = float(offer.get("seller_score", 100.0))
+
+    return {
+        "id": offer_id,
+        "status": status,
+        "side": side,
+        "account": pubkey,
+        "node_alias": alias or pubkey,
+        "min_size": min_size,
+        "max_size": max_size,
+        "total_size": total_size,
+        "locked_size": locked_size,
+        "available_size": total_size - locked_size,
+        "base_fee": base_fee,
+        "fee_rate": fee_rate,
+        "amboss_fee": amboss_fee,
+        "min_block_length": min_block_length,
+        "base_fee_cap": base_fee_cap,
+        "fee_rate_cap": fee_rate_cap,
+        "seller_score": seller_score,
+        "raw_offer": offer
+    }
 # --- LND Interaction ---
 def get_lncli_utxos(current_general_config):
     """
@@ -415,62 +579,47 @@ def get_lnd_onchain_balance(current_general_config):
 
 # --- Market Analysis & Pricing Logic --- (analyze_and_price_offer and calculate_apr remain largely the same)
 def fetch_public_magma_offers(node_pubkey_to_exclude, current_magma_config):
-    logging.info("Fetching public Magma sell offers...")
-    payload = {"query": GET_PUBLIC_MAGMA_OFFERS_QUERY}
-    data = _execute_amboss_graphql_request(payload, "GetPublicOffers")
+    logging.info("Fetching public Magma sell offers for market pricing analysis...")
+    payload = {
+        "query": GET_PUBLIC_MAGMA_OFFERS_QUERY,
+        "variables": {"page": {"limit": 100, "offset": 0}}
+    }
+    data = _execute_amboss_graphql_request(payload, "GetPublicOffers", endpoint_url=MAGMA_GRAPHQL_URL)
 
     processed_offers = []
-    if data and data.get("getOffers", {}).get("list"):
-        raw_offers = data["getOffers"]["list"]
+    raw_offers = []
+    if data:
+        raw_offers = (
+            data.get("market", {}).get("offer", {}).get("offers", {}).get("list", [])
+            or data.get("getOffers", {}).get("list", [])
+        )
 
-        # Correctly get min_seller_score_filter from the [magma_autoprice] section
+    if raw_offers:
         min_seller_score_filter = get_config_float_with_comment_stripping(
-            current_magma_config["magma_autoprice"],
+            current_magma_config,
+            "market_analysis",
             "min_seller_score_filter",
             fallback=0.0,
         )
-
-        # DEBUG: Log the raw data for verification
         logging.debug(f"Raw offers count: {len(raw_offers)}")
         logging.debug(f"Min seller score filter: {min_seller_score_filter}")
 
         for offer in raw_offers:
             try:
+                parsed_offer = extract_market_offer_info(offer)
                 if (
-                    offer.get("status") != "ENABLED"
-                    or offer.get("side") != "SELL"
-                    or offer.get("offer_type") != "CHANNEL"
+                    parsed_offer["status"] != "ENABLED"
+                    or parsed_offer["side"] != "SELL"
                 ):
                     continue
                 if (
                     node_pubkey_to_exclude
-                    and offer.get("account") == node_pubkey_to_exclude
+                    and parsed_offer["account"] == node_pubkey_to_exclude
                 ):
                     logging.debug(
-                        f"Excluding own offer (Account: {offer.get('account')}) from market analysis."
+                        f"Excluding own offer (Account: {parsed_offer['account']}) from market analysis."
                     )
                     continue
-
-                parsed_offer = {
-                    "id": offer.get("id"),
-                    "offer_type": offer.get("offer_type"),
-                    "base_fee": int(offer.get("base_fee", 0)),
-                    "fee_rate": int(offer.get("fee_rate", 0)),
-                    "max_size": int(offer.get("max_size", 0)),
-                    "min_block_length": int(offer.get("min_block_length", 0)),
-                    "min_size": int(offer.get("min_size", 0)),
-                    "seller_score": float(offer.get("seller_score", 0.0)),
-                    "status": offer.get("status"),
-                    "side": offer.get("side"),
-                    "total_size": int(offer.get("total_size", 0)),
-                    "account": offer.get("account"),
-                    "node_alias": offer.get("account"),
-                }
-
-                # DEBUG: Log each offer's score for verification
-                logging.debug(
-                    f"Offer {parsed_offer.get('id', 'N/A')}: score={parsed_offer['seller_score']}, base_fee={parsed_offer['base_fee']}, fee_rate={parsed_offer['fee_rate']}"
-                )
 
                 if parsed_offer["seller_score"] < min_seller_score_filter:
                     logging.debug(
@@ -496,24 +645,13 @@ def fetch_public_magma_offers(node_pubkey_to_exclude, current_magma_config):
                 )
                 continue
 
-        # DEBUG: Log final filtered results
-        logging.debug(f"Final processed offers count: {len(processed_offers)}")
-        if processed_offers:
-            scores = [offer["seller_score"] for offer in processed_offers]
-            fees = [offer["base_fee"] for offer in processed_offers]
-            ppm_rates = [offer["fee_rate"] for offer in processed_offers]
-            logging.debug(f"Score range: {min(scores)} - {max(scores)}")
-            logging.debug(f"Fee range: {min(fees)} - {max(fees)}")
-            logging.debug(f"PPM range: {min(ppm_rates)} - {max(ppm_rates)}")
-
         logging.info(
-            f"Fetched and processed {len(processed_offers)} relevant public Magma CHANNEL/SELL/ENABLED offers (excluding own, score >= {min_seller_score_filter})."
+            f"Fetched and processed {len(processed_offers)} relevant public Magma SELL/ENABLED offers (excluding own, score >= {min_seller_score_filter})."
         )
         return processed_offers
     else:
         logging.warning("No public Magma offers found or error in fetching.")
         return []
-
 
 def calculate_apr(fixed_fee_sats, ppm_fee_rate, channel_size_sats, duration_days_float):
     if channel_size_sats == 0 or duration_days_float == 0:
@@ -720,56 +858,38 @@ def analyze_and_price_offer(
 # --- Manage Our Offers on Amboss ---
 def fetch_my_current_offers():
     logging.info("Fetching my current Magma sell offers...")
-    payload = {"query": GET_MY_MAGMA_OFFERS_QUERY}
-    data = _execute_amboss_graphql_request(payload, "MyOffers")
+    payload = {
+        "query": GET_MY_MAGMA_OFFERS_QUERY,
+        "variables": {"page": {"limit": 50, "offset": 0}}
+    }
+    data = _execute_amboss_graphql_request(payload, "MyOffers", endpoint_url=MAGMA_GRAPHQL_URL)
 
     processed_offers = []
-    if data and data.get("getUser", {}).get("market", {}).get("offers", {}).get("list"):
-        my_raw_offers = data["getUser"]["market"]["offers"]["list"]
+    my_raw_offers = []
+    if data:
+        my_raw_offers = (
+            data.get("user", {}).get("market", {}).get("offers", {}).get("offers", {}).get("list", [])
+            or data.get("getUser", {}).get("market", {}).get("offers", {}).get("list", [])
+        )
+
+    if my_raw_offers:
         for offer_item in my_raw_offers:
             try:
                 if not offer_item:
                     continue
-                offer_id = offer_item.get("id", "N/A_ID")
-                logging.debug(
-                    f"Processing own offer item ID {offer_id}: {json.dumps(offer_item)}"
-                )
+                parsed = extract_market_offer_info(offer_item)
+                offer_id = parsed["id"]
 
-                if (
-                    offer_item.get("offer_type") != "CHANNEL"
-                    or offer_item.get("side") != "SELL"
-                ):
+                if parsed["side"] != "SELL":
                     logging.debug(
-                        f"Skipping own offer {offer_id} - not a CHANNEL sell offer. Type: {offer_item.get('offer_type')}, Side: {offer_item.get('side')}"
+                        f"Skipping own offer {offer_id} - not a SELL offer. Side: {parsed['side']}"
                     )
                     continue
 
-                total_size_sats = int(offer_item.get("total_size", 0))
-
-                orders_data = offer_item.get("orders")
-                locked_size_str = "0"
-                if orders_data and isinstance(orders_data, dict):
-                    locked_size_str = orders_data.get("locked_size", "0")
-                elif (
-                    orders_data is not None
-                ):  # orders field exists but not a dict, log warning
-                    logging.warning(
-                        f"Offer ID {offer_id} has 'orders' field but it's not a dictionary: {orders_data}. Defaulting locked_size to 0."
-                    )
-
-                locked_size_sats = int(
-                    locked_size_str if locked_size_str is not None else "0"
-                )  # Ensure int conversion
-                available_size_sats = total_size_sats - locked_size_sats
-
-                logging.debug(
-                    f"Offer ID {offer_id}: total_size={total_size_sats}, orders_data={orders_data}, parsed_locked_size_str='{locked_size_str}', locked_size_sats={locked_size_sats}, calculated_available_size={available_size_sats}"
-                )
-
-                current_fixed_fee = int(offer_item.get("base_fee", 0))
-                current_ppm_rate = int(offer_item.get("fee_rate", 0))
-                current_min_size = int(offer_item.get("min_size", 0))
-                current_duration_blocks = int(offer_item.get("min_block_length", 0))
+                current_fixed_fee = parsed["base_fee"]
+                current_ppm_rate = parsed["fee_rate"]
+                current_min_size = parsed["min_size"]
+                current_duration_blocks = parsed["min_block_length"]
                 current_duration_days = (
                     current_duration_blocks / BLOCKS_PER_DAY
                     if BLOCKS_PER_DAY > 0
@@ -784,20 +904,19 @@ def fetch_my_current_offers():
 
                 details = {
                     "id": offer_id,
-                    "status": offer_item.get("status", "UNKNOWN").upper(),
-                    "offer_type": offer_item.get("offer_type"),
+                    "status": parsed["status"],
                     "base_fee": current_fixed_fee,
                     "fee_rate": current_ppm_rate,
-                    "max_size": int(offer_item.get("max_size", 0)),
+                    "max_size": parsed["max_size"],
                     "min_block_length": current_duration_blocks,
                     "min_size": current_min_size,
-                    "total_size": total_size_sats,
-                    "locked_size": locked_size_sats,
-                    "available_size": available_size_sats,
-                    "side": offer_item.get("side"),
-                    "account": offer_item.get("account"),
-                    "duration_days": current_duration_days,  # Store for display
-                    "apr": current_apr,  # Store for display
+                    "total_size": parsed["total_size"],
+                    "locked_size": parsed["locked_size"],
+                    "available_size": parsed["available_size"],
+                    "side": parsed["side"],
+                    "account": parsed["account"],
+                    "duration_days": current_duration_days,
+                    "apr": current_apr,
                 }
                 if not (
                     details["id"] != "N/A_ID"
@@ -812,28 +931,30 @@ def fetch_my_current_offers():
                 processed_offers.append(details)
             except (ValueError, TypeError, KeyError) as e:
                 logging.warning(
-                    f"Error parsing own offer {offer_id}: {e}. Offer data: {offer_item}"
+                    f"Error parsing own offer {offer_item.get('id')}: {e}. Offer data: {offer_item}"
                 )
                 continue
         logging.info(
-            f"Found and processed {len(processed_offers)} existing Magma CHANNEL sell offers."
+            f"Found and processed {len(processed_offers)} existing Magma sell offers."
         )
         return processed_offers
     logging.warning("No existing Magma sell offers found or error fetching.")
     return []
 
-
 def create_magma_offer(pricing_details, template_capital_for_total_size, template_name):
-    duration_blocks = pricing_details["duration_days"] * BLOCKS_PER_DAY
+    duration_blocks = int(pricing_details["duration_days"] * BLOCKS_PER_DAY)
     amboss_offer_input = {
-        "base_fee": pricing_details["fixed_fee_sats"],
-        "fee_rate": pricing_details["ppm_fee_rate"],
-        "min_size": pricing_details["channel_size_sats"],
-        "max_size": pricing_details["channel_size_sats"],
+        "pubkey": MY_NODE_PUBKEY,
+        "base_fee": int(pricing_details["fixed_fee_sats"]),
+        "fee_rate": int(pricing_details["ppm_fee_rate"]),
+        "min_size": int(pricing_details["channel_size_sats"]),
+        "max_size": int(pricing_details["channel_size_sats"]),
         "min_block_length": duration_blocks,
-        "total_size": template_capital_for_total_size,
-        "base_fee_cap": pricing_details["fixed_fee_sats"],
-        "fee_rate_cap": pricing_details["ppm_fee_rate"],
+        "total_size": int(template_capital_for_total_size),
+        "base_fee_cap": int(pricing_details["fixed_fee_sats"]),
+        "fee_rate_cap": int(pricing_details["ppm_fee_rate"]),
+        "onchain_priority": "MEDIUM",
+        "onchain_multiplier": 2,
     }
     log_prefix = "DRY RUN: Would create" if DRY_RUN_MODE else "Creating"
     logging.info(
@@ -841,25 +962,32 @@ def create_magma_offer(pricing_details, template_capital_for_total_size, templat
     )
 
     if DRY_RUN_MODE:
-        # Simulate the structure Amboss might return for createOffer, including a simulated ID.
-        return {"createOffer": f"dryrun-offer-id-{template_name.replace(' ', '_')}"}
+        return {
+            "id": f"dryrun-offer-id-{template_name.replace(' ', '_')}",
+            "createOffer": f"dryrun-offer-id-{template_name.replace(' ', '_')}",
+            "status_after_create": "ACTIVE",
+        }
 
     payload = {
         "query": CREATE_MAGMA_OFFER_MUTATION,
         "variables": {"input": amboss_offer_input},
     }
-    data = _execute_amboss_graphql_request(payload, f"CreateMagmaOffer-{template_name}")
-    if data and data.get(
-        "createOffer"
-    ):  # createOffer returns the new Offer ID (String)
-        new_offer_id = data.get("createOffer")
+    data = _execute_amboss_graphql_request(payload, f"CreateMagmaOffer-{template_name}", endpoint_url=MAGMA_GRAPHQL_URL)
+    new_offer_id = None
+    if data:
+        new_offer_id = (
+            data.get("market", {}).get("offer", {}).get("create", {}).get("offer_id")
+            or data.get("createOffer")
+        )
+    if new_offer_id:
         logging.info(
             f"Successfully created Magma offer for '{template_name}'. New Offer ID: {new_offer_id}"
         )
         return {
             "id": new_offer_id,
+            "createOffer": new_offer_id,
             "status_after_create": "ACTIVE",
-        }  # Assume ACTIVE, will be toggled
+        }
     else:
         logging.error(
             f"Failed to create Magma offer for '{template_name}'. Response: {data}"
@@ -870,18 +998,15 @@ def create_magma_offer(pricing_details, template_capital_for_total_size, templat
 def update_magma_offer(
     offer_id_to_update, pricing_details, template_capital_for_total_size, template_name
 ):
-    duration_blocks = pricing_details["duration_days"] * BLOCKS_PER_DAY
+    duration_blocks = int(pricing_details["duration_days"] * BLOCKS_PER_DAY)
     amboss_offer_input = {
-        "base_fee": pricing_details["fixed_fee_sats"],
-        "fee_rate": pricing_details["ppm_fee_rate"],
-        "min_size": pricing_details["channel_size_sats"],
-        "max_size": pricing_details[
-            "channel_size_sats"
-        ],  # Assuming fixed size for our offers
+        "offer_id": offer_id_to_update,
+        "base_fee": int(pricing_details["fixed_fee_sats"]),
+        "fee_rate": int(pricing_details["ppm_fee_rate"]),
+        "min_size": int(pricing_details["channel_size_sats"]),
+        "max_size": int(pricing_details["channel_size_sats"]),
         "min_block_length": duration_blocks,
-        "total_size": template_capital_for_total_size,
-        # base_fee_cap and fee_rate_cap are part of CreateOfferInput but optional in UpdateOfferDetailsInput
-        # If you want to update them, add them here. For now, matching previous behavior.
+        "total_size": int(template_capital_for_total_size),
     }
     log_prefix = "DRY RUN: Would update" if DRY_RUN_MODE else "Updating"
     logging.info(
@@ -889,7 +1014,6 @@ def update_magma_offer(
     )
 
     if DRY_RUN_MODE:
-        # Simulate the structure of the returned Offer object after update
         return {
             "id": offer_id_to_update,
             **amboss_offer_input,
@@ -898,14 +1022,24 @@ def update_magma_offer(
 
     payload = {
         "query": UPDATE_MAGMA_OFFER_MUTATION,
-        "variables": {"id": offer_id_to_update, "input": amboss_offer_input},
+        "variables": {"input": amboss_offer_input},
     }
     data = _execute_amboss_graphql_request(
-        payload, f"UpdateMagmaOffer-{offer_id_to_update}"
+        payload, f"UpdateMagmaOffer-{offer_id_to_update}", endpoint_url=MAGMA_GRAPHQL_URL
     )
-    if data and data.get("updateOfferDetails"):
+    is_success = False
+    if data:
+        is_success = (
+            data.get("market", {}).get("offer", {}).get("update", {}).get("success") is True
+            or data.get("updateOfferDetails") is not None
+        )
+    if is_success:
         logging.info(f"Successfully updated Magma offer ID {offer_id_to_update}.")
-        return data.get("updateOfferDetails")  # This is the Offer object
+        return {
+            "id": offer_id_to_update,
+            **amboss_offer_input,
+            "status": "UPDATED",
+        }
     else:
         logging.error(
             f"Failed to update Magma offer ID {offer_id_to_update}. Response: {data}"
@@ -917,21 +1051,26 @@ def toggle_magma_offer_status(
     offer_id, template_name_logging_info, target_log_status_str
 ):
     log_prefix = "DRY RUN: Would toggle" if DRY_RUN_MODE else "Toggling"
-    # target_log_status_str is for logging the intent, actual toggle flips the state
     logging.info(
         f"{log_prefix} Magma offer ID {offer_id} (info: '{template_name_logging_info}'). Intent from script: {target_log_status_str}."
     )
 
     if DRY_RUN_MODE:
         logging.info(f"DRY RUN: Simulating toggle for {offer_id} successful.")
-        return True  # Simulate success
+        return True
 
     payload = {
         "query": TOGGLE_MAGMA_OFFER_MUTATION,
-        "variables": {"toggleOfferId": offer_id},
+        "variables": {"input": {"offer_id": offer_id}},
     }
-    data = _execute_amboss_graphql_request(payload, f"ToggleMagmaOffer-{offer_id}")
-    if data and data.get("toggleOffer") is True:  # toggleOffer returns Boolean
+    data = _execute_amboss_graphql_request(payload, f"ToggleMagmaOffer-{offer_id}", endpoint_url=MAGMA_GRAPHQL_URL)
+    is_toggled = False
+    if data:
+        status_val = data.get("market", {}).get("offer", {}).get("toggle", {}).get("status")
+        if status_val in ["ENABLED", "DISABLED", "ACTIVE", "INACTIVE"] or data.get("toggleOffer") is True:
+            is_toggled = True
+
+    if is_toggled:
         logging.info(f"Successfully toggled status for Magma offer ID {offer_id}.")
         return True
     else:
@@ -939,7 +1078,6 @@ def toggle_magma_offer_status(
             f"Failed to toggle status for Magma offer ID {offer_id}. Response: {data}"
         )
         return False
-
 
 # --- Main Application Logic ---
 def main():
@@ -1467,8 +1605,8 @@ def main():
                 create_result = create_magma_offer(
                     new_pricing, template_capital_limit_for_total_size, template_name
                 )
-                if create_result and create_result.get("createOffer"):
-                    new_id = create_result["createOffer"]
+                if create_result and (create_result.get("createOffer") or create_result.get("id")):
+                    new_id = create_result.get("createOffer") or create_result.get("id")
                     managed_offer_ids_this_run.add(new_id)
                     actions_summary_for_telegram.append(
                         f"🚀 Created {template_name} (New ID {new_id[:8]}): APR {prop_apr_val}% (F:{prop_fixed_val},PPM:{prop_ppm_val},TS:{prop_capital_val}). Initial: DISABLED."
