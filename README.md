@@ -1,5 +1,8 @@
 # ⚡ Lightning Python Tools
 
+[![Tests](https://github.com/TrezorHannes/Lightning-Python-Tools/actions/workflows/tests.yml/badge.svg)](https://github.com/TrezorHannes/Lightning-Python-Tools/actions/workflows/tests.yml)
+[![Security Policy](https://img.shields.io/badge/Security-Policy-blue.svg)](SECURITY.md)
+
 A comprehensive suite of production-grade automation scripts, background daemons, liquidity optimizers, and monitoring utilities for **LND** Lightning Network node operators.
 
 ---
@@ -18,7 +21,7 @@ A comprehensive suite of production-grade automation scripts, background daemons
   - [Systemd Daemon Example](#systemd-daemon-example)
   - [Crontab Example](#crontab-example)
 - [Testing & Quality Assurance](#-testing--quality-assurance)
-- [Security Best Practices](#-security-best-practices)
+- [Security & Vulnerability Reporting](#-security--vulnerability-reporting)
 
 ---
 
@@ -185,7 +188,11 @@ pytest tests/ -v
 
 ---
 
-## 🔒 Security Best Practices
-- Never commit `config.ini`, `.env`, or credential files to Git.
-- Restrict file permissions on `config.ini`: `chmod 600 config.ini`.
-- Use read-only or restricted API keys whenever possible.
+## 🔒 Security & Vulnerability Reporting
+
+For our full responsible disclosure policy, supported versions, and contact channels, please review [`SECURITY.md`](SECURITY.md).
+
+- **Vulnerability Disclosure**: Report security vulnerabilities privately via [GitHub Security Advisories](https://github.com/TrezorHannes/Lightning-Python-Tools/security/advisories) or email `security@tunnelsats.com`.
+- **Secrets Management**: Never commit `config.ini`, `.env`, or credential files to Git.
+- **Permissions**: Restrict file permissions on `config.ini`: `chmod 600 config.ini`.
+- **Least Privilege**: Use read-only or scoped API keys and macaroons whenever possible.
