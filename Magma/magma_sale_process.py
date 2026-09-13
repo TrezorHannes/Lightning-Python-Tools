@@ -80,12 +80,12 @@ POLLING_INTERVAL_MINUTES = config.getint("magma", "polling_interval_minutes", fa
 
 BANNED_PUBKEYS = config.get("pubkey", "banned_magma_pubkeys", fallback="").split(",")
 
-TOKEN = config["telegram"]["magma_bot_token"]
-AMBOSS_TOKEN = config["credentials"]["amboss_authorization"]
-CHAT_ID = config["telegram"]["telegram_user_id"]
-bot = telebot.TeleBot(TOKEN)
+TOKEN = config.get("telegram", "magma_bot_token", fallback="")
+AMBOSS_TOKEN = config.get("credentials", "amboss_authorization", fallback="")
+CHAT_ID = config.get("telegram", "telegram_user_id", fallback="")
+bot = telebot.TeleBot(TOKEN if TOKEN else "fake_token")
 
-FULL_PATH_BOS = config["system"]["full_path_bos"]
+FULL_PATH_BOS = config.get("system", "full_path_bos", fallback="")
 LNCLI_PATH = config.get("paths", "lncli_path", fallback="lncli")
 
 
