@@ -188,6 +188,23 @@ def test_execute_lncli_addinvoice_failure(magma_module, mocker):
     assert pay_req is None
 
 
+def test_execute_lncli_addinvoice_with_route_hints(magma_module, mocker):
+    """Test generating an invoice with route hints appends --private."""
+    mock_popen = mocker.patch("subprocess.Popen")
+    process_mock = MagicMock()
+    expected_json = '{"r_hash": "hash_hint", "payment_request": "lnbc_hint..."}'
+    process_mock.communicate.return_value = (expected_json.encode('utf-8'), b"")
+    mock_popen.return_value = process_mock
+
+    r_hash, pay_req = magma_module.execute_lncli_addinvoice(1000, "memo", 3600, include_route_hints=True)
+
+    assert r_hash == "hash_hint"
+    assert pay_req == "lnbc_hint..."
+    args = mock_popen.call_args[0][0]
+    assert "--private" in args
+
+
+
 def test_accept_order_success(magma_module):
     """Test accepting an order on Amboss Magma."""
     mock_response = {
@@ -367,6 +384,49 @@ def test_get_offers_awaiting_seller_approval_banned_pubkey_auto_reject(magma_mod
     offer = magma_module.get_offers_awaiting_seller_approval()
     assert offer is None
     mock_reject.assert_called_once_with("order_banned_01")
+
+
+def test_get_offers_awaiting_seller_approval_banned_pubkey_reject_error_null_data(magma_module, mocker):
+    """Test auto-rejection handles GraphQL errors with null data without raising AttributeError."""
+    mock_response = {
+        "data": {
+            "user": {
+                "market": {
+                    "orders": {
+                        "sales": {
+                            "total": 1,
+                            "list": [
+                                {
+                                    "id": "order_banned_02",
+                                    "status": "WAITING_FOR_SELLER_APPROVAL",
+                                    "amount": {"satoshi": {"sats": "2000000"}},
+                                    "fees": {"seller": {"sats": "5000"}},
+                                    "destination": {"pubkey": "banned_pubkey_1", "alias": "BadActor"}
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+    }
+    mock_post = MagicMock()
+    mock_post.json.return_value = mock_response
+    mock_post.raise_for_status.return_value = None
+    magma_module.requests.post = MagicMock(return_value=mock_post)
+
+    mock_reject = mocker.patch.object(
+        magma_module,
+        "reject_order",
+        return_value={"errors": [{"message": "Rejection failed"}], "data": None}
+    )
+    mocker.patch.object(magma_module, "send_telegram_notification")
+
+    # Must NOT raise AttributeError: 'NoneType' object has no attribute 'get'
+    offer = magma_module.get_offers_awaiting_seller_approval()
+    assert offer is None
+    mock_reject.assert_called_once_with("order_banned_02")
+
 
 
 def test_get_orders_awaiting_channel_open_success(magma_module):
@@ -683,6 +743,44 @@ def test_complete_offer_approval_process_raw_and_normalized(magma_module, mocker
     assert magma_module.accept_order.call_args[0] == ("order_proc_001", "lnbc4500...")
     assert mock_wait.called
     assert mock_wait.call_args[0][0] == "order_proc_001"
+
+
+def test_complete_offer_approval_process_graphql_error_null_data(magma_module, mocker):
+    """Test _complete_offer_approval_process handles GraphQL errors with null data gracefully without crashing."""
+    raw_graphql_order = {
+        "id": "order_proc_002",
+        "status": "WAITING_FOR_SELLER_APPROVAL",
+        "amount": {"satoshi": {"sats": "5000000"}},
+        "fees": {"seller": {"sats": "15926"}},
+        "destination": {"pubkey": "03buyer", "alias": "BuyerNode"},
+        "buyer_alias": "BuyerNode"
+    }
+
+    mocker.patch.object(magma_module, "execute_lncli_addinvoice", return_value=("hash_err", "lnbc15926..."))
+    mocker.patch.object(magma_module, "accept_order", return_value={
+        "errors": [
+            {
+                "message": "Unable to find a route to this destination! Please reach out to support!",
+                "locations": [{"line": 6, "column": 9}],
+                "path": ["market", "order", "seller", "accept"],
+                "extensions": {"code": "INTERNAL_SERVER_ERROR"}
+            }
+        ],
+        "data": None
+    })
+    mock_wait = mocker.patch.object(magma_module, "wait_for_buyer_payment")
+    mock_send = mocker.patch.object(magma_module, "send_telegram_notification")
+    mocker.patch("builtins.open", mocker.mock_open())
+
+    # Must NOT raise AttributeError: 'NoneType' object has no attribute 'get'
+    magma_module._complete_offer_approval_process("order_proc_002", raw_graphql_order)
+
+    assert not mock_wait.called
+    assert mock_send.called
+    # Check that error notification contains the actual Amboss error detail
+    sent_messages = [call[0][0] for call in mock_send.call_args_list]
+    assert any("Unable to find a route to this destination" in msg for msg in sent_messages)
+
 
 
 def test_telegram_logging_handler_captures_errors_and_tracebacks(magma_module):

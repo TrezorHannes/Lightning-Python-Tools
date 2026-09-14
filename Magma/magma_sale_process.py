@@ -71,6 +71,7 @@ config.read(config_file_path)
 
 # Variables from config file
 INVOICE_EXPIRY_SECONDS = config.getint("magma", "invoice_expiry_seconds", fallback=180000)
+INVOICE_INCLUDE_ROUTE_HINTS = config.getboolean("magma", "invoice_include_route_hints", fallback=False)
 MAX_FEE_PERCENTAGE_OF_INVOICE = config.getfloat("magma", "max_fee_percentage_of_invoice", fallback=0.90)
 CHANNEL_FEE_RATE_PPM = config.getint("magma", "channel_fee_rate_ppm", fallback=350)
 MEMPOOL_FEES_API_URL = config.get("urls", "mempool_fees_api", fallback="https://mempool.space/api/v1/fees/recommended")
@@ -646,9 +647,13 @@ def get_node_extended_details(pubkey: str) -> dict:
     return data.get("getNode")
 
 
-def execute_lncli_addinvoice(amt, memo, expiry):
+def execute_lncli_addinvoice(amt, memo, expiry, include_route_hints=None):
+    if include_route_hints is None:
+        include_route_hints = INVOICE_INCLUDE_ROUTE_HINTS
     # Command to be executed as list
     command = [LNCLI_PATH, "addinvoice", "--memo", str(memo), "--amt", str(amt), "--expiry", str(expiry)]
+    if include_route_hints:
+        command.append("--private")
     logging.info(f"Executing command: {' '.join(command)}")
 
     try:
@@ -1326,12 +1331,14 @@ def get_offers_awaiting_seller_approval():
                 )
                 reject_response = reject_order(offer_id)
 
+                reject_data = reject_response.get("data") if isinstance(reject_response, dict) else None
                 is_rejected = (
                     reject_response
                     and not reject_response.get("errors")
+                    and isinstance(reject_data, dict)
                     and (
-                        reject_response.get("data", {}).get("market", {}).get("order", {}).get("seller", {}).get("reject", {}).get("success") is True
-                        or reject_response.get("data", {}).get("sellerRejectOrder")
+                        reject_data.get("market", {}).get("order", {}).get("seller", {}).get("reject", {}).get("success") is True
+                        or reject_data.get("sellerRejectOrder") is True
                     )
                 )
 
@@ -1488,11 +1495,12 @@ def _complete_offer_approval_process(order_id, order_details):
     accept_result = accept_order(order_id, invoice_request)
     logging.info(f"Order {order_id} Amboss acceptance result: {accept_result}")
 
+    accept_data = accept_result.get("data") if isinstance(accept_result, dict) else None
     is_accepted = (
-        "data" in accept_result
+        isinstance(accept_data, dict)
         and (
-            accept_result["data"].get("market", {}).get("order", {}).get("seller", {}).get("accept", {}).get("success") is True
-            or accept_result["data"].get("sellerAcceptOrder") is True
+            accept_data.get("market", {}).get("order", {}).get("seller", {}).get("accept", {}).get("success") is True
+            or accept_data.get("sellerAcceptOrder") is True
         )
     )
     if is_accepted:
