@@ -61,6 +61,8 @@ agg_liquidity_threshold = 10
 [magma]
 # Invoice expiry in seconds
 invoice_expiry_seconds = 180000
+# Include routing hints in invoice for private channels (--private)
+invoice_include_route_hints = false
 # Maximum percentage of the invoice amount that can be consumed by on-chain fees for channel opening
 # e.g., 0.90 means 90% of the invoice can be fees.
 max_fee_percentage_of_invoice = 0.90
