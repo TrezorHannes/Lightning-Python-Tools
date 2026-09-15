@@ -59,7 +59,9 @@ def magma_module(mock_dependencies):
          sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../Magma')))
     
     import magma_sale_process
+    import requests as real_requests
     magma_sale_process.requests = MagicMock()
+    magma_sale_process.requests.exceptions = real_requests.exceptions
     magma_sale_process.AMBOSS_TOKEN = "fake_auth"
     return magma_sale_process
 
@@ -848,3 +850,77 @@ def test_telegram_logging_handler_recursion_and_filters(magma_module):
     # Should not raise exception
     handler.emit(rec_error)
     magma_module.bot.send_message.side_effect = None
+
+
+def test_telegram_logging_handler_suppresses_telebot_pascal_case_and_infinity_polling(magma_module):
+    """Test TelegramLoggingHandler suppresses PascalCase TeleBot records and infinity_polling exceptions."""
+    handler = magma_module.TelegramLoggingHandler(bot=magma_module.bot, chat_id=123)
+    magma_module.bot.send_message.reset_mock()
+
+    # Case-insensitive checks: TeleBot, telebot, TELEBOT, TeleBot.apihelper, urllib3.connectionpool
+    noisy_loggers = [
+        "TeleBot",
+        "telebot",
+        "TELEBOT",
+        "TeleBot.apihelper",
+        "telebot.apihelper",
+        "urllib3.connectionpool",
+        "requests.packages.urllib3",
+    ]
+    for logger_name in noisy_loggers:
+        rec = logging.LogRecord(
+            name=logger_name,
+            level=logging.ERROR,
+            pathname="foo.py",
+            lineno=1021,
+            msg="Connection read timeout",
+            args=(),
+            exc_info=None,
+        )
+        handler.emit(rec)
+    assert not magma_module.bot.send_message.called
+
+    # Failsafe: funcName is infinity_polling or message contains Infinity polling exception
+    rec_poll1 = logging.LogRecord(
+        name="some_logger",
+        level=logging.ERROR,
+        pathname="__init__.py",
+        lineno=1021,
+        msg="Infinity polling exception: HTTPSConnectionPool: Read timed out.",
+        args=(),
+        exc_info=None,
+        func="infinity_polling",
+    )
+    handler.emit(rec_poll1)
+    assert not magma_module.bot.send_message.called
+
+
+def test_execute_amboss_graphql_request_timeout_demoted_to_warning(magma_module, mocker, caplog):
+    """Test that transient HTTP timeouts during GraphQL queries log as WARNING and do not dispatch error alerts."""
+    import requests
+    mocker.patch.object(magma_module.requests, "post", side_effect=requests.exceptions.Timeout("Amboss 20s timeout"))
+    magma_module.bot.send_message.reset_mock()
+
+    with caplog.at_level(logging.WARNING):
+        result = magma_module._execute_amboss_graphql_request({"query": "{ test }"}, "TestTimeoutQuery")
+
+    assert result is None
+    # Verify logged as WARNING, not ERROR
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("Timeout during TestTimeoutQuery to Amboss" in r.message for r in warning_records)
+    assert not any("Timeout during TestTimeoutQuery to Amboss" in r.message for r in error_records)
+    # Ensure no Telegram alert was dispatched
+    assert not magma_module.bot.send_message.called
+
+
+def test_telegram_logging_handler_no_duplicate_dispatches(magma_module):
+    """Test that logging error on root logger dispatches exactly one Telegram message."""
+    root_logger = logging.getLogger()
+    telegram_handlers = [h for h in root_logger.handlers if isinstance(h, magma_module.TelegramLoggingHandler)]
+    assert len(telegram_handlers) == 1
+
+    magma_module.bot.send_message.reset_mock()
+    logging.error("Single operational failure on root logger")
+    assert magma_module.bot.send_message.call_count == 1
+
