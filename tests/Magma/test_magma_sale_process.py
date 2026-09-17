@@ -772,7 +772,7 @@ def test_complete_offer_approval_process_graphql_error_null_data(magma_module, m
     })
     mock_wait = mocker.patch.object(magma_module, "wait_for_buyer_payment")
     mock_send = mocker.patch.object(magma_module, "send_telegram_notification")
-    mocker.patch("builtins.open", mocker.mock_open())
+    mock_file_open = mocker.patch("builtins.open", mocker.mock_open())
 
     # Must NOT raise AttributeError: 'NoneType' object has no attribute 'get'
     magma_module._complete_offer_approval_process("order_proc_002", raw_graphql_order)
@@ -782,6 +782,30 @@ def test_complete_offer_approval_process_graphql_error_null_data(magma_module, m
     # Check that error notification contains the actual Amboss error detail
     sent_messages = [call[0][0] for call in mock_send.call_args_list]
     assert any("Unable to find a route to this destination" in msg for msg in sent_messages)
+    # Ensure critical error flag file was NOT created/written to
+    assert not any(call[0][0] == magma_module.CRITICAL_ERROR_FILE_PATH for call in mock_file_open.call_args_list)
+
+
+def test_execute_bot_behavior_critical_flag_silenced_to_warning(magma_module, mocker, caplog):
+    """Test that existing CRITICAL_ERROR_FILE_PATH suspends bot without sending repeated Telegram alerts."""
+    mocker.patch("os.path.exists", return_value=True)
+    mock_new_offers = mocker.patch.object(magma_module, "process_new_offers")
+    mock_paid_orders = mocker.patch.object(magma_module, "process_paid_orders_for_channel_opening")
+    magma_module.bot.send_message.reset_mock()
+
+    with caplog.at_level(logging.WARNING):
+        magma_module.execute_bot_behavior()
+
+    # Behavior must be suspended
+    assert not mock_new_offers.called
+    assert not mock_paid_orders.called
+
+    # Must log at WARNING level, NOT CRITICAL, and NOT dispatch to Telegram
+    warning_logs = [r for r in caplog.records if r.levelno == logging.WARNING]
+    critical_logs = [r for r in caplog.records if r.levelno >= logging.CRITICAL]
+    assert any("CRITICAL ERROR FLAG" in r.message and "suspended" in r.message for r in warning_logs)
+    assert not any("CRITICAL ERROR FLAG" in r.message for r in critical_logs)
+    assert not magma_module.bot.send_message.called
 
 
 

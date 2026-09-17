@@ -1535,12 +1535,10 @@ def _complete_offer_approval_process(order_id, order_details):
         logging.error(failure_message)
         send_telegram_notification(failure_message, level="error", parse_mode="Markdown")
 
-        if not is_timeout_error and errors_list: # Create critical flag only if it's not a timeout but some other Amboss error
-            logging.warning(f"Creating critical error flag for order {order_id} due to non-timeout Amboss error during accept: {errors_list}")
-            with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
-                log_file.write(f"{datetime.now()}: Failed to accept Amboss order {order_id} after approval. Response: {errors_list}\n")
-        elif is_timeout_error:
-            logging.info(f"Order {order_id} acceptance timed out. Not creating critical error flag. Amboss may need to be checked manually for this order or it might be re-processed if applicable.")
+        if is_timeout_error:
+            logging.info(f"Order {order_id} acceptance timed out. Amboss may need to be checked manually for this order or it might be re-processed if applicable.")
+        else:
+            logging.warning(f"Order {order_id} acceptance failed on Amboss with non-timeout error: {errors_list}. Daemon remains active.")
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('decide_order:'))
@@ -2047,11 +2045,7 @@ def execute_bot_behavior():
 
     if os.path.exists(CRITICAL_ERROR_FILE_PATH):
         msg = f"CRITICAL ERROR FLAG ({CRITICAL_ERROR_FILE_PATH}) exists. Bot behavior suspended. Manual intervention required."
-        logging.critical(msg)
-        # Send one-time notification if bot is running and sees this
-        # This part might be tricky if the bot instance is restarted.
-        # For now, primary notification is via logs and manual check of the flag.
-        # send_telegram_notification(msg, level="error") # Careful with spamming this
+        logging.warning(msg)
         return
 
     try:
