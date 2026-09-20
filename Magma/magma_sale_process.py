@@ -121,12 +121,20 @@ class TelegramLoggingHandler(logging.Handler):
             return
 
         # Suppress logging from external network/telegram libraries to avoid cascade loops
-        if record.name in ("telebot", "urllib3", "requests") or record.name.startswith(("telebot.", "urllib3.", "requests.")):
+        logger_name = (record.name or "").lower()
+        if (
+            logger_name in ("telebot", "urllib3", "requests")
+            or logger_name.startswith(("telebot.", "urllib3.", "requests."))
+            or getattr(record, "funcName", None) == "infinity_polling"
+        ):
             return
 
-        # Suppress messages that are already sent via send_telegram_notification
+        # Suppress messages that are already sent via send_telegram_notification or infinity polling noise
         formatted_msg = record.getMessage()
-        if formatted_msg.startswith("Telegram NOTIFICATION:"):
+        if (
+            formatted_msg.startswith("Telegram NOTIFICATION:")
+            or "infinity polling" in formatted_msg.lower()
+        ):
             return
 
         target_bot = self.bot if self.bot is not None else bot
@@ -178,18 +186,21 @@ handler = RotatingFileHandler(
 )
 telegram_handler = TelegramLoggingHandler(bot=bot, chat_id=CHAT_ID, level=logging.ERROR)
 
-# Set up logging configuration
+# Set up logging configuration idempotently
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[handler, telegram_handler],
+    handlers=[handler],
 )
-logging.getLogger().addHandler(telegram_handler)
+root_logger = logging.getLogger()
+if not any(isinstance(h, TelegramLoggingHandler) for h in root_logger.handlers):
+    root_logger.addHandler(telegram_handler)
 
-# Adjust logging levels for third-party libraries
+# Adjust logging levels for third-party libraries (including PascalCase TeleBot)
 logging.getLogger("requests").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("telebot").setLevel(logging.WARNING)
+logging.getLogger("TeleBot").setLevel(logging.WARNING)
 
 CRITICAL_ERROR_FILE_PATH = os.path.join(parent_dir, "..", "logs", "magma_sale_process-critical-error.flag") # Reverted
 
@@ -497,10 +508,10 @@ def _execute_amboss_graphql_request(
         return response_json.get("data")
 
     except requests.exceptions.Timeout:
-        logging.error(f"Timeout during {operation_name} to Amboss.")
+        logging.warning(f"Timeout during {operation_name} to Amboss.")
         return None
     except requests.exceptions.RequestException as e:
-        logging.error(f"API request error during {operation_name} to Amboss: {e}")
+        logging.warning(f"API request error during {operation_name} to Amboss: {e}")
         return None
     except json.JSONDecodeError as e:
         logging.error(f"Failed to decode JSON response during {operation_name} from Amboss: {e}")
@@ -1524,12 +1535,10 @@ def _complete_offer_approval_process(order_id, order_details):
         logging.error(failure_message)
         send_telegram_notification(failure_message, level="error", parse_mode="Markdown")
 
-        if not is_timeout_error and errors_list: # Create critical flag only if it's not a timeout but some other Amboss error
-            logging.warning(f"Creating critical error flag for order {order_id} due to non-timeout Amboss error during accept: {errors_list}")
-            with open(CRITICAL_ERROR_FILE_PATH, "a") as log_file:
-                log_file.write(f"{datetime.now()}: Failed to accept Amboss order {order_id} after approval. Response: {errors_list}\n")
-        elif is_timeout_error:
-            logging.info(f"Order {order_id} acceptance timed out. Not creating critical error flag. Amboss may need to be checked manually for this order or it might be re-processed if applicable.")
+        if is_timeout_error:
+            logging.info(f"Order {order_id} acceptance timed out. Amboss may need to be checked manually for this order or it might be re-processed if applicable.")
+        else:
+            logging.warning(f"Order {order_id} acceptance failed on Amboss with non-timeout error: {errors_list}. Daemon remains active.")
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('decide_order:'))
@@ -2036,11 +2045,7 @@ def execute_bot_behavior():
 
     if os.path.exists(CRITICAL_ERROR_FILE_PATH):
         msg = f"CRITICAL ERROR FLAG ({CRITICAL_ERROR_FILE_PATH}) exists. Bot behavior suspended. Manual intervention required."
-        logging.critical(msg)
-        # Send one-time notification if bot is running and sees this
-        # This part might be tricky if the bot instance is restarted.
-        # For now, primary notification is via logs and manual check of the flag.
-        # send_telegram_notification(msg, level="error") # Careful with spamming this
+        logging.warning(msg)
         return
 
     try:
@@ -2095,7 +2100,7 @@ def run_telegram_polling():
             # infinity_polling handles most transient errors internally
             # timeout: connection timeout for requests
             # long_polling_timeout: how long Telegram waits before returning empty response
-            bot.infinity_polling(timeout=60, long_polling_timeout=30)
+            bot.infinity_polling(timeout=60, long_polling_timeout=30, logger_level=logging.WARNING)
             # If we get here, polling exited cleanly - reset backoff
             restart_count = 0
             current_delay = TELEGRAM_POLL_INITIAL_DELAY_SECONDS
@@ -2132,13 +2137,16 @@ if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO, # Default to INFO, can be overridden by config later if needed
         format="%(asctime)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s", # Added funcName and lineno
-        handlers=[main_handler, main_telegram_handler],
+        handlers=[main_handler],
     )
-    logging.getLogger().addHandler(main_telegram_handler)
+    root_logger = logging.getLogger()
+    if not any(isinstance(h, TelegramLoggingHandler) for h in root_logger.handlers):
+        root_logger.addHandler(main_telegram_handler)
     # Adjust logging levels for third-party libraries
     logging.getLogger("requests").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("telebot").setLevel(logging.WARNING)
+    logging.getLogger("TeleBot").setLevel(logging.WARNING)
     
     # Load config after basic logging is up, so config loading errors can be logged.
     config = configparser.ConfigParser()
