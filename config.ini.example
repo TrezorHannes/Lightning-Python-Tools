@@ -112,6 +112,10 @@ min_local_balance_ratio = 60
 min_capacity = 3000000
 # Target local balance ratio (percentage) when calculating dynamic loop-out size
 target_local_ratio = 50
+# Number of concurrent workers for route probing (default: 1 for zero downstream collision, 2 for parallel)
+workers = 1
+# Timeout in seconds for individual route prepay probes (default: 15)
+probe_timeout = 15
 # Loop daemon connection parameters (used if loop_command is 'loop' instead of 'litloop')
 # rpcserver = localhost:8443
 # tlscertpath = ~/.lit/tls.cert

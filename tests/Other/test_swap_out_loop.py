@@ -488,3 +488,30 @@ def test_interactive_menu_select_non_tty():
         with patch('builtins.input', return_value='q'):
             selected = swap_out_loop.interactive_menu_select(sample_candidates)
             assert selected is None
+
+
+def test_evaluate_single_candidate_success():
+    """Test evaluate_single_candidate successfully validating quote, route, and prepay probe."""
+    candidate = {
+        "chan_id": "111",
+        "proposed_amt": 2_000_000,
+        "alias": "Test-Peer",
+        "local_fee_rate": 10,
+        "remote_pubkey": "03peer",
+    }
+    mock_quote = {"service_fee": 2000, "estimated_onchain_fee": 150}
+    with patch.object(swap_out_loop, "get_loop_quote", return_value=mock_quote),          patch.object(swap_out_loop, "query_route_to_loop", return_value=(True, 25, 2)),          patch.object(swap_out_loop, "send_prepay_probe", return_value=(True, 25, 2, None)):
+        res = swap_out_loop.evaluate_single_candidate(
+            c=candidate,
+            config={},
+            loop_cmd=["litloop"],
+            loop_pubkey="02loop",
+            conf_target=9,
+            probe_timeout=15,
+            skip_prepay_probe=False,
+        )
+        assert res is not None
+        assert res["chan_id"] == "111"
+        assert res["service_fee"] == 2000
+        assert res["routing_fee"] == 25
+        assert res["total_cost"] == 2195

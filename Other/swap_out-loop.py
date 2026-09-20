@@ -973,6 +973,72 @@ def execute_loop_out(
     return {"success": True, "swap_id": swap_id, "output": output, "dry_run": False}
 
 
+def evaluate_single_candidate(
+    c: Dict[str, Any],
+    config: Any,
+    loop_cmd: List[str],
+    loop_pubkey: str,
+    conf_target: int,
+    probe_timeout: int,
+    skip_prepay_probe: bool,
+    print_lock: Optional[Any] = None,
+) -> Optional[Dict[str, Any]]:
+    """Evaluates a single candidate channel by querying quote, route, and prepay probe."""
+    chan_id = c["chan_id"]
+    amt = c["proposed_amt"]
+    alias = c["alias"]
+
+    def log(msg: str):
+        if print_lock:
+            with print_lock:
+                print(msg)
+        else:
+            print(msg)
+
+    log(f"  → Checking {alias[:20]} ({chan_id}) for {amt:,} sats...")
+
+    # 1. Fetch Loop Quote (read-only query)
+    quote = get_loop_quote(loop_cmd, amt, conf_target=conf_target, dry_run=False)
+
+    # 2. Stage 1: queryroutes (read-only query)
+    route_ok, route_fee, hops = query_route_to_loop(config, loop_pubkey, amt, chan_id, dry_run=False)
+    if not route_ok:
+        log(f"    ✗ Queryroutes found no route to Loop node for {alias[:20]}.")
+        return None
+
+    # 3. Stage 2: Prepay probe with fake hash (proves actual live liquidity without spending funds)
+    probe_ok, verified_fee, verified_hops, probe_err = send_prepay_probe(
+        config=config,
+        dest_pubkey=loop_pubkey,
+        amt=amt,
+        outgoing_chan_id=chan_id,
+        remote_pubkey=c.get("remote_pubkey", ""),
+        timeout=probe_timeout,
+        skip_probe=skip_prepay_probe,
+    )
+    if not probe_ok:
+        log(f"    ✗ Prepay probe failed for {alias[:20]}: {probe_err}")
+        return None
+
+    actual_fee = verified_fee if verified_fee > 0 or skip_prepay_probe else route_fee
+    actual_hops = verified_hops if verified_hops > 0 or skip_prepay_probe else hops
+    log(f"    ✓ Route verified with live liquidity for {alias[:20]} ({actual_hops} hops, {actual_fee:,} sat routing fee).")
+
+    # 4. Economic cost breakdown
+    econ = calculate_economic_cost(
+        amt=amt,
+        service_fee=quote["service_fee"],
+        onchain_fee=quote["estimated_onchain_fee"],
+        routing_fee=actual_fee,
+        local_fee_rate=c["local_fee_rate"],
+    )
+
+    c_eval = dict(c)
+    c_eval.update(quote)
+    c_eval.update(econ)
+    return c_eval
+
+
 def monitor_loop(config: configparser.ConfigParser):
     """Streams litloop monitor to terminal with detachment instructions."""
     loop_cmd = resolve_loop_command(config)
@@ -1039,6 +1105,13 @@ def parse_arguments() -> argparse.Namespace:
         type=str,
         default=None,
         help="Custom on-chain Bitcoin address for swept funds (defaults to LND internal wallet).",
+    )
+    parser.add_argument(
+        "-w",
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of concurrent worker threads for route probing (default from config or 1). Recommended max: 2.",
     )
     parser.add_argument(
         "--probe-timeout",
@@ -1214,54 +1287,48 @@ def main():
     # Route probing & quote evaluation on top candidates
     loop_cmd = resolve_loop_command(config)
     evaluated_candidates = []
+    top_candidates = candidates[:8]
+    workers = args.workers or config.getint("loop", "workers", fallback=1)
+    workers = max(1, workers)
 
-    for c in candidates[:8]:  # Evaluate up to top 8 candidates
-        chan_id = c["chan_id"]
-        amt = c["proposed_amt"]
-        alias = c["alias"]
-
-        print(f"  → Checking {alias[:20]} ({chan_id}) for {amt:,} sats...")
-
-        # 1. Fetch Loop Quote (read-only query)
-        quote = get_loop_quote(loop_cmd, amt, conf_target=conf_target, dry_run=False)
-
-        # 2. Stage 1: queryroutes (read-only query)
-        route_ok, route_fee, hops = query_route_to_loop(config, loop_pubkey, amt, chan_id, dry_run=False)
-        if not route_ok:
-            print(f"    ✗ Queryroutes found no route to Loop node.")
-            continue
-
-        # 3. Stage 2: Prepay probe with fake hash (proves actual live liquidity without spending funds)
-        probe_ok, verified_fee, verified_hops, probe_err = send_prepay_probe(
-            config=config,
-            dest_pubkey=loop_pubkey,
-            amt=amt,
-            outgoing_chan_id=chan_id,
-            remote_pubkey=c.get("remote_pubkey", ""),
-            timeout=args.probe_timeout,
-            skip_probe=args.skip_prepay_probe,
-        )
-        if not probe_ok:
-            print(f"    ✗ Prepay probe failed: {probe_err}")
-            continue
-
-        actual_fee = verified_fee if verified_fee > 0 or args.skip_prepay_probe else route_fee
-        actual_hops = verified_hops if verified_hops > 0 or args.skip_prepay_probe else hops
-        print(f"    ✓ Route verified with live liquidity ({actual_hops} hops, {actual_fee:,} sat routing fee).")
-
-        # 4. Economic cost breakdown
-        econ = calculate_economic_cost(
-            amt=amt,
-            service_fee=quote["service_fee"],
-            onchain_fee=quote["estimated_onchain_fee"],
-            routing_fee=actual_fee,
-            local_fee_rate=c["local_fee_rate"],
-        )
-
-        c_eval = dict(c)
-        c_eval.update(quote)
-        c_eval.update(econ)
-        evaluated_candidates.append(c_eval)
+    if workers > 1:
+        import concurrent.futures
+        import threading
+        print_color(f"Probing {len(top_candidates)} candidate channels using {workers} concurrent workers...", Colors.OKCYAN)
+        print_lock = threading.Lock()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(
+                    evaluate_single_candidate,
+                    c=c,
+                    config=config,
+                    loop_cmd=loop_cmd,
+                    loop_pubkey=loop_pubkey,
+                    conf_target=conf_target,
+                    probe_timeout=args.probe_timeout,
+                    skip_prepay_probe=args.skip_prepay_probe,
+                    print_lock=print_lock,
+                )
+                for c in top_candidates
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                res = future.result()
+                if res:
+                    evaluated_candidates.append(res)
+    else:
+        for c in top_candidates:
+            res = evaluate_single_candidate(
+                c=c,
+                config=config,
+                loop_cmd=loop_cmd,
+                loop_pubkey=loop_pubkey,
+                conf_target=conf_target,
+                probe_timeout=args.probe_timeout,
+                skip_prepay_probe=args.skip_prepay_probe,
+                print_lock=None,
+            )
+            if res:
+                evaluated_candidates.append(res)
 
     if not evaluated_candidates:
         print_color("\nNo candidates passed both queryroutes and prepay probing.", Colors.FAIL, bold=True)
