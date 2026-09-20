@@ -95,3 +95,21 @@ day_of_week = friday
 rpcserver = your_lnd_host:port
 tlscertpath = /path/to/your/lnd/tls.cert
 macaroonpath = /path/to/your/lnd/admin.macaroon
+[loop]
+# Path or alias to litloop/loop command. Defaults to litloop or loop
+loop_command = litloop
+# Public key of the Lightning Labs Loop server node
+loop_pubkey = 021c97a90a411ff2b10dc2a8e32de2f29d2fa49d41bfbb52bd416e460db0747d0d
+# Default confirmation target for sweep transaction (minimum 6 for economical sweep)
+conf_target = 9
+# Default maximum local fee rate (ppm) to consider for looping out (opportunity cost cap)
+max_local_fee_ppm = 100
+# Minimum local balance ratio (percentage) on candidate channel to consider
+min_local_balance_ratio = 60
+# Minimum channel capacity (sats)
+min_capacity = 3000000
+# Target local balance ratio (percentage) when calculating dynamic loop-out size
+target_local_ratio = 50
+# Loop daemon connection parameters (used if loop_command is 'loop' instead of 'litloop')
+# rpcserver = localhost:8443
+# tlscertpath = ~/.lit/tls.cert

@@ -83,7 +83,7 @@ Manage on-chain UTXOs, submarine swaps, and dynamic channel fee pricing.
 | [`Other/rebalance_guard.py`](Other/rebalance_guard.py) | `cronjob` / `CLI tool` | **Standalone Rebalance Guard**: Audits all open LNDg channels across both native Auto-Fees and `fee_adjuster.py`. Protects channels with active inbound discounts by setting `ar_out_target = 100%`, and automatically restores baseline targets using **Dynamic Hysteresis** once liquidity recovers. |
 | [`Other/boltz_swap-out.py`](Other/boltz_swap-out.py) | `CLI tool` | Automates submarine swap-outs through the Boltz exchange (Lightning to Liquid L-BTC). |
 | [`Other/swap_wallet.py`](Other/swap_wallet.py) | `CLI tool` | Batches automated payouts or drain payments over Lightning to a designated Lightning Address. |
-| [`Other/swap_out-loop.py`](Other/swap_out-loop.py) | `CLI tool` | Orchestrates continuous swap-outs for rebalancing large liquidity sinks. |
+| [`Other/swap_out-loop.py`](Other/swap_out-loop.py) | `CLI tool` | Economically optimized Loop Out liquidity rebalancing via Lightning Labs Loop (`litloop` / `loopd`) with route probing, economic scoring, arrow-key interactive menu, and SQLite accounting. See [documentation](Other/swap_out-loop.md). |
 | [`Other/lnd_utxo_consolidator.py`](Other/lnd_utxo_consolidator.py) | `CLI tool` | Safely consolidates fragmented on-chain LND UTXOs during low-mempool fee environments. |
 
 ---
