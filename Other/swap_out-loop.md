@@ -28,9 +28,12 @@ Rather than simply finding channels with high local balances, `swap_out-loop.py`
 - **Economical Sweep Timing**:
   - Enforces a minimum confirmation target of 6 blocks (default: 9) to prevent overpaying for fast on-chain sweeps.
   - Omits `--fast` so Loop's swap server batches the on-chain HTLC publication, reducing chain fees.
-- **Persistent Accounting Record Store**:
-  - Initiated and completed swaps are automatically recorded in a local SQLite database (`data/loop_out_history.db`).
-  - Automatically exports and synchronizes records with `data/loop_out_history.csv` for easy spreadsheet and tax accounting.
+- **Native Single Source of Truth (SOT) Accounting**:
+  - Leverages Loop's own database (`~/.loop/mainnet/loop_sqlite.db`) as the authoritative Source of Truth (SOT), avoiding redundant databases and state divergence.
+  - Can be configured via `loop_db_path` in `config.ini` or queried dynamically over RPC via `litloop listswaps`.
+  - Swaps are automatically tagged on initiation with `--label "Loop-Out: <alias> (<chan_id>)"` to preserve peer and channel metadata directly in `loop.db`.
+  - Displays historical swaps and final settled costs with `python Other/swap_out-loop.py --history`.
+  - Supports CSV exports via `--history --csv [optional_path]`.
 - **Interactive Monitoring with Safe Detach**:
   - Launches `litloop monitor` directly in the foreground.
   - Node operators can press `[Ctrl+C]` at any time to detach without aborting the swap; background `loopd` continues processing automatically.
@@ -66,6 +69,8 @@ swapout_blacklist = pubkey1,pubkey2
 [loop]
 # Path or alias to litloop/loop command
 loop_command = litloop
+# Path to loop's local SQLite database (Source of Truth for history and swap accounting)
+loop_db_path = ~/.loop/mainnet/loop_sqlite.db
 # Public key of the Lightning Labs Loop server node
 loop_pubkey = 021c97a90a411ff2b10dc2a8e32de2f29d2fa49d41bfbb52bd416e460db0747d0d
 # Default confirmation target for sweep transaction (minimum 6)

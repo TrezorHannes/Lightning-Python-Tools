@@ -98,6 +98,8 @@ macaroonpath = /path/to/your/lnd/admin.macaroon
 [loop]
 # Path or alias to litloop/loop command. Defaults to litloop or loop
 loop_command = litloop
+# Path to loop's local SQLite database (Source of Truth for history and swap accounting)
+loop_db_path = ~/.loop/mainnet/loop_sqlite.db
 # Public key of the Lightning Labs Loop server node
 loop_pubkey = 021c97a90a411ff2b10dc2a8e32de2f29d2fa49d41bfbb52bd416e460db0747d0d
 # Default confirmation target for sweep transaction (minimum 6 for economical sweep)

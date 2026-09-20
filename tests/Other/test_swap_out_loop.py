@@ -1,4 +1,5 @@
 import json
+import configparser
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -305,54 +306,131 @@ def test_prepay_probe_fallback_to_direct_route():
         mock_dir.assert_called_once()
 
 
-def test_sqlite_accounting_store_lifecycle():
-    """Test creating accounting store, inserting swap record, updating state, and CSV export."""
+def test_get_loop_db_path():
+    """Test determining loop_db_path from config.ini or default path."""
+    config = configparser.ConfigParser()
+    config.add_section("loop")
+    config.set("loop", "loop_db_path", "/tmp/custom_loop_sqlite.db")
+    path = swap_out_loop.get_loop_db_path(config)
+    assert path == "/tmp/custom_loop_sqlite.db"
+
+
+def test_fetch_loop_history_from_db_sot():
+    """Test querying Loop Out history directly from Loop's SQLite DB (Source of Truth)."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = os.path.join(tmpdir, "test_loop.db")
-        csv_path = os.path.join(tmpdir, "test_loop.csv")
-
-        store = swap_out_loop.AccountingStore(db_path=db_path, csv_path=csv_path)
-
-        swap_data = {
-            "swap_id": "swap-test-hash-12345",
-            "amount": 3_500_000,
-            "channel_id": "111111111111111111",
-            "peer_alias": "Cheap-High-Liquidity-Node",
-            "peer_pubkey": "02aaaabbbbcccc",
-            "server_fee": 3500,
-            "onchain_fee": 180,
-            "routing_fee": 45,
-            "opportunity_cost": 35,
-            "total_cost": 3760,
-            "effective_ppm": 1074,
-            "conf_target": 9,
-            "sweep_address": "bc1ptestaddress123",
-            "status": "INITIATED",
-        }
-        store.record_swap_initiated(swap_data)
-
-        # Verify in SQLite
+        db_path = os.path.join(tmpdir, "loop_sqlite.db")
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
-        cur.execute("SELECT swap_id, amount, status FROM loop_outs WHERE swap_id = ?", ("swap-test-hash-12345",))
-        row = cur.fetchone()
-        assert row is not None
-        assert row[0] == "swap-test-hash-12345"
-        assert row[1] == 3_500_000
-        assert row[2] == "INITIATED"
+        cur.execute("""
+        CREATE TABLE swaps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            swap_hash BLOB,
+            initiation_time TIMESTAMP,
+            amount_requested BIGINT,
+            label TEXT
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE loopout_swaps (
+            swap_hash BLOB PRIMARY KEY,
+            dest_address TEXT,
+            outgoing_chan_set TEXT
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE swap_updates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            swap_hash BLOB,
+            update_timestamp TIMESTAMP,
+            update_state INTEGER,
+            server_cost BIGINT,
+            onchain_cost BIGINT,
+            offchain_cost BIGINT
+        );
+        """)
+        hash1 = bytes.fromhex("11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff")
+        cur.execute("INSERT INTO swaps (swap_hash, initiation_time, amount_requested, label) VALUES (?, ?, ?, ?)",
+                    (hash1, "2026-09-20 14:00:00", 5000000, "Loop-Out: block-iad-1 (896468114071224320)"))
+        cur.execute("INSERT INTO loopout_swaps (swap_hash, dest_address, outgoing_chan_set) VALUES (?, ?, ?)",
+                    (hash1, "bc1ptest", "896468114071224320"))
+        cur.execute("INSERT INTO swap_updates (swap_hash, update_timestamp, update_state, server_cost, onchain_cost, offchain_cost) VALUES (?, ?, ?, ?, ?, ?)",
+                    (hash1, "2026-09-20 14:45:00", 2, 5000, 153, 12206))
+        conn.commit()
         conn.close()
 
-        # Update to SUCCESS
-        store.update_swap_status("swap-test-hash-12345", "SUCCESS", "txid-sweep-99999")
+        swaps = swap_out_loop.fetch_loop_history_from_db(db_path, limit=10)
+        assert len(swaps) == 1
+        s0 = swaps[0]
+        assert s0["swap_id"] == "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff"
+        assert s0["amount"] == 5000000
+        assert s0["server_fee"] == 5000
+        assert s0["onchain_fee"] == 153
+        assert s0["routing_fee"] == 12206
+        assert s0["total_cost"] == 17359
+        assert s0["effective_ppm"] == 3471
+        assert s0["status"] == "SUCCESS"
+        assert "block-iad-1" in s0["label"]
 
-        # Verify CSV export
+
+def test_fetch_loop_history_from_cli_fallback():
+    """Test querying loop listswaps via RPC CLI when SQLite DB direct access is not used."""
+    mock_listswaps = {
+        "swaps": [
+            {
+                "id": "aabbccddeeff",
+                "type": "LOOP_OUT",
+                "amt": "4000000",
+                "state": "SUCCESS",
+                "initiation_time": "1726830000000000000",
+                "cost_server": "4000",
+                "cost_onchain": "150",
+                "cost_offchain": "8000",
+                "label": "Loop-Out: Sunny Sarah",
+                "outgoing_chan_set": ["1055691691402854401"],
+            },
+            {
+                "id": "112233",
+                "type": "LOOP_IN",
+                "amt": "20000000",
+                "state": "SUCCESS",
+            }
+        ]
+    }
+    with patch.object(swap_out_loop, "run_command", return_value=(True, mock_listswaps, None)):
+        swaps = swap_out_loop.fetch_loop_history_from_cli(config={}, limit=10)
+        assert len(swaps) == 1
+        assert swaps[0]["swap_id"] == "aabbccddeeff"
+        assert swaps[0]["amount"] == 4000000
+        assert swaps[0]["total_cost"] == 12150
+        assert swaps[0]["status"] == "SUCCESS"
+
+
+def test_export_history_to_csv():
+    """Test exporting parsed history to CSV file."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        csv_path = os.path.join(tmpdir, "test_history.csv")
+        sample_swaps = [
+            {
+                "swap_id": "test1234",
+                "initiation_time": "2026-09-20 14:00:00",
+                "amount": 5000000,
+                "label": "Loop-Out: test",
+                "outgoing_chan_set": "123456",
+                "server_fee": 5000,
+                "onchain_fee": 150,
+                "routing_fee": 1000,
+                "total_cost": 6150,
+                "effective_ppm": 1230,
+                "status": "SUCCESS",
+            }
+        ]
+        swap_out_loop.export_history_to_csv(sample_swaps, csv_path)
         assert os.path.exists(csv_path)
         with open(csv_path, "r", encoding="utf-8") as f:
             reader = list(csv.DictReader(f))
             assert len(reader) == 1
-            assert reader[0]["swap_id"] == "swap-test-hash-12345"
-            assert reader[0]["status"] == "SUCCESS"
-            assert reader[0]["sweep_txid"] == "txid-sweep-99999"
+            assert reader[0]["swap_id"] == "test1234"
+            assert reader[0]["total_cost"] == "6150"
 
 
 def test_dry_run_execution():

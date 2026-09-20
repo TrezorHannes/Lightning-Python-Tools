@@ -21,6 +21,7 @@ import os
 import sys
 import json
 import time
+import datetime
 import math
 import binascii
 import subprocess
@@ -586,113 +587,182 @@ def calculate_economic_cost(
     }
 
 
-class AccountingStore:
-    """Persistent SQLite database and auto-export CSV store for loop-out operations."""
+def get_loop_db_path(config: Any) -> Optional[str]:
+    """
+    Returns the configured or discovered path to Loop's SQLite database (Source of Truth).
+    Checks [loop] -> loop_db_path and [paths] -> loop_db_path in config.ini,
+    falling back to default ~/.loop/mainnet/loop_sqlite.db.
+    """
+    db_path = ""
+    if hasattr(config, "get"):
+        if config.has_section("loop"):
+            db_path = config.get("loop", "loop_db_path", fallback="")
+        if not db_path and config.has_section("paths"):
+            db_path = config.get("paths", "loop_db_path", fallback="")
 
-    def __init__(self, db_path: str, csv_path: str):
-        self.db_path = db_path
-        self.csv_path = csv_path
-        self._init_db()
+    if db_path:
+        expanded = os.path.expanduser(db_path.strip())
+        if os.path.exists(expanded):
+            return expanded
+        return expanded
 
-    def _init_db(self):
-        os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
-        conn = sqlite3.connect(self.db_path)
-        cur = conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS loop_outs (
-                swap_id TEXT PRIMARY KEY,
-                initiation_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                completion_time TIMESTAMP,
-                amount INTEGER NOT NULL,
-                channel_id TEXT NOT NULL,
-                peer_alias TEXT,
-                peer_pubkey TEXT,
-                server_fee INTEGER,
-                onchain_fee INTEGER,
-                routing_fee INTEGER,
-                opportunity_cost INTEGER,
-                total_cost INTEGER,
-                effective_ppm INTEGER,
-                conf_target INTEGER,
-                sweep_address TEXT,
-                sweep_txid TEXT,
-                status TEXT NOT NULL
-            )
-            """
-        )
-        conn.commit()
-        conn.close()
+    default_path = os.path.expanduser("~/.loop/mainnet/loop_sqlite.db")
+    if os.path.exists(default_path):
+        return default_path
 
-    def record_swap_initiated(self, swap_data: Dict[str, Any]):
-        conn = sqlite3.connect(self.db_path)
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT OR REPLACE INTO loop_outs (
-                swap_id, amount, channel_id, peer_alias, peer_pubkey,
-                server_fee, onchain_fee, routing_fee, opportunity_cost,
-                total_cost, effective_ppm, conf_target, sweep_address, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                swap_data["swap_id"],
-                swap_data["amount"],
-                swap_data["channel_id"],
-                swap_data.get("peer_alias", ""),
-                swap_data.get("peer_pubkey", ""),
-                swap_data.get("server_fee", 0),
-                swap_data.get("onchain_fee", 0),
-                swap_data.get("routing_fee", 0),
-                swap_data.get("opportunity_cost", 0),
-                swap_data.get("total_cost", 0),
-                swap_data.get("effective_ppm", 0),
-                swap_data.get("conf_target", DEFAULT_CONF_TARGET),
-                swap_data.get("sweep_address", ""),
-                swap_data.get("status", "INITIATED"),
-            ),
-        )
-        conn.commit()
-        conn.close()
-        self.export_csv()
+    return None
 
-    def update_swap_status(self, swap_id: str, status: str, sweep_txid: Optional[str] = None):
-        conn = sqlite3.connect(self.db_path)
-        cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE loop_outs
-            SET status = ?, sweep_txid = COALESCE(?, sweep_txid), completion_time = CURRENT_TIMESTAMP
-            WHERE swap_id = ?
-            """,
-            (status, sweep_txid, swap_id),
-        )
-        conn.commit()
-        conn.close()
-        self.export_csv()
 
-    def list_swaps(self, limit: int = 25) -> List[Dict[str, Any]]:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM loop_outs ORDER BY initiation_time DESC LIMIT ?", (limit,))
-        rows = [dict(r) for r in cur.fetchall()]
-        conn.close()
-        return rows
+LOOP_STATE_MAP = {
+    0: "INITIATED",
+    1: "HTLC_PUBLISHED",
+    2: "SUCCESS",
+    3: "FAILED",
+    4: "FAILED",
+    5: "INVOICE_SETTLED",
+    6: "SUCCESS",
+    7: "FAILED",
+    8: "HTLC_PUBLISHED",
+    9: "PREIMAGE_REVEALED",
+}
 
-    def export_csv(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM loop_outs ORDER BY initiation_time DESC")
-        rows = cur.fetchall()
-        if rows:
-            with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(rows[0].keys())
-                for row in rows:
-                    writer.writerow(list(row))
-        conn.close()
+
+def fetch_loop_history_from_db(db_path: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """Reads Loop Out swaps directly from Loop's SQLite database (Source of Truth)."""
+    if not os.path.exists(db_path):
+        return []
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    query = """
+    SELECT 
+        hex(s.swap_hash) AS swap_id,
+        s.initiation_time,
+        s.amount_requested AS amount,
+        s.label,
+        lo.outgoing_chan_set,
+        lo.dest_address,
+        su.update_state,
+        COALESCE(su.server_cost, 0) AS server_cost,
+        COALESCE(su.onchain_cost, 0) AS onchain_cost,
+        COALESCE(su.offchain_cost, 0) AS offchain_cost
+    FROM loopout_swaps lo
+    JOIN swaps s ON lo.swap_hash = s.swap_hash
+    LEFT JOIN (
+        SELECT swap_hash, update_state, server_cost, onchain_cost, offchain_cost,
+               ROW_NUMBER() OVER (PARTITION BY swap_hash ORDER BY update_timestamp DESC) as rn
+        FROM swap_updates
+    ) su ON lo.swap_hash = su.swap_hash AND su.rn = 1
+    ORDER BY s.initiation_time DESC
+    LIMIT ?;
+    """
+    cur.execute(query, (limit,))
+    rows = []
+    for r in cur.fetchall():
+        server_fee = int(r["server_cost"])
+        onchain_fee = int(r["onchain_cost"])
+        routing_fee = int(r["offchain_cost"])
+        total_cost = server_fee + onchain_fee + routing_fee
+        amt = int(r["amount"])
+        ppm = int((total_cost * 1_000_000) / amt) if amt > 0 else 0
+
+        state_code = r["update_state"]
+        state_str = LOOP_STATE_MAP.get(state_code, f"STATE_{state_code}" if state_code is not None else "INITIATED")
+
+        raw_time = str(r["initiation_time"])
+        formatted_time = raw_time.split(".")[0].replace(" +0000 UTC", "")
+
+        rows.append({
+            "swap_id": r["swap_id"].lower(),
+            "initiation_time": formatted_time,
+            "amount": amt,
+            "label": r["label"] or "",
+            "outgoing_chan_set": r["outgoing_chan_set"] or "",
+            "server_fee": server_fee,
+            "onchain_fee": onchain_fee,
+            "routing_fee": routing_fee,
+            "total_cost": total_cost,
+            "effective_ppm": ppm,
+            "status": state_str,
+        })
+    conn.close()
+    return rows
+
+
+def fetch_loop_history_from_cli(config: Any, limit: int = 50) -> List[Dict[str, Any]]:
+    """Queries loop listswaps via RPC CLI as fallback."""
+    loop_cmd = resolve_loop_command(config)
+    cmd = list(loop_cmd) + ["listswaps"]
+    succ, out, _ = run_command(cmd, timeout=30, expect_json=True)
+    if not succ or not isinstance(out, dict) or "swaps" not in out:
+        return []
+
+    raw_swaps = [s for s in out.get("swaps", []) if s.get("type") == "LOOP_OUT"]
+    raw_swaps.sort(key=lambda s: int(s.get("initiation_time", 0)), reverse=True)
+
+    rows = []
+    for s in raw_swaps[:limit]:
+        amt = int(s.get("amt", 0))
+        server_fee = int(s.get("cost_server", 0))
+        onchain_fee = int(s.get("cost_onchain", 0))
+        routing_fee = int(s.get("cost_offchain", 0))
+        total_cost = server_fee + onchain_fee + routing_fee
+        ppm = int((total_cost * 1_000_000) / amt) if amt > 0 else 0
+
+        ns_time = int(s.get("initiation_time", 0))
+        if ns_time > 0:
+            formatted_time = datetime.datetime.fromtimestamp(ns_time / 1e9, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            formatted_time = "UNKNOWN"
+
+        chan_set = s.get("outgoing_chan_set", [])
+        chan_str = ",".join(str(c) for c in chan_set) if isinstance(chan_set, list) else str(chan_set)
+
+        rows.append({
+            "swap_id": s.get("id", "").lower(),
+            "initiation_time": formatted_time,
+            "amount": amt,
+            "label": s.get("label", ""),
+            "outgoing_chan_set": chan_str,
+            "server_fee": server_fee,
+            "onchain_fee": onchain_fee,
+            "routing_fee": routing_fee,
+            "total_cost": total_cost,
+            "effective_ppm": ppm,
+            "status": s.get("state", "UNKNOWN"),
+        })
+    return rows
+
+
+def fetch_loop_history(config: Any, limit: int = 50) -> Tuple[List[Dict[str, Any]], str]:
+    """
+    Fetches Loop Out history. First tries direct SQLite read from the configured
+    or discovered loop_db_path (Source of Truth). If unavailable, falls back to RPC CLI (listswaps).
+    Returns (swaps_list, source_description).
+    """
+    db_path = get_loop_db_path(config)
+    if db_path and os.path.exists(db_path):
+        try:
+            swaps = fetch_loop_history_from_db(db_path, limit=limit)
+            return swaps, f"Loop SQLite DB SOT ({db_path})"
+        except Exception:
+            pass
+
+    swaps = fetch_loop_history_from_cli(config, limit=limit)
+    return swaps, "Loop Daemon RPC (listswaps)"
+
+
+def export_history_to_csv(swaps: List[Dict[str, Any]], csv_path: str) -> None:
+    """Exports swap history records to CSV file."""
+    if not swaps:
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(swaps[0].keys())
+        for s in swaps:
+            writer.writerow(list(s.values()))
 
 
 def read_single_keypress() -> str:
@@ -844,19 +914,24 @@ def interactive_menu_select(candidates: List[Dict[str, Any]]) -> Optional[Dict[s
 
 
 def execute_loop_out(
-    config: configparser.ConfigParser,
+    config: Any,
     channel_id: str,
     amt: int,
     conf_target: int = 9,
     max_routing_fee: int = 0,
     dest_addr: Optional[str] = None,
+    alias: str = "",
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """Initiates the Loop Out swap using litloop / loop."""
+    """Initiates the Loop Out swap using litloop / loop, tagging with label."""
+    label = f"Loop-Out: {alias} ({channel_id})" if alias else f"Loop-Out: {channel_id}"
     if dry_run:
         fake_swap_id = "dry-run-swap-" + binascii.hexlify(os.urandom(16)).decode()
         print_color(f"\n[DRY RUN] Simulated litloop out execution for channel {channel_id}:", Colors.WARNING, bold=True)
-        print_color(f"  Command: litloop out --amt {amt} --channel {channel_id} --conf_target {conf_target} --force", Colors.WARNING)
+        print_color(
+            f'  Command: litloop out --amt {amt} --channel {channel_id} --conf_target {conf_target} --label "{label}" --force',
+            Colors.WARNING,
+        )
         return {"success": True, "swap_id": fake_swap_id, "dry_run": True}
 
     loop_cmd = resolve_loop_command(config)
@@ -868,6 +943,8 @@ def execute_loop_out(
         str(channel_id),
         "--conf_target",
         str(conf_target),
+        "--label",
+        label,
         "--force",
     ]
 
@@ -987,7 +1064,20 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--history",
         action="store_true",
-        help="Display past Loop Out swaps from local SQLite accounting record store.",
+        help="Display past Loop Out swaps from Loop's database (Source of Truth).",
+    )
+    parser.add_argument(
+        "--csv",
+        nargs="?",
+        const="default",
+        default=None,
+        help="Export historical swaps to CSV file (default: data/loop_out_history.csv).",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=30,
+        help="Maximum number of historical swaps to display (default: 30).",
     )
     parser.add_argument(
         "-p",
@@ -998,18 +1088,21 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def display_history(store: AccountingStore):
-    """Prints table of historical loop-out operations."""
-    swaps = store.list_swaps(limit=30)
+def display_history(config: Any, limit: int = 30, csv_path: Optional[str] = None):
+    """Prints table of historical loop-out operations from the Source of Truth."""
+    swaps, source = fetch_loop_history(config, limit=limit)
     if not swaps:
-        print_color("No past Loop Out operations recorded in database.", Colors.WARNING)
+        print_color(f"No past Loop Out operations found via {source}.", Colors.WARNING)
         return
+
+    print_color(f"\n=== Lightning Loop Out - Historical Swaps ===", Colors.HEADER, bold=True)
+    print_color(f"Source of Truth: {source}\n", Colors.OKCYAN)
 
     table = PrettyTable()
     table.field_names = [
-        "Time",
+        "Time (UTC)",
         "Swap ID",
-        "Alias",
+        "Label / Channel",
         "Amount (sat)",
         "Server Fee",
         "Onchain Fee",
@@ -1019,27 +1112,45 @@ def display_history(store: AccountingStore):
         "Status",
     ]
     table.align = "r"
-    table.align["Time"] = "l"
+    table.align["Time (UTC)"] = "l"
     table.align["Swap ID"] = "l"
-    table.align["Alias"] = "l"
+    table.align["Label / Channel"] = "l"
     table.align["Status"] = "c"
 
     for s in swaps:
+        disp_label = s.get("label", "")
+        if not disp_label:
+            chans = s.get("outgoing_chan_set", "")
+            disp_label = (chans[:24] + "...") if len(chans) > 24 else chans
+
+        status = s.get("status", "UNKNOWN")
+        status_colored = status
+        if status == "SUCCESS":
+            status_colored = f"{Colors.OKGREEN}{status}{Colors.ENDC}"
+        elif status == "FAILED":
+            status_colored = f"{Colors.FAIL}{status}{Colors.ENDC}"
+        elif status in ["INITIATED", "HTLC_PUBLISHED", "PREIMAGE_REVEALED"]:
+            status_colored = f"{Colors.WARNING}{status}{Colors.ENDC}"
+
         table.add_row(
             [
-                str(s.get("initiation_time", ""))[:19],
-                str(s.get("swap_id", ""))[:16] + "...",
-                str(s.get("peer_alias", ""))[:18],
+                s.get("initiation_time", ""),
+                s.get("swap_id", "")[:12] + "...",
+                disp_label[:28],
                 f"{s.get('amount', 0):,}",
                 f"{s.get('server_fee', 0):,}",
                 f"{s.get('onchain_fee', 0):,}",
                 f"{s.get('routing_fee', 0):,}",
                 f"{s.get('total_cost', 0):,}",
                 f"{s.get('effective_ppm', 0):,}",
-                s.get("status", "UNKNOWN"),
+                status_colored,
             ]
         )
     print(table)
+
+    if csv_path:
+        export_history_to_csv(swaps, csv_path)
+        print_color(f"\n✓ Exported {len(swaps)} records to CSV: {csv_path}", Colors.OKGREEN)
 
 
 def main():
@@ -1047,12 +1158,15 @@ def main():
     config, project_root = load_config()
     logger = setup_logger(project_root)
 
-    db_path = os.path.join(project_root, "data", "loop_out_history.db")
-    csv_path = os.path.join(project_root, "data", "loop_out_history.csv")
-    store = AccountingStore(db_path=db_path, csv_path=csv_path)
-
     if args.history:
-        display_history(store)
+        csv_target = None
+        if args.csv is not None:
+            csv_target = (
+                args.csv
+                if args.csv != "default"
+                else os.path.join(project_root, "data", "loop_out_history.csv")
+            )
+        display_history(config, limit=args.limit, csv_path=csv_target)
         return
 
     # Configuration defaults
@@ -1181,28 +1295,15 @@ def main():
         conf_target=conf_target,
         max_routing_fee=max_rf,
         dest_addr=args.dest_addr,
+        alias=selected["alias"],
         dry_run=args.dry_run,
     )
 
     if res.get("success"):
-        swap_record = {
-            "swap_id": res.get("swap_id", "dry-run"),
-            "amount": selected["proposed_amt"],
-            "channel_id": selected["chan_id"],
-            "peer_alias": selected["alias"],
-            "peer_pubkey": selected["remote_pubkey"],
-            "server_fee": selected["server_fee"],
-            "onchain_fee": selected["onchain_fee"],
-            "routing_fee": selected["routing_fee"],
-            "opportunity_cost": selected["opportunity_cost"],
-            "total_cost": selected["total_cost"],
-            "effective_ppm": selected["effective_ppm"],
-            "conf_target": conf_target,
-            "sweep_address": args.dest_addr or "lnd_wallet",
-            "status": "INITIATED" if not args.dry_run else "SIMULATED",
-        }
-        store.record_swap_initiated(swap_record)
-        logger.info(f"Swap initiated: {json.dumps(swap_record)}")
+        logger.info(
+            f"Swap initiated for {selected['alias']} ({selected['chan_id']}): "
+            f"amt={selected['proposed_amt']} sats, total_cost={selected['total_cost']} sats"
+        )
 
         if not args.dry_run:
             monitor_loop(config)
