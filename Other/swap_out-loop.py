@@ -408,19 +408,93 @@ def query_route_to_loop(
     return False, 0, 0
 
 
+def probe_direct_route_to_loop(
+    config: Any,
+    remote_pubkey: str,
+    dest_pubkey: str,
+    amt: int,
+    timeout: int = 15,
+) -> Tuple[bool, int, int, Optional[str]]:
+    """
+    Attempts to probe direct 2-hop route: Local -> Peer -> Loop.
+    Uses lncli buildroute and lncli sendtoroute with a fake payment hash.
+    Returns (success, verified_fee, hops_count, error_msg).
+    """
+    if not remote_pubkey:
+        return False, 0, 0, "No remote pubkey provided"
+
+    lncli_path = get_config_val(config, "paths", "lncli_path", "lncli")
+    lnd_params = get_lnd_connection_params(config)
+
+    # 1. Build direct route
+    build_cmd = [
+        lncli_path,
+        *lnd_params,
+        "buildroute",
+        "--amt",
+        str(amt),
+        "--hops",
+        f"{remote_pubkey},{dest_pubkey}",
+    ]
+    succ_build, out_build, err_build = run_command(build_cmd, timeout=timeout, expect_json=True)
+    if not succ_build or not isinstance(out_build, dict) or "route" not in out_build:
+        return False, 0, 0, err_build or "Direct channel to Loop not available or buildroute failed"
+
+    route = out_build["route"]
+    direct_fees = int(route.get("total_fees", 0))
+    hops_count = len(route.get("hops", []))
+
+    # 2. Probe direct route using sendtoroute with fake payment hash
+    fake_payment_hash = binascii.hexlify(os.urandom(32)).decode()
+    probe_cmd = [
+        lncli_path,
+        *lnd_params,
+        "sendtoroute",
+        f"--payment_hash={fake_payment_hash}",
+        "-",
+    ]
+    try:
+        process = subprocess.run(
+            probe_cmd,
+            input=json.dumps(out_build),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+        if process.stdout:
+            out_probe = json.loads(process.stdout)
+            failure_code = out_probe.get("failure", {}).get("code", "")
+            if failure_code in ["INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS", "INCORRECT_PAYMENT_DETAILS"]:
+                return True, direct_fees, hops_count, None
+            for htlc in out_probe.get("htlcs", []):
+                code = htlc.get("failure", {}).get("code", "")
+                if code in ["INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS", "INCORRECT_PAYMENT_DETAILS"]:
+                    return True, direct_fees, hops_count, None
+            err = out_probe.get("failure", {}).get("code") or "Direct route lacked liquidity"
+            return False, 0, 0, err
+    except Exception as e:
+        return False, 0, 0, str(e)
+
+    return False, 0, 0, "Failed to verify direct route"
+
+
 def send_prepay_probe(
-    config: configparser.ConfigParser,
+    config: Any,
     dest_pubkey: str,
     amt: int,
     outgoing_chan_id: str,
-    dry_run: bool = False,
-) -> Tuple[bool, Optional[str]]:
+    remote_pubkey: str = "",
+    timeout: int = 20,
+    skip_probe: bool = False,
+) -> Tuple[bool, int, int, Optional[str]]:
     """
-    Stage 2: Live route probe via lncli sendpayment using random 32-byte fake hash.
+    Stage 2: Live route probe using a random 32-byte fake hash.
     Proves downstream liquidity without risking funds.
+    Returns (success, verified_routing_fee, hops_count, error_detail).
     """
-    if dry_run:
-        return True, None
+    if skip_probe:
+        return True, 0, 0, None
 
     lncli_path = get_config_val(config, "paths", "lncli_path", "lncli")
     lnd_params = get_lnd_connection_params(config)
@@ -439,17 +513,27 @@ def send_prepay_probe(
         "--outgoing_chan_id",
         str(outgoing_chan_id),
         "--timeout",
-        "25s",
+        f"{timeout}s",
         "--json",
     ]
 
-    _, output, _ = run_command(cmd, timeout=35, expect_json=True)
+    _, output, _ = run_command(cmd, timeout=timeout + 10, expect_json=True)
 
     if isinstance(output, dict):
-        # Successful probe signals (reached Loop destination)
+        # 1. Check if any attempt reached Loop destination
+        htlcs = output.get("htlcs", [])
+        for htlc in htlcs:
+            failure = htlc.get("failure", {})
+            code = failure.get("code", "")
+            if code in ["INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS", "INCORRECT_PAYMENT_DETAILS"]:
+                route = htlc.get("route", {})
+                verified_fee = int(route.get("total_fees", 0))
+                hops_count = len(route.get("hops", []))
+                return True, verified_fee, hops_count, None
+
+        # Check top-level failure reason
         failure_reason = output.get("failure_reason", "")
         payment_error = output.get("payment_error", "")
-
         acceptable_signals = [
             "INCORRECT_PAYMENT_DETAILS",
             "INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS",
@@ -458,18 +542,25 @@ def send_prepay_probe(
         if any(sig in failure_reason for sig in acceptable_signals) or any(
             sig in payment_error for sig in acceptable_signals
         ):
-            return True, None
+            if htlcs:
+                last_route = htlcs[-1].get("route", {})
+                verified_fee = int(last_route.get("total_fees", 0))
+                hops_count = len(last_route.get("hops", []))
+                return True, verified_fee, hops_count, None
+            return True, 0, 0, None
 
-        # Check nested HTLCs failure codes
-        for htlc in output.get("htlcs", []):
-            code = htlc.get("failure", {}).get("code", "")
-            if code in ["INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS", "INCORRECT_PAYMENT_DETAILS"]:
-                return True, None
+    # 2. Multi-hop probe failed. If peer has a direct channel to Loop, probe the direct channel!
+    if remote_pubkey:
+        succ_dir, fee_dir, hops_dir, err_dir = probe_direct_route_to_loop(
+            config, remote_pubkey, dest_pubkey, amt, timeout=timeout
+        )
+        if succ_dir:
+            return True, fee_dir, hops_dir, None
 
-        err_detail = output.get("failure_reason") or output.get("payment_error") or "Unknown probe failure"
-        return False, err_detail
-
-    return False, "Failed to parse probe response"
+    err_detail = "Insufficient liquidity on route to Loop"
+    if isinstance(output, dict):
+        err_detail = output.get("failure_reason") or output.get("payment_error") or err_detail
+    return False, 0, 0, err_detail
 
 
 def calculate_economic_cost(
@@ -625,6 +716,42 @@ def read_single_keypress() -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
+def print_candidates_table(candidates: List[Dict[str, Any]]) -> None:
+    """Prints a formatted summary table of candidates with fee and cost breakdown."""
+    table = PrettyTable()
+    table.field_names = [
+        "#",
+        "Alias",
+        "Channel ID",
+        "Local %",
+        "Swap Size",
+        "Loop Fee",
+        "Sweep Fee",
+        "Route Fee",
+        "Opp Cost",
+        "Total Cost",
+        "Net PPM",
+    ]
+    table.align = "r"
+    table.align["Alias"] = "l"
+    table.align["#"] = "c"
+    for idx, c in enumerate(candidates, 1):
+        table.add_row([
+            f"[{idx}]",
+            c["alias"][:20],
+            c["chan_id"],
+            f"{c['local_ratio']:.1f}%",
+            f"{c['proposed_amt']:,}",
+            f"{c['server_fee']:,}",
+            f"{c['onchain_fee']:,}",
+            f"{c['routing_fee']:,}",
+            f"{c['opportunity_cost']:,}",
+            f"{c['total_cost']:,}",
+            f"{c['effective_ppm']:,}",
+        ])
+    print(table)
+
+
 def interactive_menu_select(candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
     Renders an interactive CLI terminal menu with arrow-key navigation.
@@ -636,10 +763,9 @@ def interactive_menu_select(candidates: List[Dict[str, Any]]) -> Optional[Dict[s
     if not sys.stdin.isatty():
         # Non-interactive fallback
         print("\nAvailable Candidates:")
-        for idx, c in enumerate(candidates, 1):
-            print(f"[{idx}] {c['alias']} ({c['chan_id']}) - Size: {c['proposed_amt']:,} sats - Net PPM: {c['effective_ppm']} ppm")
+        print_candidates_table(candidates)
         try:
-            choice = input(f"Select candidate [1-{len(candidates)}] or [q] to cancel: ").strip().lower()
+            choice = input(f"\nSelect candidate [1-{len(candidates)}] or [q] to cancel: ").strip().lower()
             if choice.isdigit() and 1 <= int(choice) <= len(candidates):
                 return candidates[int(choice) - 1]
         except (EOFError, KeyboardInterrupt):
@@ -838,6 +964,17 @@ def parse_arguments() -> argparse.Namespace:
         help="Custom on-chain Bitcoin address for swept funds (defaults to LND internal wallet).",
     )
     parser.add_argument(
+        "--probe-timeout",
+        type=int,
+        default=15,
+        help="Timeout in seconds for individual route prepay probes (default: 15s).",
+    )
+    parser.add_argument(
+        "--skip-prepay-probe",
+        action="store_true",
+        help="Skip active prepay probing and rely on queryroutes theoretical fees (not recommended).",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Simulate route probing and quote calculation without initiating any real swap.",
@@ -980,20 +1117,30 @@ def main():
             print(f"    ✗ Queryroutes found no route to Loop node.")
             continue
 
-        # 3. Stage 2: Prepay probe top candidates
-        probe_ok, probe_err = send_prepay_probe(config, loop_pubkey, amt, chan_id, dry_run=args.dry_run)
+        # 3. Stage 2: Prepay probe with fake hash (proves actual live liquidity without spending funds)
+        probe_ok, verified_fee, verified_hops, probe_err = send_prepay_probe(
+            config=config,
+            dest_pubkey=loop_pubkey,
+            amt=amt,
+            outgoing_chan_id=chan_id,
+            remote_pubkey=c.get("remote_pubkey", ""),
+            timeout=args.probe_timeout,
+            skip_probe=args.skip_prepay_probe,
+        )
         if not probe_ok:
             print(f"    ✗ Prepay probe failed: {probe_err}")
             continue
 
-        print(f"    ✓ Route verified ({hops} hops, {route_fee} sat routing fee).")
+        actual_fee = verified_fee if verified_fee > 0 or args.skip_prepay_probe else route_fee
+        actual_hops = verified_hops if verified_hops > 0 or args.skip_prepay_probe else hops
+        print(f"    ✓ Route verified with live liquidity ({actual_hops} hops, {actual_fee:,} sat routing fee).")
 
         # 4. Economic cost breakdown
         econ = calculate_economic_cost(
             amt=amt,
             service_fee=quote["service_fee"],
             onchain_fee=quote["estimated_onchain_fee"],
-            routing_fee=route_fee,
+            routing_fee=actual_fee,
             local_fee_rate=c["local_fee_rate"],
         )
 
@@ -1012,6 +1159,8 @@ def main():
     # Selection
     selected = None
     if args.auto_approve:
+        print("\nEvaluated Candidates:")
+        print_candidates_table(evaluated_candidates)
         selected = evaluated_candidates[0]
         print_color(f"\nAuto-approved top candidate: {selected['alias']} ({selected['chan_id']})", Colors.OKGREEN, bold=True)
     else:

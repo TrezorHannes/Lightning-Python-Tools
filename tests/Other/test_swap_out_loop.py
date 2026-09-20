@@ -1,3 +1,4 @@
+import json
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -219,17 +220,24 @@ def test_prepay_probe_success():
     mock_output = {
         "failure_reason": "FAILURE_REASON_INCORRECT_PAYMENT_DETAILS",
         "payment_error": "incorrect or unknown payment details",
+        "htlcs": [
+            {
+                "failure": {"code": "INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS"},
+                "route": {"total_fees": "120", "hops": [{"chan_id": "111"}, {"chan_id": "222"}]},
+            }
+        ],
     }
     with patch.object(swap_out_loop, "run_command") as mock_run:
-        mock_run.return_value = (False, mock_output, "Probe failed: incorrect payment details")
-        success, err = swap_out_loop.send_prepay_probe(
+        mock_run.return_value = (True, mock_output, None)
+        success, fee, hops, err = swap_out_loop.send_prepay_probe(
             config={},
             dest_pubkey="021c97a90a411ff2b10dc2a8e32de2f29d2fa49d41bfbb52bd416e460db0747d0d",
             amt=2_000_000,
             outgoing_chan_id="111111111111111111",
-            dry_run=False,
         )
         assert success is True
+        assert fee == 120
+        assert hops == 2
         assert err is None
 
 
@@ -241,15 +249,60 @@ def test_prepay_probe_channel_failure():
     }
     with patch.object(swap_out_loop, "run_command") as mock_run:
         mock_run.return_value = (False, mock_output, "Probe failed: no route")
-        success, err = swap_out_loop.send_prepay_probe(
+        success, fee, hops, err = swap_out_loop.send_prepay_probe(
             config={},
             dest_pubkey="021c97a90a411ff2b10dc2a8e32de2f29d2fa49d41bfbb52bd416e460db0747d0d",
             amt=2_000_000,
             outgoing_chan_id="111111111111111111",
-            dry_run=False,
         )
         assert success is False
         assert "no_route" in err.lower() or "no route" in err.lower() or "temporary channel failure" in err.lower()
+
+
+def test_probe_direct_route_to_loop_success():
+    """Test probe_direct_route_to_loop building direct route and probing with fake hash."""
+    build_output = {
+        "route": {
+            "total_fees": "12206",
+            "hops": [{"pub_key": "03peer"}, {"pub_key": "02loop"}],
+        }
+    }
+    probe_output = {
+        "failure": {"code": "INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS"}
+    }
+    with patch.object(swap_out_loop, "run_command", return_value=(True, build_output, None)),          patch("subprocess.run") as mock_subproc:
+        mock_subproc.return_value.stdout = json.dumps(probe_output)
+        success, fee, hops, err = swap_out_loop.probe_direct_route_to_loop(
+            config={},
+            remote_pubkey="03peer",
+            dest_pubkey="02loop",
+            amt=4_880_000,
+        )
+        assert success is True
+        assert fee == 12206
+        assert hops == 2
+        assert err is None
+
+
+def test_prepay_probe_fallback_to_direct_route():
+    """Test send_prepay_probe falling back to direct route when multi-hop probe fails."""
+    fail_output = {
+        "failure_reason": "FAILURE_REASON_NO_ROUTE",
+        "payment_error": "temporary channel failure",
+    }
+    with patch.object(swap_out_loop, "run_command", return_value=(False, fail_output, "temporary failure")),          patch.object(swap_out_loop, "probe_direct_route_to_loop", return_value=(True, 12206, 2, None)) as mock_dir:
+        success, fee, hops, err = swap_out_loop.send_prepay_probe(
+            config={},
+            dest_pubkey="021c97a90a411ff2b10dc2a8e32de2f29d2fa49d41bfbb52bd416e460db0747d0d",
+            amt=4_880_000,
+            outgoing_chan_id="111111111111111111",
+            remote_pubkey="03peer",
+        )
+        assert success is True
+        assert fee == 12206
+        assert hops == 2
+        assert err is None
+        mock_dir.assert_called_once()
 
 
 def test_sqlite_accounting_store_lifecycle():
