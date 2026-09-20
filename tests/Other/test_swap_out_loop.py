@@ -515,3 +515,60 @@ def test_evaluate_single_candidate_success():
         assert res["service_fee"] == 2000
         assert res["routing_fee"] == 25
         assert res["total_cost"] == 2195
+
+
+def test_calculate_max_routing_fee_budget_default():
+    """Verify default fee leeway calculation (100% leeway / 2.0x + 500 sats buffer)."""
+    budget = swap_out_loop.calculate_max_routing_fee_budget(
+        probed_routing_fee=20_000,
+        config={},
+    )
+    # 20,000 * 2.0 + 500 = 40,500
+    assert budget == 40_500
+
+
+def test_calculate_max_routing_fee_budget_explicit_zero_unbounded():
+    """Verify that explicit 0 returns 0 (unbounded / loop daemon default)."""
+    budget = swap_out_loop.calculate_max_routing_fee_budget(
+        probed_routing_fee=20_000,
+        config={},
+        explicit_max_routing_fee=0,
+    )
+    assert budget == 0
+
+
+def test_calculate_max_routing_fee_budget_explicit_positive():
+    """Verify that explicit positive fee overrides all leeway calculations."""
+    budget = swap_out_loop.calculate_max_routing_fee_budget(
+        probed_routing_fee=20_000,
+        config={},
+        explicit_max_routing_fee=35_000,
+    )
+    assert budget == 35_000
+
+
+def test_calculate_max_routing_fee_budget_custom_config():
+    """Verify custom config settings for fee_leeway_pct and fee_leeway_base_sats."""
+    import configparser
+    cfg = configparser.ConfigParser()
+    cfg.add_section("loop")
+    cfg.set("loop", "fee_leeway_pct", "50")
+    cfg.set("loop", "fee_leeway_base_sats", "1000")
+
+    budget = swap_out_loop.calculate_max_routing_fee_budget(
+        probed_routing_fee=20_000,
+        config=cfg,
+    )
+    # 20,000 * 1.5 + 1000 = 31,000
+    assert budget == 31_000
+
+
+def test_calculate_max_routing_fee_budget_cli_leeway_override():
+    """Verify that explicit_leeway_pct overrides config."""
+    budget = swap_out_loop.calculate_max_routing_fee_budget(
+        probed_routing_fee=20_000,
+        config={},
+        explicit_leeway_pct=200.0,
+    )
+    # 20,000 * 3.0 + 500 = 60,500
+    assert budget == 60_500
