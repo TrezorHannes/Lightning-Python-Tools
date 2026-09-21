@@ -962,3 +962,34 @@ def test_fetch_loop_history_from_db_preimage_revealed():
         assert s0["onchain_fee"] == 113
         assert s0["total_cost"] == 187
         assert s0["effective_ppm"] == 62
+
+
+def test_display_history_deduplication_and_formatting(capsys):
+    # Verify display_history cleans 'Loop-Out: ' prefix and deduplicates redundant channel count
+    mock_swaps = [
+        {
+            "swap_id": "da536e98a98a16a15030d8f5224f41aaeebec1eb07d096285aaa34fd13d5379a",
+            "initiation_time": "2026-09-21 17:34:59",
+            "amount": 3000000,
+            "label": "Loop-Out: block-iad-1 + 1 more (2 chans) (2 chans)",
+            "outgoing_chan_set": "896468114071224320,1028289662652973056",
+            "server_fee": 0,
+            "onchain_fee": 113,
+            "routing_fee": 74,
+            "total_cost": 187,
+            "effective_ppm": 62,
+            "status": "PREIMAGE_REVEALED",
+        }
+    ]
+
+    config = configparser.ConfigParser()
+    config.add_section("loop")
+    config.set("loop", "loop_db_path", "/nonexistent/path/db.sqlite")
+
+    with patch.object(swap_out_loop, "get_loop_db_path", return_value=None),          patch.object(swap_out_loop, "fetch_loop_history_from_cli", return_value=mock_swaps):
+        swap_out_loop.display_history(config, limit=5)
+
+    captured = capsys.readouterr().out
+    assert "block-iad-1 + 1 more (2 chans)" in captured
+    assert "(2 chans) (2 chans)" not in captured
+    assert "PREIMAGE_REVEALED" in captured
