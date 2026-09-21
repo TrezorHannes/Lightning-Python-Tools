@@ -637,40 +637,88 @@ def fetch_loop_history_from_db(db_path: str, limit: int = 50) -> List[Dict[str, 
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    query = """
-    SELECT 
-        hex(s.swap_hash) AS swap_id,
-        s.initiation_time,
-        s.amount_requested AS amount,
-        s.label,
-        lo.outgoing_chan_set,
-        lo.dest_address,
-        su.update_state,
-        COALESCE(su.server_cost, 0) AS server_cost,
-        COALESCE(su.onchain_cost, 0) AS onchain_cost,
-        COALESCE(su.offchain_cost, 0) AS offchain_cost
-    FROM loopout_swaps lo
-    JOIN swaps s ON lo.swap_hash = s.swap_hash
-    LEFT JOIN (
-        SELECT swap_hash, update_state, server_cost, onchain_cost, offchain_cost,
-               ROW_NUMBER() OVER (PARTITION BY swap_hash ORDER BY update_timestamp DESC) as rn
-        FROM swap_updates
-    ) su ON lo.swap_hash = su.swap_hash AND su.rn = 1
-    ORDER BY s.initiation_time DESC
-    LIMIT ?;
-    """
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sweeps';")
+    has_sweeps = cur.fetchone() is not None
+
+    if has_sweeps:
+        query = """
+        SELECT 
+            hex(s.swap_hash) AS swap_id,
+            s.initiation_time,
+            s.amount_requested AS amount,
+            s.label,
+            lo.outgoing_chan_set,
+            lo.dest_address,
+            su.update_state,
+            COALESCE(su.server_cost, 0) AS server_cost,
+            COALESCE(su.onchain_cost, 0) AS onchain_cost,
+            COALESCE(su.offchain_cost, 0) AS offchain_cost,
+            sw.completed AS sweep_completed,
+            sw.amt AS sweep_amt,
+            sb.batch_tx_id
+        FROM loopout_swaps lo
+        JOIN swaps s ON lo.swap_hash = s.swap_hash
+        LEFT JOIN (
+            SELECT swap_hash, update_state, server_cost, onchain_cost, offchain_cost,
+                   ROW_NUMBER() OVER (PARTITION BY swap_hash ORDER BY update_timestamp DESC) as rn
+            FROM swap_updates
+        ) su ON lo.swap_hash = su.swap_hash AND su.rn = 1
+        LEFT JOIN sweeps sw ON lo.swap_hash = sw.swap_hash
+        LEFT JOIN sweep_batches sb ON sw.batch_id = sb.id
+        ORDER BY s.initiation_time DESC
+        LIMIT ?;
+        """
+    else:
+        query = """
+        SELECT 
+            hex(s.swap_hash) AS swap_id,
+            s.initiation_time,
+            s.amount_requested AS amount,
+            s.label,
+            lo.outgoing_chan_set,
+            lo.dest_address,
+            su.update_state,
+            COALESCE(su.server_cost, 0) AS server_cost,
+            COALESCE(su.onchain_cost, 0) AS onchain_cost,
+            COALESCE(su.offchain_cost, 0) AS offchain_cost,
+            NULL AS sweep_completed,
+            NULL AS sweep_amt,
+            NULL AS batch_tx_id
+        FROM loopout_swaps lo
+        JOIN swaps s ON lo.swap_hash = s.swap_hash
+        LEFT JOIN (
+            SELECT swap_hash, update_state, server_cost, onchain_cost, offchain_cost,
+                   ROW_NUMBER() OVER (PARTITION BY swap_hash ORDER BY update_timestamp DESC) as rn
+            FROM swap_updates
+        ) su ON lo.swap_hash = su.swap_hash AND su.rn = 1
+        ORDER BY s.initiation_time DESC
+        LIMIT ?;
+        """
     cur.execute(query, (limit,))
     rows = []
     for r in cur.fetchall():
         server_fee = int(r["server_cost"])
         onchain_fee = int(r["onchain_cost"])
         routing_fee = int(r["offchain_cost"])
-        total_cost = server_fee + onchain_fee + routing_fee
         amt = int(r["amount"])
+
+        sweep_completed = r["sweep_completed"]
+        batch_tx_id = r["batch_tx_id"]
+        sweep_amt = int(r["sweep_amt"]) if r["sweep_amt"] is not None else 0
+
+        # If onchain fee is 0 in swap_updates but a sweep batch tx exists,
+        # estimate/calculate the pending onchain fee from the sweep output
+        if onchain_fee == 0 and batch_tx_id and sweep_amt > 0 and amt >= sweep_amt:
+            onchain_fee = amt - sweep_amt
+
+        total_cost = server_fee + onchain_fee + routing_fee
         ppm = int((total_cost * 1_000_000) / amt) if amt > 0 else 0
 
         state_code = r["update_state"]
-        state_str = LOOP_STATE_MAP.get(state_code, f"STATE_{state_code}" if state_code is not None else "INITIATED")
+        if state_code == 1 and batch_tx_id and (sweep_completed == 0 or sweep_completed is False):
+            state_str = "PREIMAGE_REVEALED"
+        else:
+            state_str = LOOP_STATE_MAP.get(state_code, f"STATE_{state_code}" if state_code is not None else "INITIATED")
 
         raw_time = str(r["initiation_time"])
         formatted_time = raw_time.split(".")[0].replace(" +0000 UTC", "")
@@ -1045,7 +1093,13 @@ def execute_loop_out(
         chan_arg = str(channel_id)
         chan_label = chan_arg
 
-    label = f"Loop-Out: {alias} ({chan_label})" if alias else f"Loop-Out: {chan_label}"
+    if alias:
+        if chan_label in alias or f"({chan_label})" in alias:
+            label = f"Loop-Out: {alias}"
+        else:
+            label = f"Loop-Out: {alias} ({chan_label})"
+    else:
+        label = f"Loop-Out: {chan_label}"
     if dry_run:
         fake_swap_id = "dry-run-swap-" + binascii.hexlify(os.urandom(16)).decode()
         fee_arg = f" --max_swap_routing_fee {max_routing_fee}" if max_routing_fee > 0 else ""
@@ -1334,7 +1388,11 @@ def display_history(config: Any, limit: int = 30, csv_path: Optional[str] = None
         disp_label = s.get("label", "")
         if not disp_label:
             chans = s.get("outgoing_chan_set", "")
-            disp_label = (chans[:24] + "...") if len(chans) > 24 else chans
+            disp_label = (chans[:28] + "...") if len(chans) > 28 else chans
+        else:
+            if disp_label.startswith("Loop-Out: "):
+                disp_label = disp_label[10:]
+            disp_label = re.sub(r"(\(\d+\s+chans\))(?:\s+\1)+", r"\1", disp_label)
 
         status = s.get("status", "UNKNOWN")
         status_colored = status
@@ -1349,7 +1407,7 @@ def display_history(config: Any, limit: int = 30, csv_path: Optional[str] = None
             [
                 s.get("initiation_time", ""),
                 s.get("swap_id", "")[:12] + "...",
-                disp_label[:28],
+                disp_label[:30],
                 f"{s.get('amount', 0):,}",
                 f"{s.get('server_fee', 0):,}",
                 f"{s.get('onchain_fee', 0):,}",
@@ -1524,7 +1582,13 @@ def main():
         total_cost = sel["total_cost"]
     else:
         chan_ids = [c["chan_id"] for c in selected_channels]
-        alias_str = f"{selected_channels[0]['alias']} + {len(selected_channels) - 1} more"
+        aliases = [c["alias"] if c.get("alias") else str(c["chan_id"]) for c in selected_channels]
+        if len(selected_channels) <= 3 and sum(len(a) for a in aliases) <= 60:
+            alias_str = ", ".join(aliases)
+        elif len(selected_channels) > 1:
+            alias_str = f"{aliases[0]} + {len(selected_channels) - 1} more"
+        else:
+            alias_str = aliases[0]
         if args.amt and args.amt > 0:
             total_swap_amt = args.amt
         else:

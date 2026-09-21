@@ -777,7 +777,7 @@ def test_main_multi_channel_logging_success():
 
         mock_logger.info.assert_called_once()
         log_call_msg = mock_logger.info.call_args[0][0]
-        assert "block-iad-1 + 1 more" in log_call_msg
+        assert "block-iad-1, allNice | torq.co" in log_call_msg
         assert "896468114071224320,1028289662652973056" in log_call_msg
 
 
@@ -848,3 +848,117 @@ def test_multi_channel_fixed_amount_and_max_fee_budget():
         assert mock_exec.call_args[1]["max_routing_fee"] == 21_494
         # channel_id list contains both channels
         assert mock_exec.call_args[1]["channel_id"] == ["896468114071224320", "1028289662652973056"]
+
+
+def test_execute_loop_out_label_deduplication():
+    # Verify execute_loop_out does not duplicate (X chans) if already in alias
+    with patch.object(swap_out_loop, "resolve_loop_command", return_value=["litloop"]):
+        with patch.object(swap_out_loop, "run_command", return_value=(True, "Swap initiated: 999", None)) as mock_run:
+            # Case 1: alias already contains (2 chans)
+            swap_out_loop.execute_loop_out(
+                config={},
+                channel_id=["111", "222"],
+                amt=3_000_000,
+                alias="block-iad-1 + 1 more (2 chans)",
+                dry_run=False,
+            )
+            cmd1 = mock_run.call_args[0][0]
+            label_idx1 = cmd1.index("--label")
+            assert cmd1[label_idx1 + 1] == "Loop-Out: block-iad-1 + 1 more (2 chans)"
+
+            # Case 2: alias without channel count
+            swap_out_loop.execute_loop_out(
+                config={},
+                channel_id=["111", "222"],
+                amt=3_000_000,
+                alias="block-iad-1 + 1 more",
+                dry_run=False,
+            )
+            cmd2 = mock_run.call_args[0][0]
+            label_idx2 = cmd2.index("--label")
+            assert cmd2[label_idx2 + 1] == "Loop-Out: block-iad-1 + 1 more (2 chans)"
+
+
+def test_fetch_loop_history_from_db_preimage_revealed():
+    # Verify fetch_loop_history_from_db maps state 1 to PREIMAGE_REVEALED when sweep is pending
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "loop_sqlite.db")
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute('''
+        CREATE TABLE swaps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            swap_hash BLOB,
+            initiation_time TIMESTAMP,
+            amount_requested BIGINT,
+            label TEXT
+        );
+        ''')
+        cur.execute('''
+        CREATE TABLE loopout_swaps (
+            swap_hash BLOB PRIMARY KEY,
+            dest_address TEXT,
+            outgoing_chan_set TEXT
+        );
+        ''')
+        cur.execute('''
+        CREATE TABLE swap_updates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            swap_hash BLOB,
+            update_timestamp TIMESTAMP,
+            update_state INTEGER,
+            server_cost BIGINT,
+            onchain_cost BIGINT,
+            offchain_cost BIGINT
+        );
+        ''')
+        cur.execute('''
+        CREATE TABLE sweep_batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            confirmed BOOLEAN NOT NULL DEFAULT FALSE,
+            batch_tx_id TEXT
+        );
+        ''')
+        cur.execute('''
+        CREATE TABLE sweeps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            swap_hash BLOB NOT NULL,
+            batch_id INTEGER NOT NULL,
+            outpoint TEXT NOT NULL,
+            amt BIGINT NOT NULL,
+            completed BOOLEAN NOT NULL DEFAULT FALSE
+        );
+        ''')
+
+        hash1 = bytes.fromhex("da536e98a98a16a15030d8f5224f41aaeebec1eb07d096285aaa34fd13d5379a")
+        cur.execute(
+            "INSERT INTO swaps (swap_hash, initiation_time, amount_requested, label) VALUES (?, ?, ?, ?)",
+            (hash1, "2026-09-21 17:34:59", 3000000, "Loop-Out: block-iad-1 + 1 more (2 chans)")
+        )
+        cur.execute(
+            "INSERT INTO loopout_swaps (swap_hash, dest_address, outgoing_chan_set) VALUES (?, ?, ?)",
+            (hash1, "bc1ptest", "896468114071224320,1028289662652973056")
+        )
+        cur.execute(
+            "INSERT INTO swap_updates (swap_hash, update_timestamp, update_state, server_cost, onchain_cost, offchain_cost) VALUES (?, ?, ?, ?, ?, ?)",
+            (hash1, "2026-09-21 18:53:55", 1, 0, 0, 74)
+        )
+        cur.execute(
+            "INSERT INTO sweep_batches (confirmed, batch_tx_id) VALUES (?, ?)",
+            (False, "393404e4c9c51490fa638cf2a25690ca70e2354bd0dc0d5fea7553f1bd6b40ff")
+        )
+        cur.execute(
+            "INSERT INTO sweeps (swap_hash, batch_id, outpoint, amt, completed) VALUES (?, ?, ?, ?, ?)",
+            (hash1, 1, "e3e3:6", 2999887, False)
+        )
+        conn.commit()
+        conn.close()
+
+        swaps = swap_out_loop.fetch_loop_history_from_db(db_path, limit=10)
+        assert len(swaps) == 1
+        s0 = swaps[0]
+        assert s0["status"] == "PREIMAGE_REVEALED"
+        assert s0["routing_fee"] == 74
+        assert s0["onchain_fee"] == 113
+        assert s0["total_cost"] == 187
+        assert s0["effective_ppm"] == 62
