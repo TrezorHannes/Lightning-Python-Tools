@@ -716,3 +716,66 @@ def test_execute_loop_out_multi_channel_real_command():
             assert "--addr" in called_cmd
             addr_idx = called_cmd.index("--addr")
             assert called_cmd[addr_idx + 1] == "bc1qtestaddr"
+
+
+def test_main_multi_channel_logging_success():
+    """Verify main() executes and logs successfully when interactive_menu_select returns a multi-channel list."""
+    mock_candidates = [
+        {
+            "chan_id": "896468114071224320",
+            "alias": "block-iad-1",
+            "proposed_amt": 3_000_000,
+            "drainable_surplus": 3_000_000,
+            "local_ratio": 99.0,
+            "server_fee": 3049,
+            "onchain_fee": 163,
+            "routing_fee": 7494,
+            "opportunity_cost": 0,
+            "total_cost": 10706,
+            "effective_ppm": 3569,
+        },
+        {
+            "chan_id": "1028289662652973056",
+            "alias": "allNice | torq.co",
+            "proposed_amt": 3_000_000,
+            "drainable_surplus": 3_000_000,
+            "local_ratio": 95.4,
+            "server_fee": 3049,
+            "onchain_fee": 163,
+            "routing_fee": 10497,
+            "opportunity_cost": 0,
+            "total_cost": 13709,
+            "effective_ppm": 4570,
+        },
+    ]
+
+    mock_args = MagicMock()
+    mock_args.history = False
+    mock_args.capacity = 3_000_000
+    mock_args.fee_limit = 100
+    mock_args.min_ratio = 60.0
+    mock_args.amt = 3_000_000
+    mock_args.conf_target = 9
+    mock_args.max_routing_fee = None
+    mock_args.fee_leeway_pct = None
+    mock_args.dest_addr = None
+    mock_args.dry_run = True
+    mock_args.auto_approve = False
+    mock_args.max_channels = 3
+    mock_args.channel = None
+    mock_args.workers = 1
+    mock_args.probe_timeout = 15
+    mock_args.skip_prepay_probe = False
+
+    with patch.object(swap_out_loop, "parse_arguments", return_value=mock_args),          patch.object(swap_out_loop, "load_config", return_value=(configparser.ConfigParser(), "/tmp")),          patch.object(swap_out_loop, "setup_logger") as mock_setup_logger,          patch.object(swap_out_loop, "fetch_channels_lndg", return_value=[{"is_active": True, "is_open": True, "capacity": 10000000, "local_balance": 8000000, "local_fee_rate": 5, "chan_id": "111", "alias": "node"}]),          patch.object(swap_out_loop, "filter_and_size_candidates", return_value=mock_candidates),          patch.object(swap_out_loop, "evaluate_single_candidate", side_effect=lambda c, **kwargs: c),          patch.object(swap_out_loop, "interactive_menu_select", return_value=mock_candidates),          patch.object(swap_out_loop, "execute_loop_out", return_value={"success": True, "swap_id": "mock-swap-id", "dry_run": True}):
+
+        mock_logger = MagicMock()
+        mock_setup_logger.return_value = mock_logger
+
+        # Calling main() should NOT raise TypeError: list indices must be integers or slices, not str
+        swap_out_loop.main()
+
+        mock_logger.info.assert_called_once()
+        log_call_msg = mock_logger.info.call_args[0][0]
+        assert "block-iad-1 + 1 more" in log_call_msg
+        assert "896468114071224320,1028289662652973056" in log_call_msg

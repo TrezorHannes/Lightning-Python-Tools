@@ -934,7 +934,10 @@ def interactive_menu_select(
 
         if selected_indices:
             sel_list = [candidates[i] for i in sorted(selected_indices)]
-            comb_amt = sum(c["proposed_amt"] for c in sel_list)
+            if target_amt and target_amt > 0:
+                comb_amt = min(target_amt, sum(c["proposed_amt"] for c in sel_list))
+            else:
+                comb_amt = sum(c["proposed_amt"] for c in sel_list)
             comb_cost = sum(c["total_cost"] for c in sel_list)
             comb_ppm = round((comb_cost / comb_amt) * 1_000_000) if comb_amt > 0 else 0
             print_color(
@@ -1515,7 +1518,7 @@ def main():
         total_cost = sel["total_cost"]
     else:
         chan_ids = [c["chan_id"] for c in selected_channels]
-        alias_str = f"{selected_channels[0]['alias']} + {len(selected_channels) - 1} more ({len(selected_channels)} chans)"
+        alias_str = f"{selected_channels[0]['alias']} + {len(selected_channels) - 1} more"
         if args.amt and args.amt > 0:
             total_swap_amt = min(args.amt, sum(c["proposed_amt"] for c in selected_channels))
         else:
@@ -1562,9 +1565,10 @@ def main():
     )
 
     if res.get("success"):
+        chan_ids_str = ",".join(str(c) for c in chan_ids) if isinstance(chan_ids, list) else str(chan_ids)
         logger.info(
-            f"Swap initiated for {selected['alias']} ({selected['chan_id']}): "
-            f"amt={selected['proposed_amt']} sats, total_cost={selected['total_cost']} sats"
+            f"Swap initiated for {alias_str} ({chan_ids_str}): "
+            f"amt={total_swap_amt} sats, total_cost={total_cost} sats"
         )
 
         if not args.dry_run:
