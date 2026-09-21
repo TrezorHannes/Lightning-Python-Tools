@@ -23,11 +23,16 @@ Rather than simply finding channels with high local balances, `swap_out-loop.py`
   - **Direct 2-Hop Route Fallback**: If multi-hop routes fail due to intermediate bottlenecks or dead gossip nodes, the tool automatically checks if the candidate peer maintains a direct channel to the Loop node (`021c97a9...`), constructing the route via `lncli buildroute` and probing it with `lncli sendtoroute` to accurately capture the exact verified route fee.
 - **Concurrent Worker Probing (`--workers <N>`)**:
   - Probes candidates sequentially by default for zero downstream HTLC collision, or in parallel via `--workers 2` using `ThreadPoolExecutor` with thread-safe output formatting, cutting scanning time in half.
-- **Interactive Terminal UI (Arrow-Key Navigation)**:
+- **Multi-Channel Outgoing Pooling (`--max-channels <N>`)**:
+  - Pools surplus local liquidity across multiple channels when target amount exceeds individual channel capacity (e.g., pooling 3M + 3M + 2M to execute a single 8M swap).
+  - Passes comma-separated channel IDs directly to `litloop out --channel <id1>,<id2>...` (native Loop daemon feature).
+  - Bypasses single-channel bottlenecks, avoids stranded prepayments if a single peer experiences churn or mass channel closures, and optimizes routing path diversity.
+- **Interactive Terminal UI with Multi-Select**:
   - Native Python implementation (`termios` and `tty`) with zero Node/npm/npx dependencies.
   - Navigate candidates with `↑` / `↓` (or `k` / `j`) arrow keys, showing real-time highlighted selection and cost breakdown.
-  - Press `[Enter]` to select and confirm, or `[q]` / `[Esc]` to abort.
-  - Automatically falls back to a clean PrettyTable and numbered prompt in non-interactive/piped environments.
+  - Press `[Space]` to toggle individual channels (`[✓]`), `[a]` to toggle all up to `--max-channels`, and `[Enter]` to confirm the batch.
+  - Displays dynamic combined swap size and aggregate PPM in real time.
+  - Automatically falls back to greedy batching and clean PrettyTable in non-interactive/piped environments.
 - **Economical Sweep Timing**:
   - Enforces a minimum confirmation target of 6 blocks (default: 9) to prevent overpaying for fast on-chain sweeps.
   - Omits `--fast` so Loop's swap server batches the on-chain HTLC publication, reducing chain fees.
@@ -120,7 +125,13 @@ python3 Other/swap_out-loop.py --capacity 5000000 --fee-limit 50 --min-ratio 70
 # Sweeping to an external cold-storage address with custom 12-block confirmation target
 python3 Other/swap_out-loop.py --amt 3000000 --conf-target 12 --dest-addr bc1q...
 
-# Non-interactive / headless automation (automatically selects top-ranked candidate)
+# Multi-channel batching (e.g., pooling multiple channels up to 8M total)
+python3 Other/swap_out-loop.py --amt 8000000 --max-channels 3
+
+# Target specific outgoing channels directly
+python3 Other/swap_out-loop.py --channel 1055691691402854401,896468114071224320 --amt 8000000
+
+# Non-interactive / headless automation (automatically selects top-ranked candidate or greedy batch)
 python3 Other/swap_out-loop.py --amt 2000000 --auto-approve
 
 # View historical loop-out operations from Loop's SOT database
@@ -144,6 +155,8 @@ python3 Other/swap_out-loop.py --history --csv
 | `--skip-prepay-probe` | `flag` | `False` | Skip active prepay probing and rely on queryroutes theoretical fees (not recommended). |
 | `--max-routing-fee`| `int` | Leeway buffer | Upper limit on off-chain routing fees in satoshis. Set to 0 to omit fee limit (uses Loop daemon default). |
 | `--fee-leeway-pct` | `float`| Config / `100%` | Percentage leeway added on top of probed routing fee for max off-chain fee budget (e.g. 100 = 2x headroom). |
+| `--max-channels` | `int` | Config / `3` | Maximum number of outgoing channels to batch in a multi-channel Loop Out. |
+| `--channel`, `--channels` | `str` | `None` | Comma-separated list of short channel IDs to target directly. |
 | `--dest-addr` | `str` | LND wallet | Custom destination address for swept on-chain funds. |
 | `--dry-run` | `flag` | `False` | Simulates candidate selection, live quotes, and route probes without executing. |
 | `--auto-approve` | `flag` | `False` | Automatically executes the top-ranked candidate without interactive prompt. |

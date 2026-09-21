@@ -30,7 +30,7 @@ import configparser
 import sqlite3
 import csv
 import logging
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Union
 import requests
 from prettytable import PrettyTable
 
@@ -248,12 +248,13 @@ def filter_and_size_candidates(
             continue
 
         # Dynamic or fixed sizing
+        reserve = max(100_000, int(capacity * 0.05))
+        drainable_surplus = max(0, local_balance - reserve)
+
         if target_amt is not None and target_amt > 0:
-            proposed_amt = target_amt
-            # Verify channel has sufficient liquidity leaving reasonable reserve (5% or 100k)
-            reserve = max(100_000, int(capacity * 0.05))
-            if local_balance - proposed_amt < reserve:
+            if drainable_surplus < MIN_LOOP_OUT_SATS:
                 continue
+            proposed_amt = min(target_amt, drainable_surplus)
         else:
             # Rebalance channel down to target equilibrium ratio (e.g. 50%)
             target_local_balance = int(capacity * (target_local_ratio / 100.0))
@@ -274,6 +275,7 @@ def filter_and_size_candidates(
             "local_ratio": local_ratio,
             "local_fee_rate": local_fee_rate,
             "proposed_amt": proposed_amt,
+            "drainable_surplus": drainable_surplus,
         }
         candidates.append(candidate)
 
@@ -822,20 +824,45 @@ def print_candidates_table(candidates: List[Dict[str, Any]]) -> None:
     print(table)
 
 
-def interactive_menu_select(candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def interactive_menu_select(
+    candidates: List[Dict[str, Any]],
+    target_amt: Optional[int] = None,
+    max_channels: int = 3,
+) -> Optional[Union[Dict[str, Any], List[Dict[str, Any]]]]:
     """
-    Renders an interactive CLI terminal menu with arrow-key navigation.
-    Falls back to text input if terminal is non-interactive.
+    Renders an interactive CLI terminal menu with arrow-key navigation,
+    Spacebar multi-select toggling, and greedy batching fallback.
     """
     if not candidates:
         return None
 
     if not sys.stdin.isatty():
+        # If target_amt is specified and exceeds first candidate's drainable surplus,
+        # greedily pool top candidates to meet target_amt up to max_channels.
+        first_cand_capacity = candidates[0].get("drainable_surplus", candidates[0]["proposed_amt"])
+        if target_amt is not None and target_amt > first_cand_capacity:
+            batch = []
+            accumulated = 0
+            for c in candidates:
+                batch.append(c)
+                accumulated += c.get("drainable_surplus", c.get("proposed_amt", 0))
+                if accumulated >= target_amt or len(batch) >= max_channels:
+                    break
+            if len(batch) > 1:
+                return batch
+
         # Non-interactive fallback
         print("\nAvailable Candidates:")
         print_candidates_table(candidates)
         try:
-            choice = input(f"\nSelect candidate [1-{len(candidates)}] or [q] to cancel: ").strip().lower()
+            prompt_msg = f"\nSelect candidate [1-{len(candidates)}] (comma-separated for multi) or [q] to cancel: "
+            choice = input(prompt_msg).strip().lower()
+            if not choice or choice == "q":
+                return None
+            if "," in choice:
+                indices = [int(x.strip()) - 1 for x in choice.split(",") if x.strip().isdigit()]
+                valid = [candidates[i] for i in indices if 0 <= i < len(candidates)]
+                return valid if valid else None
             if choice.isdigit() and 1 <= int(choice) <= len(candidates):
                 return candidates[int(choice) - 1]
         except (EOFError, KeyboardInterrupt):
@@ -844,12 +871,16 @@ def interactive_menu_select(candidates: List[Dict[str, Any]]) -> Optional[Dict[s
 
     current_idx = 0
     total = len(candidates)
+    selected_indices = set()
 
     while True:
         # Clear screen segment and render
-        print("\033[2J\033[H", end="")  # Clear screen and move to top-left
+        print("[2J[H", end="")  # Clear screen and move to top-left
         print_color("=== Lightning Loop Out - Economic Channel Selection ===", Colors.HEADER, bold=True)
-        print_color("Use [↑/k] and [↓/j] to navigate, [Enter] to select, [q] to cancel.\n", Colors.OKCYAN)
+        print_color(
+            "Use [↑/k] & [↓/j] to navigate, [Space] to toggle multi-channel, [a] toggle all, [Enter] to select, [q] to cancel.\n",
+            Colors.OKCYAN,
+        )
 
         table = PrettyTable()
         table.field_names = [
@@ -870,11 +901,15 @@ def interactive_menu_select(candidates: List[Dict[str, Any]]) -> Optional[Dict[s
         table.align["Sel"] = "c"
 
         for idx, c in enumerate(candidates):
-            is_selected = idx == current_idx
-            sel_mark = "▶" if is_selected else " "
+            is_active_cursor = idx == current_idx
+            is_checked = idx in selected_indices
+
+            cursor_mark = "▶" if is_active_cursor else " "
+            check_mark = "[✓]" if is_checked else "[ ]"
+            sel_display = f"{cursor_mark} {check_mark}"
 
             row = [
-                sel_mark,
+                sel_display,
                 c["alias"][:20],
                 c["chan_id"],
                 f"{c['local_ratio']:.1f}%",
@@ -887,30 +922,62 @@ def interactive_menu_select(candidates: List[Dict[str, Any]]) -> Optional[Dict[s
                 f"{c['effective_ppm']:,}",
             ]
 
-            if is_selected:
+            if is_active_cursor:
                 # Highlight active row in color
                 row = [f"{Colors.OKGREEN}{Colors.BOLD}{val}{Colors.ENDC}" for val in row]
+            elif is_checked:
+                row = [f"{Colors.OKCYAN}{val}{Colors.ENDC}" for val in row]
             table.add_row(row)
 
         print(table)
         print()
-        selected_cand = candidates[current_idx]
-        print_color(
-            f"Active: {selected_cand['alias']} | Swap: {selected_cand['proposed_amt']:,} sats | Total Cost: {selected_cand['total_cost']:,} sats ({selected_cand['effective_ppm']} ppm)",
-            Colors.OKBLUE,
-            bold=True,
-        )
+
+        if selected_indices:
+            sel_list = [candidates[i] for i in sorted(selected_indices)]
+            comb_amt = sum(c["proposed_amt"] for c in sel_list)
+            comb_cost = sum(c["total_cost"] for c in sel_list)
+            comb_ppm = round((comb_cost / comb_amt) * 1_000_000) if comb_amt > 0 else 0
+            print_color(
+                f"Multi-Select Active ({len(selected_indices)} chans): Combined Size {comb_amt:,} sats | Est Total Cost: {comb_cost:,} sats ({comb_ppm} ppm)",
+                Colors.OKGREEN,
+                bold=True,
+            )
+            print_color("Press [Enter] to execute multi-channel swap with selected channels.", Colors.OKBLUE)
+        else:
+            selected_cand = candidates[current_idx]
+            print_color(
+                f"Active: {selected_cand['alias']} | Swap: {selected_cand['proposed_amt']:,} sats | Total Cost: {selected_cand['total_cost']:,} sats ({selected_cand['effective_ppm']} ppm)",
+                Colors.OKBLUE,
+                bold=True,
+            )
 
         key = read_single_keypress()
-        if key in ("\x1b[A", "k", "K"):  # Up
+        if key in ("[A", "k", "K"):  # Up
             current_idx = (current_idx - 1) % total
-        elif key in ("\x1b[B", "j", "J"):  # Down
+        elif key in ("[B", "j", "J"):  # Down
             current_idx = (current_idx + 1) % total
-        elif key in ("\r", "\n", " "):  # Enter or Space to select
+        elif key == " ":  # Space toggles selection
+            if current_idx in selected_indices:
+                selected_indices.remove(current_idx)
+            else:
+                if len(selected_indices) < max_channels:
+                    selected_indices.add(current_idx)
+                else:
+                    print_color(f"Max channels ({max_channels}) reached!", Colors.WARNING)
+                    time.sleep(0.3)
+        elif key in ("a", "A"):  # Toggle all up to max_channels
+            if len(selected_indices) == min(total, max_channels):
+                selected_indices.clear()
+            else:
+                selected_indices = set(range(min(total, max_channels)))
+        elif key in ("\r", "\n"):  # Enter to confirm
+            if selected_indices:
+                return [candidates[i] for i in sorted(selected_indices)]
             return candidates[current_idx]
         elif key in ("q", "Q", "\x1b"):  # Quit or Escape
             print_color("\nLoop Out selection cancelled.", Colors.WARNING)
             return None
+
 
 
 def calculate_max_routing_fee_budget(
@@ -950,7 +1017,7 @@ def calculate_max_routing_fee_budget(
 
 def execute_loop_out(
     config: Any,
-    channel_id: str,
+    channel_id: Union[str, List[str]],
     amt: int,
     conf_target: int = 9,
     max_routing_fee: int = 0,
@@ -958,13 +1025,23 @@ def execute_loop_out(
     alias: str = "",
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """Initiates the Loop Out swap using litloop / loop, tagging with label."""
-    label = f"Loop-Out: {alias} ({channel_id})" if alias else f"Loop-Out: {channel_id}"
+    """
+    Executes litloop out / loop out with specified channel(s), amount, conf_target, and fees.
+    channel_id can be a single short channel ID string or a list of channel IDs.
+    """
+    if isinstance(channel_id, list):
+        chan_arg = ",".join(str(c) for c in channel_id)
+        chan_label = f"{len(channel_id)} chans"
+    else:
+        chan_arg = str(channel_id)
+        chan_label = chan_arg
+
+    label = f"Loop-Out: {alias} ({chan_label})" if alias else f"Loop-Out: {chan_label}"
     if dry_run:
         fake_swap_id = "dry-run-swap-" + binascii.hexlify(os.urandom(16)).decode()
         fee_arg = f" --max_swap_routing_fee {max_routing_fee}" if max_routing_fee > 0 else ""
         print_color(
-            f'  Command: litloop out --amt {amt} --channel {channel_id} --conf_target {conf_target} --label "{label}" --force{fee_arg}',
+            f'  Command: litloop out --amt {amt} --channel {chan_arg} --conf_target {conf_target} --label "{label}" --force{fee_arg}',
             Colors.WARNING,
         )
         return {"success": True, "swap_id": fake_swap_id, "dry_run": True}
@@ -975,7 +1052,7 @@ def execute_loop_out(
         "--amt",
         str(amt),
         "--channel",
-        str(channel_id),
+        chan_arg,
         "--conf_target",
         str(conf_target),
         "--label",
@@ -1146,6 +1223,19 @@ def parse_arguments() -> argparse.Namespace:
         type=str,
         default=None,
         help="Custom on-chain Bitcoin address for swept funds (defaults to LND internal wallet).",
+    )
+    parser.add_argument(
+        "--max-channels",
+        type=int,
+        default=None,
+        help="Maximum number of outgoing channels to batch in a multi-channel Loop Out (default from config or 3).",
+    )
+    parser.add_argument(
+        "--channel",
+        "--channels",
+        type=str,
+        default=None,
+        help="Optional comma-separated list of short channel IDs to target directly.",
     )
     parser.add_argument(
         "-w",
@@ -1319,6 +1409,11 @@ def main():
         blacklist=blacklist,
     )
 
+    target_channel_ids = []
+    if getattr(args, "channel", None):
+        target_channel_ids = [c.strip() for c in args.channel.split(",") if c.strip()]
+        candidates = [c for c in candidates if c["chan_id"] in target_channel_ids]
+
     if not candidates:
         print_color("No suitable candidate channels found matching criteria.", Colors.WARNING)
         sys.exit(0)
@@ -1379,31 +1474,73 @@ def main():
     evaluated_candidates.sort(key=lambda x: x["effective_ppm"])
 
     # Selection
+    max_channels = args.max_channels or config.getint("loop", "max_channels", fallback=3)
     selected = None
     if args.auto_approve:
         print("\nEvaluated Candidates:")
         print_candidates_table(evaluated_candidates)
-        selected = evaluated_candidates[0]
-        print_color(f"\nAuto-approved top candidate: {selected['alias']} ({selected['chan_id']})", Colors.OKGREEN, bold=True)
+        top_cap = evaluated_candidates[0].get("drainable_surplus", evaluated_candidates[0]["proposed_amt"])
+        if args.amt and args.amt > top_cap:
+            batch = []
+            acc = 0
+            for c in evaluated_candidates:
+                batch.append(c)
+                acc += c.get("drainable_surplus", c.get("proposed_amt", 0))
+                if acc >= args.amt or len(batch) >= max_channels:
+                    break
+            selected = batch
+        else:
+            selected = evaluated_candidates[0]
+
+        if isinstance(selected, list):
+            aliases = ", ".join(c["alias"] for c in selected)
+            print_color(f"\nAuto-approved batch of {len(selected)} candidates: {aliases}", Colors.OKGREEN, bold=True)
+        else:
+            print_color(f"\nAuto-approved top candidate: {selected['alias']} ({selected['chan_id']})", Colors.OKGREEN, bold=True)
     else:
-        selected = interactive_menu_select(evaluated_candidates)
+        selected = interactive_menu_select(evaluated_candidates, target_amt=args.amt, max_channels=max_channels)
 
     if not selected:
         print_color("Operation cancelled. No swap initiated.", Colors.WARNING)
         sys.exit(0)
 
+    selected_channels = [selected] if isinstance(selected, dict) else selected
+
+    if len(selected_channels) == 1:
+        sel = selected_channels[0]
+        chan_ids = sel["chan_id"]
+        alias_str = sel["alias"]
+        total_swap_amt = sel["proposed_amt"]
+        probed_routing_fee = sel["routing_fee"]
+        total_cost = sel["total_cost"]
+    else:
+        chan_ids = [c["chan_id"] for c in selected_channels]
+        alias_str = f"{selected_channels[0]['alias']} + {len(selected_channels) - 1} more ({len(selected_channels)} chans)"
+        if args.amt and args.amt > 0:
+            total_swap_amt = min(args.amt, sum(c["proposed_amt"] for c in selected_channels))
+        else:
+            total_swap_amt = sum(c["proposed_amt"] for c in selected_channels)
+        total_swap_amt = min(total_swap_amt, MAX_LOOP_OUT_SATS)
+        probed_routing_fee = sum(c["routing_fee"] for c in selected_channels)
+        total_cost = sum(c["total_cost"] for c in selected_channels)
+
+        print_color(f"\nMulti-Channel Loop Out Batch Selected ({len(selected_channels)} channels):", Colors.OKGREEN, bold=True)
+        for idx, sc in enumerate(selected_channels, 1):
+            print(f"  [{idx}] {sc['alias']} ({sc['chan_id']}): {sc['proposed_amt']:,} sats (Route: {sc['routing_fee']:,} sat, Net PPM: {sc['effective_ppm']})")
+        print(f"  Combined Swap Size: {total_swap_amt:,} sats")
+
     # Max routing fee budget with configurable leeway
     max_rf = calculate_max_routing_fee_budget(
-        probed_routing_fee=selected["routing_fee"],
+        probed_routing_fee=probed_routing_fee,
         config=config,
         explicit_max_routing_fee=args.max_routing_fee,
         explicit_leeway_pct=args.fee_leeway_pct,
     )
 
     if max_rf > 0:
-        buffer_sats = max_rf - selected["routing_fee"]
+        buffer_sats = max_rf - probed_routing_fee
         print_color(
-            f"Routing Fee Budget: {max_rf:,} sats (Probed: {selected['routing_fee']:,} sats + {buffer_sats:,} sat leeway)",
+            f"Routing Fee Budget: {max_rf:,} sats (Probed: {probed_routing_fee:,} sats + {buffer_sats:,} sat leeway)",
             Colors.OKCYAN,
         )
     else:
@@ -1415,12 +1552,12 @@ def main():
     # Execute
     res = execute_loop_out(
         config=config,
-        channel_id=selected["chan_id"],
-        amt=selected["proposed_amt"],
+        channel_id=chan_ids,
+        amt=total_swap_amt,
         conf_target=conf_target,
         max_routing_fee=max_rf,
         dest_addr=args.dest_addr,
-        alias=selected["alias"],
+        alias=alias_str,
         dry_run=args.dry_run,
     )
 

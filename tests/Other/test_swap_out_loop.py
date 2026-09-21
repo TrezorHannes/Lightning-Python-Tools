@@ -572,3 +572,147 @@ def test_calculate_max_routing_fee_budget_cli_leeway_override():
     )
     # 20,000 * 3.0 + 500 = 60,500
     assert budget == 60_500
+
+
+def test_filter_and_size_candidates_multi_channel_pooling(sample_channels):
+    """Verify channels with drainable surplus qualify when target_amt exceeds single channel capacity."""
+    blacklist = ["02blacklist1111111111111111111111111111111111111111111111111111111"]
+    # User requests 15,000,000 sats (no single channel in sample_channels has 15M)
+    candidates = swap_out_loop.filter_and_size_candidates(
+        channels=sample_channels,
+        target_amt=15_000_000,
+        min_capacity=3_000_000,
+        max_fee_rate=500,
+        min_local_ratio=60.0,
+        blacklist=blacklist,
+    )
+    # Both Cheap (8.5M local) and Expensive (9M local) have drainable surplus >= 250k sats
+    assert len(candidates) == 2
+    for c in candidates:
+        assert c["drainable_surplus"] >= 8_000_000
+        assert c["proposed_amt"] <= 15_000_000
+
+
+def test_execute_loop_out_multi_channel_list():
+    """Verify execute_loop_out accepts a list of channel IDs and formats comma-separated argument."""
+    res = swap_out_loop.execute_loop_out(
+        config={},
+        channel_id=["1055691691402854401", "896468114071224320"],
+        amt=8_000_000,
+        conf_target=9,
+        max_routing_fee=40_000,
+        alias="Sunny Sarah ☀️ + 1 more (2 chans)",
+        dry_run=True,
+    )
+    assert res["success"] is True
+    assert "dry-run-swap-" in res["swap_id"]
+
+
+def test_interactive_menu_select_multi_channel_non_tty():
+    """Verify non-TTY interactive_menu_select returns greedy batch when target_amt exceeds single channel."""
+    candidates = [
+        {
+            "chan_id": "111",
+            "alias": "Node-1",
+            "proposed_amt": 4_000_000,
+            "drainable_surplus": 4_000_000,
+            "local_ratio": 90.0,
+            "server_fee": 1000,
+            "onchain_fee": 150,
+            "routing_fee": 1000,
+            "opportunity_cost": 0,
+            "total_cost": 2150,
+            "effective_ppm": 537,
+        },
+        {
+            "chan_id": "222",
+            "alias": "Node-2",
+            "proposed_amt": 4_000_000,
+            "drainable_surplus": 4_000_000,
+            "local_ratio": 85.0,
+            "server_fee": 1000,
+            "onchain_fee": 150,
+            "routing_fee": 1200,
+            "opportunity_cost": 0,
+            "total_cost": 2350,
+            "effective_ppm": 587,
+        },
+        {
+            "chan_id": "333",
+            "alias": "Node-3",
+            "proposed_amt": 4_000_000,
+            "drainable_surplus": 4_000_000,
+            "local_ratio": 80.0,
+            "server_fee": 1000,
+            "onchain_fee": 150,
+            "routing_fee": 2000,
+            "opportunity_cost": 0,
+            "total_cost": 3150,
+            "effective_ppm": 787,
+        },
+    ]
+
+    # When target_amt is 7,000,000, first channel alone (4M) is not enough.
+    # Non-TTY greedy batching should return 2 channels (111 and 222).
+    selected = swap_out_loop.interactive_menu_select(candidates, target_amt=7_000_000, max_channels=3)
+    assert selected is not None
+    assert isinstance(selected, list)
+    assert len(selected) == 2
+    assert selected[0]["chan_id"] == "111"
+    assert selected[1]["chan_id"] == "222"
+
+
+def test_parse_arguments_multi_channel():
+    """Verify --max-channels and --channel CLI arguments parse correctly."""
+    with patch("sys.argv", ["swap_out-loop.py", "--max-channels", "4", "--channel", "111,222"]):
+        args = swap_out_loop.parse_arguments()
+        assert args.max_channels == 4
+        assert args.channel == "111,222"
+
+
+def test_interactive_menu_select_multi_channel_comma_input():
+    """Verify non-TTY interactive_menu_select handles comma-separated manual input."""
+    candidates = [
+        {"chan_id": "111", "alias": "Node-1", "proposed_amt": 2_000_000, "drainable_surplus": 2_000_000, "local_ratio": 80.0, "server_fee": 500, "onchain_fee": 150, "routing_fee": 100, "opportunity_cost": 0, "total_cost": 750, "effective_ppm": 375},
+        {"chan_id": "222", "alias": "Node-2", "proposed_amt": 2_000_000, "drainable_surplus": 2_000_000, "local_ratio": 75.0, "server_fee": 500, "onchain_fee": 150, "routing_fee": 150, "opportunity_cost": 0, "total_cost": 800, "effective_ppm": 400},
+        {"chan_id": "333", "alias": "Node-3", "proposed_amt": 2_000_000, "drainable_surplus": 2_000_000, "local_ratio": 70.0, "server_fee": 500, "onchain_fee": 150, "routing_fee": 200, "opportunity_cost": 0, "total_cost": 850, "effective_ppm": 425},
+    ]
+    with patch("sys.stdin.isatty", return_value=False):
+        with patch("builtins.input", return_value="1,3"):
+            selected = swap_out_loop.interactive_menu_select(candidates, target_amt=None, max_channels=3)
+            assert isinstance(selected, list)
+            assert len(selected) == 2
+            assert selected[0]["chan_id"] == "111"
+            assert selected[1]["chan_id"] == "333"
+
+
+def test_execute_loop_out_multi_channel_real_command():
+    """Verify execute_loop_out formats command arguments correctly for real execution."""
+    with patch.object(swap_out_loop, "resolve_loop_command", return_value=["litloop"]):
+        with patch.object(swap_out_loop, "run_command", return_value=(True, "Swap initiated: 12345", None)) as mock_run:
+            res = swap_out_loop.execute_loop_out(
+                config={},
+                channel_id=["111", "222"],
+                amt=6_000_000,
+                conf_target=9,
+                max_routing_fee=1500,
+                dest_addr="bc1qtestaddr",
+                alias="Multi-Peer",
+                dry_run=False,
+            )
+            assert res["success"] is True
+            assert res["swap_id"] == "12345"
+            mock_run.assert_called_once()
+            called_cmd = mock_run.call_args[0][0]
+            assert "--channel" in called_cmd
+            chan_idx = called_cmd.index("--channel")
+            assert called_cmd[chan_idx + 1] == "111,222"
+            assert "--amt" in called_cmd
+            amt_idx = called_cmd.index("--amt")
+            assert called_cmd[amt_idx + 1] == "6000000"
+            assert "--max_swap_routing_fee" in called_cmd
+            fee_idx = called_cmd.index("--max_swap_routing_fee")
+            assert called_cmd[fee_idx + 1] == "1500"
+            assert "--addr" in called_cmd
+            addr_idx = called_cmd.index("--addr")
+            assert called_cmd[addr_idx + 1] == "bc1qtestaddr"
