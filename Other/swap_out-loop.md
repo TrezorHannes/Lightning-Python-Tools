@@ -91,6 +91,10 @@ target_local_ratio = 50
 workers = 1
 # Timeout in seconds for individual route prepay probes (default: 15)
 probe_timeout = 15
+# Percentage leeway added on top of probed routing fee for max off-chain fee limit (default: 100 for +100% / 2x headroom)
+fee_leeway_pct = 100
+# Base satoshis buffer added to fee leeway to absorb base fees and small fluctuations (default: 500)
+fee_leeway_base_sats = 500
 ```
 
 ---
@@ -138,7 +142,8 @@ python3 Other/swap_out-loop.py --history --csv
 | `-w`, `--workers` | `int` | Config / `1` | Number of concurrent worker threads for route probing (recommended: `1` or `2`). |
 | `--probe-timeout` | `int` | Config / `15` | Timeout in seconds for individual route prepay probes. |
 | `--skip-prepay-probe` | `flag` | `False` | Skip active prepay probing and rely on queryroutes theoretical fees (not recommended). |
-| `--max-routing-fee`| `int` | Auto buffer | Upper limit on off-chain routing fees in satoshis. |
+| `--max-routing-fee`| `int` | Leeway buffer | Upper limit on off-chain routing fees in satoshis. Set to 0 to omit fee limit (uses Loop daemon default). |
+| `--fee-leeway-pct` | `float`| Config / `100%` | Percentage leeway added on top of probed routing fee for max off-chain fee budget (e.g. 100 = 2x headroom). |
 | `--dest-addr` | `str` | LND wallet | Custom destination address for swept on-chain funds. |
 | `--dry-run` | `flag` | `False` | Simulates candidate selection, live quotes, and route probes without executing. |
 | `--auto-approve` | `flag` | `False` | Automatically executes the top-ranked candidate without interactive prompt. |

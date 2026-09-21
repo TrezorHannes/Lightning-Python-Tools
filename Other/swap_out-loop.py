@@ -913,6 +913,41 @@ def interactive_menu_select(candidates: List[Dict[str, Any]]) -> Optional[Dict[s
             return None
 
 
+def calculate_max_routing_fee_budget(
+    probed_routing_fee: int,
+    config: Any,
+    explicit_max_routing_fee: Optional[int] = None,
+    explicit_leeway_pct: Optional[float] = None,
+) -> int:
+    """
+    Calculates the max off-chain routing fee budget to pass to loop out.
+    - If explicit_max_routing_fee is 0, returns 0 (unbounded / loop daemon default).
+    - If explicit_max_routing_fee > 0, returns that exact satoshi cap.
+    - Otherwise applies percentage leeway (default 100% / 2.0x) plus base satoshi buffer (default 500).
+    """
+    if explicit_max_routing_fee is not None and explicit_max_routing_fee == 0:
+        return 0
+    if explicit_max_routing_fee is not None and explicit_max_routing_fee > 0:
+        return explicit_max_routing_fee
+
+    leeway_pct = (
+        explicit_leeway_pct
+        if explicit_leeway_pct is not None
+        else (
+            config.getfloat("loop", "fee_leeway_pct", fallback=100.0)
+            if hasattr(config, "getfloat")
+            else 100.0
+        )
+    )
+    base_buffer = (
+        config.getint("loop", "fee_leeway_base_sats", fallback=500)
+        if hasattr(config, "getint")
+        else 500
+    )
+    multiplier = 1.0 + (max(0.0, leeway_pct) / 100.0)
+    return int(probed_routing_fee * multiplier) + base_buffer
+
+
 def execute_loop_out(
     config: Any,
     channel_id: str,
@@ -927,9 +962,9 @@ def execute_loop_out(
     label = f"Loop-Out: {alias} ({channel_id})" if alias else f"Loop-Out: {channel_id}"
     if dry_run:
         fake_swap_id = "dry-run-swap-" + binascii.hexlify(os.urandom(16)).decode()
-        print_color(f"\n[DRY RUN] Simulated litloop out execution for channel {channel_id}:", Colors.WARNING, bold=True)
+        fee_arg = f" --max_swap_routing_fee {max_routing_fee}" if max_routing_fee > 0 else ""
         print_color(
-            f'  Command: litloop out --amt {amt} --channel {channel_id} --conf_target {conf_target} --label "{label}" --force',
+            f'  Command: litloop out --amt {amt} --channel {channel_id} --conf_target {conf_target} --label "{label}" --force{fee_arg}',
             Colors.WARNING,
         )
         return {"success": True, "swap_id": fake_swap_id, "dry_run": True}
@@ -1097,8 +1132,14 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--max-routing-fee",
         type=int,
-        default=0,
-        help="Maximum off-chain swap routing fee in satoshis.",
+        default=None,
+        help="Maximum off-chain swap routing fee in satoshis. If 0, no fee limit is enforced (uses loop daemon default).",
+    )
+    parser.add_argument(
+        "--fee-leeway-pct",
+        type=float,
+        default=None,
+        help="Percentage leeway added on top of probed routing fee for max off-chain fee limit (default from config or 100%%).",
     )
     parser.add_argument(
         "--dest-addr",
@@ -1351,8 +1392,25 @@ def main():
         print_color("Operation cancelled. No swap initiated.", Colors.WARNING)
         sys.exit(0)
 
-    # Max routing fee budget
-    max_rf = args.max_routing_fee or int(selected["routing_fee"] * 1.5) + 50
+    # Max routing fee budget with configurable leeway
+    max_rf = calculate_max_routing_fee_budget(
+        probed_routing_fee=selected["routing_fee"],
+        config=config,
+        explicit_max_routing_fee=args.max_routing_fee,
+        explicit_leeway_pct=args.fee_leeway_pct,
+    )
+
+    if max_rf > 0:
+        buffer_sats = max_rf - selected["routing_fee"]
+        print_color(
+            f"Routing Fee Budget: {max_rf:,} sats (Probed: {selected['routing_fee']:,} sats + {buffer_sats:,} sat leeway)",
+            Colors.OKCYAN,
+        )
+    else:
+        print_color(
+            "Routing Fee Budget: Unbounded (using Loop daemon default limit)",
+            Colors.OKCYAN,
+        )
 
     # Execute
     res = execute_loop_out(
