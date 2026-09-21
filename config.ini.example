@@ -120,6 +120,8 @@ probe_timeout = 15
 fee_leeway_pct = 100
 # Base satoshis buffer added to fee leeway to absorb base fees and small fluctuations (default: 500)
 fee_leeway_base_sats = 500
+# Maximum number of outgoing channels to batch in a multi-channel Loop Out (default: 3)
+max_channels = 3
 # Loop daemon connection parameters (used if loop_command is 'loop' instead of 'litloop')
 # rpcserver = localhost:8443
 # tlscertpath = ~/.lit/tls.cert
