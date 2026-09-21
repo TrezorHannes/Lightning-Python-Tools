@@ -23,15 +23,17 @@ Rather than simply finding channels with high local balances, `swap_out-loop.py`
   - **Direct 2-Hop Route Fallback**: If multi-hop routes fail due to intermediate bottlenecks or dead gossip nodes, the tool automatically checks if the candidate peer maintains a direct channel to the Loop node (`021c97a9...`), constructing the route via `lncli buildroute` and probing it with `lncli sendtoroute` to accurately capture the exact verified route fee.
 - **Concurrent Worker Probing (`--workers <N>`)**:
   - Probes candidates sequentially by default for zero downstream HTLC collision, or in parallel via `--workers 2` using `ThreadPoolExecutor` with thread-safe output formatting, cutting scanning time in half.
-- **Multi-Channel Outgoing Pooling (`--max-channels <N>`)**:
-  - Pools surplus local liquidity across multiple channels when target amount exceeds individual channel capacity (e.g., pooling 3M + 3M + 2M to execute a single 8M swap).
+- **Multi-Channel Outbound Candidates & Route Diversity (`--channel <id1>,<id2>...`, `--max-channels <N>`)**:
+  - Fixed Net Swap Size: The defined swap amount (`--amt`, e.g. 3,000,000 sats) remains fixed as the total swap volume. Activating multiple channels provides LND with multiple outbound route options and enables Multi-Path Payments (MPP) across chosen peers.
+  - Cost & PPM Range: Dynamically calculates and displays the effective cost range (from the cheapest candidate's PPM up to the most expensive candidate's PPM, e.g. `3,569 – 4,570 ppm`), keeping fee expectations realistic regardless of which path LND selects.
+  - Bounded Routing Fee Budget: Calculates the off-chain fee ceiling from the most expensive selected outbound candidate (`max(probed_routing_fee) + leeway`), ensuring LND has sufficient fee room without overpaying.
   - Passes comma-separated channel IDs directly to `litloop out --channel <id1>,<id2>...` (native Loop daemon feature).
   - Bypasses single-channel bottlenecks, avoids stranded prepayments if a single peer experiences churn or mass channel closures, and optimizes routing path diversity.
 - **Interactive Terminal UI with Multi-Select**:
   - Native Python implementation (`termios` and `tty`) with zero Node/npm/npx dependencies.
   - Navigate candidates with `↑` / `↓` (or `k` / `j`) arrow keys, showing real-time highlighted selection and cost breakdown.
   - Press `[Space]` to toggle individual channels (`[✓]`), `[a]` to toggle all up to `--max-channels`, and `[Enter]` to confirm the batch.
-  - Displays dynamic combined swap size and aggregate PPM in real time.
+  - Displays live fixed swap size, PPM range (`min – max ppm`), and estimated cost range in real time.
   - Automatically falls back to greedy batching and clean PrettyTable in non-interactive/piped environments.
 - **Economical Sweep Timing**:
   - Enforces a minimum confirmation target of 6 blocks (default: 9) to prevent overpaying for fast on-chain sweeps.

@@ -779,3 +779,72 @@ def test_main_multi_channel_logging_success():
         log_call_msg = mock_logger.info.call_args[0][0]
         assert "block-iad-1 + 1 more" in log_call_msg
         assert "896468114071224320,1028289662652973056" in log_call_msg
+
+
+def test_multi_channel_fixed_amount_and_max_fee_budget():
+    """Verify that multi-channel execution keeps target_amt fixed and bases fee budget on max route fee."""
+    mock_candidates = [
+        {
+            "chan_id": "896468114071224320",
+            "alias": "block-iad-1",
+            "proposed_amt": 3_000_000,
+            "drainable_surplus": 3_000_000,
+            "local_ratio": 99.0,
+            "server_fee": 3049,
+            "onchain_fee": 163,
+            "routing_fee": 7494,
+            "opportunity_cost": 0,
+            "total_cost": 10706,
+            "effective_ppm": 3569,
+        },
+        {
+            "chan_id": "1028289662652973056",
+            "alias": "allNice | torq.co",
+            "proposed_amt": 3_000_000,
+            "drainable_surplus": 3_000_000,
+            "local_ratio": 95.4,
+            "server_fee": 3049,
+            "onchain_fee": 163,
+            "routing_fee": 10497,
+            "opportunity_cost": 0,
+            "total_cost": 13709,
+            "effective_ppm": 4570,
+        },
+    ]
+
+    mock_args = MagicMock()
+    mock_args.history = False
+    mock_args.capacity = 3_000_000
+    mock_args.fee_limit = 100
+    mock_args.min_ratio = 60.0
+    mock_args.amt = 3_000_000  # User specified 3,000,000 sats
+    mock_args.conf_target = 9
+    mock_args.max_routing_fee = None
+    mock_args.fee_leeway_pct = 100.0  # +100% leeway
+    mock_args.dest_addr = None
+    mock_args.dry_run = True
+    mock_args.auto_approve = False
+    mock_args.max_channels = 3
+    mock_args.channel = None
+    mock_args.workers = 1
+    mock_args.probe_timeout = 15
+    mock_args.skip_prepay_probe = False
+
+    config = configparser.ConfigParser()
+    config.add_section("loop")
+    config.set("loop", "fee_leeway_pct", "100.0")
+    config.set("loop", "fee_leeway_base_sats", "500")
+
+    with patch.object(swap_out_loop, "parse_arguments", return_value=mock_args),          patch.object(swap_out_loop, "load_config", return_value=(config, "/tmp")),          patch.object(swap_out_loop, "setup_logger") as mock_setup_logger,          patch.object(swap_out_loop, "fetch_channels_lndg", return_value=[{"is_active": True, "is_open": True, "capacity": 10000000, "local_balance": 8000000, "local_fee_rate": 5, "chan_id": "111", "alias": "node"}]),          patch.object(swap_out_loop, "filter_and_size_candidates", return_value=mock_candidates),          patch.object(swap_out_loop, "evaluate_single_candidate", side_effect=lambda c, **kwargs: c),          patch.object(swap_out_loop, "interactive_menu_select", return_value=mock_candidates),          patch.object(swap_out_loop, "execute_loop_out", return_value={"success": True, "swap_id": "mock-swap-id", "dry_run": True}) as mock_exec:
+
+        mock_logger = MagicMock()
+        mock_setup_logger.return_value = mock_logger
+
+        swap_out_loop.main()
+
+        # execute_loop_out must be called with amt=3,000,000 (NOT 6,000,000)
+        assert mock_exec.call_args[1]["amt"] == 3_000_000
+        # max_routing_fee must be based on max(7494, 10497) = 10497 -> 10497 * 2.0 + 500 = 21494
+        assert mock_exec.call_args[1]["max_routing_fee"] == 21_494
+        # channel_id list contains both channels
+        assert mock_exec.call_args[1]["channel_id"] == ["896468114071224320", "1028289662652973056"]

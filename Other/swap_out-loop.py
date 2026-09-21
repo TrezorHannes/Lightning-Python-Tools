@@ -935,13 +935,19 @@ def interactive_menu_select(
         if selected_indices:
             sel_list = [candidates[i] for i in sorted(selected_indices)]
             if target_amt and target_amt > 0:
-                comb_amt = min(target_amt, sum(c["proposed_amt"] for c in sel_list))
+                swap_size = target_amt
             else:
-                comb_amt = sum(c["proposed_amt"] for c in sel_list)
-            comb_cost = sum(c["total_cost"] for c in sel_list)
-            comb_ppm = round((comb_cost / comb_amt) * 1_000_000) if comb_amt > 0 else 0
+                swap_size = min(c["proposed_amt"] for c in sel_list)
+
+            ppms = [c["effective_ppm"] for c in sel_list]
+            costs = [c["total_cost"] for c in sel_list]
+            min_ppm, max_ppm = min(ppms), max(ppms)
+            min_cost, max_cost = min(costs), max(costs)
+            ppm_str = f"{min_ppm:,} ppm" if min_ppm == max_ppm else f"{min_ppm:,} – {max_ppm:,} ppm"
+            cost_str = f"{min_cost:,} sats" if min_cost == max_cost else f"{min_cost:,} – {max_cost:,} sats"
+
             print_color(
-                f"Multi-Select Active ({len(selected_indices)} chans): Combined Size {comb_amt:,} sats | Est Total Cost: {comb_cost:,} sats ({comb_ppm} ppm)",
+                f"Multi-Select Active ({len(selected_indices)} chans): Fixed Swap Size {swap_size:,} sats | Net PPM: {ppm_str} (Est Cost: {cost_str})",
                 Colors.OKGREEN,
                 bold=True,
             )
@@ -1520,17 +1526,26 @@ def main():
         chan_ids = [c["chan_id"] for c in selected_channels]
         alias_str = f"{selected_channels[0]['alias']} + {len(selected_channels) - 1} more"
         if args.amt and args.amt > 0:
-            total_swap_amt = min(args.amt, sum(c["proposed_amt"] for c in selected_channels))
+            total_swap_amt = args.amt
         else:
-            total_swap_amt = sum(c["proposed_amt"] for c in selected_channels)
+            total_swap_amt = min(c["proposed_amt"] for c in selected_channels)
         total_swap_amt = min(total_swap_amt, MAX_LOOP_OUT_SATS)
-        probed_routing_fee = sum(c["routing_fee"] for c in selected_channels)
-        total_cost = sum(c["total_cost"] for c in selected_channels)
 
-        print_color(f"\nMulti-Channel Loop Out Batch Selected ({len(selected_channels)} channels):", Colors.OKGREEN, bold=True)
+        probed_routing_fee = max(c["routing_fee"] for c in selected_channels)
+        total_cost = max(c["total_cost"] for c in selected_channels)
+
+        ppms = [c["effective_ppm"] for c in selected_channels]
+        costs = [c["total_cost"] for c in selected_channels]
+        min_ppm, max_ppm = min(ppms), max(ppms)
+        min_cost, max_cost = min(costs), max(costs)
+        ppm_str = f"{min_ppm:,} ppm" if min_ppm == max_ppm else f"{min_ppm:,} – {max_ppm:,} ppm"
+        cost_str = f"{min_cost:,} sats" if min_cost == max_cost else f"{min_cost:,} – {max_cost:,} sats"
+
+        print_color(f"\nMulti-Channel Loop Out Outbound Set ({len(selected_channels)} channels):", Colors.OKGREEN, bold=True)
         for idx, sc in enumerate(selected_channels, 1):
-            print(f"  [{idx}] {sc['alias']} ({sc['chan_id']}): {sc['proposed_amt']:,} sats (Route: {sc['routing_fee']:,} sat, Net PPM: {sc['effective_ppm']})")
-        print(f"  Combined Swap Size: {total_swap_amt:,} sats")
+            print(f"  [{idx}] {sc['alias']} ({sc['chan_id']}): Probed Route Fee: {sc['routing_fee']:,} sat, Net PPM: {sc['effective_ppm']}")
+        print(f"  Fixed Swap Size: {total_swap_amt:,} sats")
+        print(f"  Effective PPM Range: {ppm_str} (Est Cost: {cost_str})")
 
     # Max routing fee budget with configurable leeway
     max_rf = calculate_max_routing_fee_budget(
@@ -1543,7 +1558,7 @@ def main():
     if max_rf > 0:
         buffer_sats = max_rf - probed_routing_fee
         print_color(
-            f"Routing Fee Budget: {max_rf:,} sats (Probed: {probed_routing_fee:,} sats + {buffer_sats:,} sat leeway)",
+            f"Routing Fee Budget: {max_rf:,} sats (Max Probed: {probed_routing_fee:,} sats + {buffer_sats:,} sat leeway)",
             Colors.OKCYAN,
         )
     else:
