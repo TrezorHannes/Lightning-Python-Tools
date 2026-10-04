@@ -1,5 +1,6 @@
 import sys
 import os
+import configparser as real_configparser
 import pytest
 from unittest.mock import MagicMock, patch, mock_open
 
@@ -312,3 +313,269 @@ def test_dry_run_mode_simulation(fee_module):
 
     toggle_res = fee_module.toggle_magma_offer_status("off_dry", "DryTemplate", "DISABLED")
     assert toggle_res is True
+
+
+def test_fetch_my_current_offers_enriches_min_max_amount_and_offer_type(fee_module):
+    """Test that SimpleMarketOffer from list is enriched via GetMyMagmaOfferDetails with min_amount/max_amount and includes offer_type."""
+    list_response = {
+        "data": {
+            "user": {
+                "market": {
+                    "offers": {
+                        "offers": {
+                            "total": 1,
+                            "list": [
+                                {
+                                    "id": "my_off_01",
+                                    "status": "ENABLED",
+                                    "side": "SELL",
+                                    "total_amount": {"satoshi": {"sats": "15000000"}},
+                                    "locked_amount": {"satoshi": {"sats": "5000000"}},
+                                    "fees": {"fixed": {"sats": "1000"}, "variable": {"sats": "400"}},
+                                    "promises": {"min_block_length": 4320},
+                                }
+                            ],
+                        }
+                    }
+                }
+            }
+        }
+    }
+    detail_response = {
+        "data": {
+            "user": {
+                "market": {
+                    "offers": {
+                        "get_offer": {
+                            "id": "my_off_01",
+                            "status": "ENABLED",
+                            "min_amount": {"satoshi": {"sats": "5000000"}},
+                            "max_amount": {"satoshi": {"sats": "5000000"}},
+                            "total_amount": {"satoshi": {"sats": "15000000", "btc": "0.15", "usd": "10000"}},
+                            "locked_amount": {"satoshi": {"sats": "5000000"}},
+                            "fees": {"fixed": {"sats": "1000"}, "variable": {"sats": "400"}},
+                            "promises": {
+                                "min_block_length": 4320,
+                                "base_fee_cap": "1000",
+                                "fee_rate_cap": "400",
+                            },
+                            "node": {"pubkey": "03mypubkey123456", "alias": "MyNode"},
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    def post_side_effect(url, json=None, headers=None, timeout=None):
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        query_str = (json or {}).get("query", "")
+        if "GetMyMagmaOfferDetails" in query_str or "get_offer" in query_str:
+            resp.json.return_value = detail_response
+        else:
+            resp.json.return_value = list_response
+        return resp
+
+    fee_module.requests.post = MagicMock(side_effect=post_side_effect)
+
+    my_offers = fee_module.fetch_my_current_offers()
+    assert len(my_offers) == 1
+    offer = my_offers[0]
+    assert offer["id"] == "my_off_01"
+    assert offer["min_size"] == 5000000
+    assert offer["max_size"] == 5000000
+    assert offer["total_size"] == 15000000
+    assert offer["available_size"] == 10000000
+    assert offer["offer_type"] == "CHANNEL"
+
+
+def test_fetch_public_magma_offers_reads_magma_autoprice_config_section(fee_module):
+    """Test that fetch_public_magma_offers reads min_seller_score_filter from [magma_autoprice] in a real ConfigParser."""
+    mock_response = {
+        "data": {
+            "market": {
+                "offer": {
+                    "offers": {
+                        "total": 2,
+                        "list": [
+                            {
+                                "id": "off_high",
+                                "status": "ENABLED",
+                                "side": "SELL",
+                                "node": {"pubkey": "03peer_high", "alias": "HighScore"},
+                                "total_amount": {"satoshi": {"sats": "5000000"}},
+                                "locked_amount": {"satoshi": {"sats": "0"}},
+                                "fees": {"fixed": {"sats": "500"}, "variable": {"sats": "300"}},
+                                "promises": {"min_block_length": 4320},
+                                "seller_score": 90.0,
+                            },
+                            {
+                                "id": "off_below_85",
+                                "status": "ENABLED",
+                                "side": "SELL",
+                                "node": {"pubkey": "03peer_mid", "alias": "MidScore"},
+                                "total_amount": {"satoshi": {"sats": "5000000"}},
+                                "locked_amount": {"satoshi": {"sats": "0"}},
+                                "fees": {"fixed": {"sats": "500"}, "variable": {"sats": "300"}},
+                                "promises": {"min_block_length": 4320},
+                                "seller_score": 80.0,
+                            },
+                        ],
+                    }
+                }
+            }
+        }
+    }
+    mock_post = MagicMock()
+    mock_post.json.return_value = mock_response
+    mock_post.raise_for_status.return_value = None
+    fee_module.requests.post = MagicMock(return_value=mock_post)
+
+    cfg = real_configparser.ConfigParser()
+    cfg.read_string("[magma_autoprice]\nmin_seller_score_filter = 85.0 # inline comment\n")
+
+    offers = fee_module.fetch_public_magma_offers("03mypubkey123456", cfg)
+    assert len(offers) == 1
+    assert offers[0]["id"] == "off_high"
+
+
+def test_fetch_public_magma_offers_paginates_multiple_pages(fee_module):
+    """Test that fetch_public_magma_offers paginates when total > first page length and deduplicates by id."""
+    page_1 = {
+        "data": {
+            "market": {
+                "offer": {
+                    "offers": {
+                        "total": 2,
+                        "list": [
+                            {
+                                "id": "pub_off_1",
+                                "status": "ENABLED",
+                                "side": "SELL",
+                                "node": {"pubkey": "03peer1", "alias": "Peer1"},
+                                "total_amount": {"satoshi": {"sats": "5000000"}},
+                                "locked_amount": {"satoshi": {"sats": "0"}},
+                                "fees": {"fixed": {"sats": "500"}, "variable": {"sats": "300"}},
+                                "promises": {"min_block_length": 4320},
+                                "seller_score": 95.0,
+                            }
+                        ],
+                    }
+                }
+            }
+        }
+    }
+    page_2 = {
+        "data": {
+            "market": {
+                "offer": {
+                    "offers": {
+                        "total": 2,
+                        "list": [
+                            {
+                                "id": "pub_off_2",
+                                "status": "ENABLED",
+                                "side": "SELL",
+                                "node": {"pubkey": "03peer2", "alias": "Peer2"},
+                                "total_amount": {"satoshi": {"sats": "8000000"}},
+                                "locked_amount": {"satoshi": {"sats": "0"}},
+                                "fees": {"fixed": {"sats": "600"}, "variable": {"sats": "350"}},
+                                "promises": {"min_block_length": 4320},
+                                "seller_score": 92.0,
+                            }
+                        ],
+                    }
+                }
+            }
+        }
+    }
+
+    def post_side_effect(url, json=None, headers=None, timeout=None):
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        offset = ((json or {}).get("variables", {}).get("page") or {}).get("offset", 0)
+        resp.json.return_value = page_1 if offset == 0 else page_2
+        return resp
+
+    fee_module.requests.post = MagicMock(side_effect=post_side_effect)
+    cfg = real_configparser.ConfigParser()
+    cfg.read_string("[magma_autoprice]\nmin_seller_score_filter = 85.0\n")
+
+    offers = fee_module.fetch_public_magma_offers("03mypubkey123456", cfg)
+    assert len(offers) == 2
+    assert [o["id"] for o in offers] == ["pub_off_1", "pub_off_2"]
+    assert fee_module.requests.post.call_count == 2
+
+
+def test_fetch_my_current_offers_paginates_multiple_pages(fee_module):
+    """Test that fetch_my_current_offers paginates across multiple pages when total > page 1 length."""
+    page_1 = {
+        "data": {
+            "user": {
+                "market": {
+                    "offers": {
+                        "offers": {
+                            "total": 2,
+                            "list": [
+                                {
+                                    "id": "my_off_p1",
+                                    "status": "ENABLED",
+                                    "side": "SELL",
+                                    "node": {"pubkey": "03mypubkey123456", "alias": "MyNode"},
+                                    "min_amount": {"satoshi": {"sats": "5000000"}},
+                                    "max_amount": {"satoshi": {"sats": "5000000"}},
+                                    "total_amount": {"satoshi": {"sats": "10000000"}},
+                                    "locked_amount": {"satoshi": {"sats": "0"}},
+                                    "fees": {"fixed": {"sats": "1000"}, "variable": {"sats": "400"}},
+                                    "promises": {"min_block_length": 4320},
+                                }
+                            ],
+                        }
+                    }
+                }
+            }
+        }
+    }
+    page_2 = {
+        "data": {
+            "user": {
+                "market": {
+                    "offers": {
+                        "offers": {
+                            "total": 2,
+                            "list": [
+                                {
+                                    "id": "my_off_p2",
+                                    "status": "DISABLED",
+                                    "side": "SELL",
+                                    "node": {"pubkey": "03mypubkey123456", "alias": "MyNode"},
+                                    "min_amount": {"satoshi": {"sats": "10000000"}},
+                                    "max_amount": {"satoshi": {"sats": "10000000"}},
+                                    "total_amount": {"satoshi": {"sats": "20000000"}},
+                                    "locked_amount": {"satoshi": {"sats": "5000000"}},
+                                    "fees": {"fixed": {"sats": "1500"}, "variable": {"sats": "500"}},
+                                    "promises": {"min_block_length": 8640},
+                                }
+                            ],
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    def post_side_effect(url, json=None, headers=None, timeout=None):
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        offset = ((json or {}).get("variables", {}).get("page") or {}).get("offset", 0)
+        resp.json.return_value = page_1 if offset == 0 else page_2
+        return resp
+
+    fee_module.requests.post = MagicMock(side_effect=post_side_effect)
+
+    my_offers = fee_module.fetch_my_current_offers()
+    assert len(my_offers) == 2
+    assert [o["id"] for o in my_offers] == ["my_off_p1", "my_off_p2"]
+    assert fee_module.requests.post.call_count == 2
+
