@@ -167,6 +167,62 @@ query ListMyOffers($page: PageInput) {
 }
 """
 
+GET_MY_OFFER_DETAILS_QUERY = """
+query GetMyMagmaOfferDetails($offerId: String!) {
+  user {
+    market {
+      offers {
+        get_offer(offer_id: $offerId) {
+          id
+          status
+          min_amount {
+            satoshi {
+              sats
+            }
+          }
+          max_amount {
+            satoshi {
+              sats
+            }
+          }
+          total_amount {
+            satoshi {
+              sats
+              btc
+              usd
+            }
+          }
+          locked_amount {
+            satoshi {
+              sats
+            }
+          }
+          fees {
+            fixed {
+              sats
+            }
+            variable {
+              sats
+            }
+          }
+          promises {
+            min_block_length
+            base_fee_cap
+            fee_rate_cap
+          }
+          node {
+            pubkey
+            alias
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+MAX_OFFER_PAGES = 20
+
 CREATE_MAGMA_OFFER_MUTATION = """
 mutation CreateOffer($input: CreateOfferInput!) {
   market {
@@ -272,12 +328,14 @@ def _execute_amboss_graphql_request(
     payload: dict,
     operation_name: str = "AmbossGraphQL",
     endpoint_url: str = MAGMA_GRAPHQL_URL,
+    amboss_token: str = None,
 ):
     """
     Executes a GraphQL request to the Amboss / Magma API.
     Handles DRY_RUN_MODE simulation for mutations.
     """
-    if not AMBOSS_TOKEN:
+    token = amboss_token or AMBOSS_TOKEN
+    if not token:
         logging.error("Amboss API token not configured.")
         return None
 
@@ -311,7 +369,7 @@ def _execute_amboss_graphql_request(
     url = endpoint_url
     headers = {
         "content-type": "application/json",
-        "Authorization": f"Bearer {AMBOSS_TOKEN}",
+        "Authorization": f"Bearer {token}",
     }
     logging.debug(
         f"Executing {operation_name} against {url} with payload: {json.dumps(payload, indent=2 if logging.getLogger().getEffectiveLevel() == logging.DEBUG else None)}"
@@ -357,6 +415,7 @@ def extract_market_offer_info(offer: dict) -> dict:
     offer_id = offer.get("id", "N/A_ID")
     status = str(offer.get("status", "UNKNOWN")).upper()
     side = str(offer.get("side", "SELL")).upper()
+    offer_type = offer.get("offer_type", "CHANNEL")
     
     # Node / Account / Pubkey
     node_obj = offer.get("node")
@@ -374,9 +433,9 @@ def extract_market_offer_info(offer: dict) -> dict:
     # Sizes / Amounts
     if "total_amount" in offer and isinstance(offer.get("total_amount"), dict):
         total_size = int(offer.get("total_amount", {}).get("satoshi", {}).get("sats", 0))
-        locked_size = int(offer.get("locked_amount", {}).get("satoshi", {}).get("sats", 0)) if "locked_amount" in offer else 0
-        min_size = int(offer.get("min_amount", {}).get("satoshi", {}).get("sats", total_size)) if "min_amount" in offer else total_size
-        max_size = int(offer.get("max_amount", {}).get("satoshi", {}).get("sats", total_size)) if "max_amount" in offer else total_size
+        locked_size = int(offer.get("locked_amount", {}).get("satoshi", {}).get("sats", 0)) if isinstance(offer.get("locked_amount"), dict) else 0
+        min_size = int(offer.get("min_amount", {}).get("satoshi", {}).get("sats", total_size)) if isinstance(offer.get("min_amount"), dict) else total_size
+        max_size = int(offer.get("max_amount", {}).get("satoshi", {}).get("sats", total_size)) if isinstance(offer.get("max_amount"), dict) else total_size
     elif "size" in offer and isinstance(offer.get("size"), dict):
         size_obj = offer.get("size", {})
         min_size = int(size_obj.get("min", {}).get("satoshi", {}).get("sats", 0))
@@ -421,6 +480,7 @@ def extract_market_offer_info(offer: dict) -> dict:
         "id": offer_id,
         "status": status,
         "side": side,
+        "offer_type": offer_type,
         "account": pubkey,
         "node_alias": alias or pubkey,
         "min_size": min_size,
@@ -580,27 +640,88 @@ def get_lnd_onchain_balance(current_general_config):
 # --- Market Analysis & Pricing Logic --- (analyze_and_price_offer and calculate_apr remain largely the same)
 def fetch_public_magma_offers(node_pubkey_to_exclude, current_magma_config):
     logging.info("Fetching public Magma sell offers for market pricing analysis...")
-    payload = {
-        "query": GET_PUBLIC_MAGMA_OFFERS_QUERY,
-        "variables": {"page": {"limit": 100, "offset": 0}}
-    }
-    data = _execute_amboss_graphql_request(payload, "GetPublicOffers", endpoint_url=MAGMA_GRAPHQL_URL)
-
     processed_offers = []
     raw_offers = []
-    if data:
-        raw_offers = (
-            data.get("market", {}).get("offer", {}).get("offers", {}).get("list", [])
-            or data.get("getOffers", {}).get("list", [])
+    seen_offer_ids = set()
+    limit = 100
+    offset = 0
+
+    for _ in range(MAX_OFFER_PAGES):
+        payload = {
+            "query": GET_PUBLIC_MAGMA_OFFERS_QUERY,
+            "variables": {"page": {"limit": limit, "offset": offset}},
+        }
+        data = _execute_amboss_graphql_request(
+            payload, "GetPublicOffers", endpoint_url=MAGMA_GRAPHQL_URL
         )
+        if not isinstance(data, dict):
+            break
+
+        offers_container = (
+            data.get("market", {}).get("offer", {}).get("offers")
+            or data.get("getOffers")
+            or {}
+        )
+        if not isinstance(offers_container, dict):
+            break
+
+        offers_list = offers_container.get("list") or []
+        if not offers_list:
+            break
+
+        total_raw = offers_container.get("total")
+        try:
+            total = int(total_raw) if total_raw is not None else len(offers_list)
+        except (ValueError, TypeError):
+            total = len(offers_list)
+
+        for offer in offers_list:
+            if not isinstance(offer, dict):
+                continue
+            offer_id = offer.get("id")
+            if offer_id is not None:
+                if offer_id in seen_offer_ids:
+                    continue
+                seen_offer_ids.add(offer_id)
+            raw_offers.append(offer)
+
+        offset += len(offers_list)
+        if offset >= total:
+            break
 
     if raw_offers:
-        min_seller_score_filter = get_config_float_with_comment_stripping(
-            current_magma_config,
-            "market_analysis",
-            "min_seller_score_filter",
-            fallback=0.0,
-        )
+        min_score_str = None
+        if current_magma_config is not None:
+            if hasattr(current_magma_config, "has_option") and callable(
+                current_magma_config.has_option
+            ):
+                if current_magma_config.has_option(
+                    "magma_autoprice", "min_seller_score_filter"
+                ):
+                    min_score_str = current_magma_config.get(
+                        "magma_autoprice", "min_seller_score_filter", fallback=None
+                    )
+                elif current_magma_config.has_option(
+                    "market_analysis", "min_seller_score_filter"
+                ):
+                    min_score_str = current_magma_config.get(
+                        "market_analysis", "min_seller_score_filter", fallback="0.0"
+                    )
+            if min_score_str is None:
+                min_score_str = current_magma_config.get(
+                    "magma_autoprice", "min_seller_score_filter", fallback=None
+                ) or current_magma_config.get(
+                    "market_analysis", "min_seller_score_filter", fallback="0.0"
+                )
+        try:
+            min_seller_score_filter = (
+                float(str(min_score_str).split("#")[0].strip())
+                if min_score_str is not None
+                else 0.0
+            )
+        except (ValueError, TypeError):
+            min_seller_score_filter = 0.0
+
         logging.debug(f"Raw offers count: {len(raw_offers)}")
         logging.debug(f"Min seller score filter: {min_seller_score_filter}")
 
@@ -856,27 +977,101 @@ def analyze_and_price_offer(
 
 
 # --- Manage Our Offers on Amboss ---
-def fetch_my_current_offers():
-    logging.info("Fetching my current Magma sell offers...")
+def fetch_my_offer_details(offer_id, amboss_token=None):
+    """Fetches full MarketOffer details (including min_amount and max_amount) for a specific user offer."""
+    if not offer_id:
+        return {}
     payload = {
-        "query": GET_MY_MAGMA_OFFERS_QUERY,
-        "variables": {"page": {"limit": 50, "offset": 0}}
+        "query": GET_MY_OFFER_DETAILS_QUERY,
+        "variables": {"offerId": str(offer_id)},
     }
-    data = _execute_amboss_graphql_request(payload, "MyOffers", endpoint_url=MAGMA_GRAPHQL_URL)
+    data = _execute_amboss_graphql_request(
+        payload,
+        "GetMyMagmaOfferDetails",
+        endpoint_url=MAGMA_GRAPHQL_URL,
+        amboss_token=amboss_token,
+    )
+    if not isinstance(data, dict):
+        return {}
+    offer_details = (
+        (((data.get("user") or {}).get("market") or {}).get("offers") or {})
+        .get("get_offer")
+    )
+    if isinstance(offer_details, dict):
+        return offer_details
+    return {}
 
+
+def fetch_my_current_offers(amboss_token=None):
+    logging.info("Fetching my current Magma sell offers...")
     processed_offers = []
     my_raw_offers = []
-    if data:
-        my_raw_offers = (
-            data.get("user", {}).get("market", {}).get("offers", {}).get("offers", {}).get("list", [])
-            or data.get("getUser", {}).get("market", {}).get("offers", {}).get("list", [])
+    seen_offer_ids = set()
+    limit = 50
+    offset = 0
+
+    for _ in range(MAX_OFFER_PAGES):
+        payload = {
+            "query": GET_MY_MAGMA_OFFERS_QUERY,
+            "variables": {"page": {"limit": limit, "offset": offset}},
+        }
+        data = _execute_amboss_graphql_request(
+            payload,
+            "MyOffers",
+            endpoint_url=MAGMA_GRAPHQL_URL,
+            amboss_token=amboss_token,
         )
+        if not isinstance(data, dict):
+            break
+
+        offers_container = (
+            data.get("user", {}).get("market", {}).get("offers", {}).get("offers")
+            or data.get("getUser", {}).get("market", {}).get("offers")
+            or {}
+        )
+        if not isinstance(offers_container, dict):
+            break
+
+        offers_list = offers_container.get("list") or []
+        if not offers_list:
+            break
+
+        total_raw = offers_container.get("total")
+        try:
+            total = int(total_raw) if total_raw is not None else len(offers_list)
+        except (ValueError, TypeError):
+            total = len(offers_list)
+
+        for offer in offers_list:
+            if not isinstance(offer, dict):
+                continue
+            offer_id = offer.get("id")
+            if offer_id is not None:
+                if offer_id in seen_offer_ids:
+                    continue
+                seen_offer_ids.add(offer_id)
+            my_raw_offers.append(offer)
+
+        offset += len(offers_list)
+        if offset >= total:
+            break
 
     if my_raw_offers:
         for offer_item in my_raw_offers:
             try:
                 if not offer_item:
                     continue
+                if (
+                    "min_amount" not in offer_item or "max_amount" not in offer_item
+                ) and offer_item.get("id"):
+                    extra_details = fetch_my_offer_details(
+                        offer_item["id"], amboss_token=amboss_token
+                    )
+                    if isinstance(extra_details, dict) and extra_details:
+                        offer_item = {
+                            **offer_item,
+                            **{k: v for k, v in extra_details.items() if v is not None},
+                        }
                 parsed = extract_market_offer_info(offer_item)
                 offer_id = parsed["id"]
 
@@ -905,6 +1100,7 @@ def fetch_my_current_offers():
                 details = {
                     "id": offer_id,
                     "status": parsed["status"],
+                    "offer_type": parsed.get("offer_type", "CHANNEL"),
                     "base_fee": current_fixed_fee,
                     "fee_rate": current_ppm_rate,
                     "max_size": parsed["max_size"],

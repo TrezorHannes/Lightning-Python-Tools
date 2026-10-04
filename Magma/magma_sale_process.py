@@ -479,39 +479,83 @@ def extract_order_info(order: dict) -> dict:
         "created_at": order.get("created_at"),
         "raw_order": order.get("raw_order", order)
     }
+def _extract_error_details_from_response(response):
+    """Extracts a JSON error dict (if any) and truncated body text from an HTTP response."""
+    if response is None:
+        return None, ""
+    resp_text = ""
+    raw_text = getattr(response, "text", None)
+    if isinstance(raw_text, str):
+        resp_text = raw_text[:1000]
+    error_json = None
+    try:
+        parsed = response.json()
+        if isinstance(parsed, dict):
+            error_json = parsed
+    except Exception:
+        pass
+    return error_json, resp_text
+
+
 def _execute_amboss_graphql_request(
     payload: dict,
     operation_name: str = "AmbossGraphQL",
     endpoint_url: str = MAGMA_GRAPHQL_URL,
+    amboss_token: str | None = None,
 ):
     """
     Executes a GraphQL request to the Amboss or Magma API.
     Handles common request logic, headers, timeouts, and basic error handling.
     """
     url = endpoint_url
+    token = amboss_token if amboss_token is not None else AMBOSS_TOKEN
     headers = {
         "content-type": "application/json",
-        "Authorization": f"Bearer {AMBOSS_TOKEN}",
+        "Authorization": f"Bearer {token}",
     }
     logging.debug(f"Executing {operation_name} against {url} with payload: {json.dumps(payload, indent=2 if logging.getLogger().getEffectiveLevel() == logging.DEBUG else None)}")
 
+    response = None
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=20)
+        status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int) and status_code >= 400:
+            error_json, resp_text = _extract_error_details_from_response(response)
+            if error_json and error_json.get("errors"):
+                logging.error(
+                    f"GraphQL HTTP {status_code} errors during {operation_name}: "
+                    f"{error_json.get('errors')} | Body: {resp_text}"
+                )
+                return None
+            logging.error(
+                f"HTTP {status_code} error during {operation_name} to Amboss. Body: {resp_text}"
+            )
         response.raise_for_status()
-        
+
         response_json = response.json()
-        
+
         if response_json.get("errors"):
             logging.error(f"GraphQL errors during {operation_name}: {response_json.get('errors')}")
             return None
-            
+
         return response_json.get("data")
 
     except requests.exceptions.Timeout:
         logging.warning(f"Timeout during {operation_name} to Amboss.")
         return None
     except requests.exceptions.RequestException as e:
-        logging.warning(f"API request error during {operation_name} to Amboss: {e}")
+        err_resp = getattr(e, "response", None) or response
+        error_json, resp_text = _extract_error_details_from_response(err_resp)
+        if error_json and error_json.get("errors"):
+            logging.error(
+                f"GraphQL errors during {operation_name} to Amboss ({e}): "
+                f"{error_json.get('errors')} | Body: {resp_text}"
+            )
+            return None
+        if resp_text:
+            logging.error(f"API request error during {operation_name} to Amboss: {e} | Body: {resp_text}")
+        else:
+            logging.warning(f"API request error during {operation_name} to Amboss: {e}")
         return None
     except json.JSONDecodeError as e:
         logging.error(f"Failed to decode JSON response during {operation_name} from Amboss: {e}")
@@ -535,8 +579,8 @@ def get_order_details_from_amboss(order_id):
 
     if data:
         order = (
-            data.get("user", {}).get("market", {}).get("orders", {}).get("get_order")
-            or data.get("getUser", {}).get("market", {}).get("orders", {}).get("get_order")
+            (((data.get("user") or {}).get("market") or {}).get("orders") or {}).get("get_order")
+            or (((data.get("getUser") or {}).get("market") or {}).get("orders") or {}).get("get_order")
             or data.get("getOrder")
         )
         if order:
@@ -551,11 +595,12 @@ def get_order_details_from_amboss(order_id):
     fallback_data = _execute_amboss_graphql_request(sales_payload, f"GetSalesFallback-{order_id}", endpoint_url=MAGMA_GRAPHQL_URL)
     if fallback_data:
         sales_list = (
-            fallback_data.get("user", {}).get("market", {}).get("orders", {}).get("sales", {}).get("list", [])
-            or fallback_data.get("getUser", {}).get("market", {}).get("offer_orders", {}).get("list", [])
+            ((((fallback_data.get("user") or {}).get("market") or {}).get("orders") or {}).get("sales") or {}).get("list")
+            or (((fallback_data.get("getUser") or {}).get("market") or {}).get("offer_orders") or {}).get("list")
+            or []
         )
         for offer in sales_list:
-            if offer.get("id") == order_id:
+            if isinstance(offer, dict) and offer.get("id") == order_id:
                 logging.info(f"Successfully found details for order {order_id} in sales list: {offer}")
                 return offer
 
@@ -594,7 +639,7 @@ def get_node_alias(pubkey: str) -> str:
         logging.warning(f"No alias returned in getNodeAlias data for {pubkey}.")
         return "AliasNotFound"
 
-def get_node_extended_details(pubkey: str) -> dict:
+def get_node_extended_details(pubkey: str, amboss_token: str | None = None) -> dict:
     """Fetches extended details for a given node pubkey from Amboss."""
     if not pubkey:
         return {} # Return empty dict if no pubkey
@@ -602,9 +647,8 @@ def get_node_extended_details(pubkey: str) -> dict:
     logging.info(f"Fetching extended details for pubkey: {pubkey}")
     payload = {
         "query": """
-            query GetNodeExtendedInfo($pubkey: String!) {
+            query GetNodeDetails($pubkey: String!, $from: String!) {
               getNode(pubkey: $pubkey) {
-                # alias # Alias is already fetched by get_node_alias, or can be added if we consolidate
                 amboss {
                   is_claimed
                 }
@@ -612,6 +656,11 @@ def get_node_extended_details(pubkey: str) -> dict:
                   channels {
                     num_channels
                     total_capacity
+                  }
+                  channel_closure_types(from: $from) {
+                    type
+                    amount
+                    percent
                   }
                   node {
                     addresses {
@@ -634,6 +683,7 @@ def get_node_extended_details(pubkey: str) -> dict:
                   }
                   lightning_labs {
                     terminal_web {
+                      score
                       position
                     }
                   }
@@ -646,10 +696,22 @@ def get_node_extended_details(pubkey: str) -> dict:
               }
             }
         """,
-        "variables": {"pubkey": pubkey}
+        "variables": {"pubkey": pubkey, "from": "1970-01-01"}
     }
 
-    data = _execute_amboss_graphql_request(payload, f"GetNodeExtendedInfo-{pubkey[:10]}", endpoint_url=AMBOSS_SPACE_GRAPHQL_URL)
+    if amboss_token is not None:
+        data = _execute_amboss_graphql_request(
+            payload,
+            f"GetNodeExtendedInfo-{pubkey[:10]}",
+            endpoint_url=AMBOSS_SPACE_GRAPHQL_URL,
+            amboss_token=amboss_token,
+        )
+    else:
+        data = _execute_amboss_graphql_request(
+            payload,
+            f"GetNodeExtendedInfo-{pubkey[:10]}",
+            endpoint_url=AMBOSS_SPACE_GRAPHQL_URL,
+        )
 
     if not data or not data.get("getNode"):
         logging.warning(f"No extended details returned for pubkey {pubkey} from Amboss.")
@@ -728,8 +790,18 @@ def accept_order(order_id, payment_request):
         "content-type": "application/json",
         "Authorization": f"Bearer {AMBOSS_TOKEN}",
     }
+    response = None
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=60)
+        status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int) and status_code >= 400:
+            error_json, resp_text = _extract_error_details_from_response(response)
+            logging.error(
+                f"HTTP {status_code} error accepting Amboss Magma order {order_id}. Body: {resp_text}"
+            )
+            if error_json and error_json.get("errors"):
+                logging.error(f"GraphQL errors accepting order {order_id}: {error_json.get('errors')}")
+                return error_json
         response.raise_for_status()
         response_json = response.json()
         logging.info(f"Amboss Magma seller accept response for {order_id}: {response_json}")
@@ -738,8 +810,19 @@ def accept_order(order_id, payment_request):
         logging.error(f"Timeout while accepting Amboss Magma order {order_id}.")
         return {"errors": [{"message": "Timeout during Amboss API call"}]}
     except requests.exceptions.RequestException as e:
-        logging.error(f"API request error accepting Amboss Magma order {order_id}: {e}")
-        return {"errors": [{"message": f"RequestException: {e}"}]}
+        err_resp = getattr(e, "response", None) or response
+        error_json, resp_text = _extract_error_details_from_response(err_resp)
+        if error_json and error_json.get("errors"):
+            logging.error(
+                f"API request error accepting Amboss Magma order {order_id}: {e} | "
+                f"GraphQL errors: {error_json.get('errors')} | Body: {resp_text}"
+            )
+            return error_json
+        logging.error(
+            f"API request error accepting Amboss Magma order {order_id}: {e}"
+            + (f" | Body: {resp_text}" if resp_text else "")
+        )
+        return {"errors": [{"message": f"RequestException: {e}" + (f" | Body: {resp_text}" if resp_text else "")}]}
     except json.JSONDecodeError as e:
         logging.error(f"Failed to decode JSON response when accepting Amboss Magma order {order_id}: {e}")
         return {"errors": [{"message": f"JSONDecodeError: {e}"}]}
@@ -763,8 +846,18 @@ def reject_order(order_id):
         "content-type": "application/json",
         "Authorization": f"Bearer {AMBOSS_TOKEN}",
     }
+    response = None
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=60)
+        status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int) and status_code >= 400:
+            error_json, resp_text = _extract_error_details_from_response(response)
+            logging.error(
+                f"HTTP {status_code} error rejecting Amboss Magma order {order_id}. Body: {resp_text}"
+            )
+            if error_json and error_json.get("errors"):
+                logging.error(f"GraphQL errors rejecting order {order_id}: {error_json.get('errors')}")
+                return error_json
         response.raise_for_status()
         response_json = response.json()
         logging.info(f"Amboss Magma seller reject response for {order_id}: {response_json}")
@@ -773,8 +866,19 @@ def reject_order(order_id):
         logging.error(f"Timeout while rejecting Amboss Magma order {order_id}.")
         return {"errors": [{"message": "Timeout during Amboss API call"}]}
     except requests.exceptions.RequestException as e:
-        logging.error(f"API request error rejecting Amboss Magma order {order_id}: {e}")
-        return {"errors": [{"message": f"RequestException: {e}"}]}
+        err_resp = getattr(e, "response", None) or response
+        error_json, resp_text = _extract_error_details_from_response(err_resp)
+        if error_json and error_json.get("errors"):
+            logging.error(
+                f"API request error rejecting Amboss Magma order {order_id}: {e} | "
+                f"GraphQL errors: {error_json.get('errors')} | Body: {resp_text}"
+            )
+            return error_json
+        logging.error(
+            f"API request error rejecting Amboss Magma order {order_id}: {e}"
+            + (f" | Body: {resp_text}" if resp_text else "")
+        )
+        return {"errors": [{"message": f"RequestException: {e}" + (f" | Body: {resp_text}" if resp_text else "")}]}
     except json.JSONDecodeError as e:
         logging.error(f"Failed to decode JSON response when rejecting Amboss Magma order {order_id}: {e}")
         return {"errors": [{"message": f"JSONDecodeError: {e}"}]}
@@ -799,13 +903,27 @@ def confirm_channel_point_to_amboss(order_id, transaction):
         "Content-Type": "application/json",
         "Authorization": f"Bearer {AMBOSS_TOKEN}",
     }
+    response = None
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=60)
-        response.raise_for_status()
-        response_json = response.json()
+        status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int) and status_code >= 400:
+            error_json, resp_text = _extract_error_details_from_response(response)
+            logging.error(
+                f"HTTP {status_code} error confirming channel point to Amboss for order {order_id}. Body: {resp_text}"
+            )
+            if error_json and error_json.get("errors"):
+                logging.error(f"GraphQL errors confirming channel point for order {order_id}: {error_json.get('errors')}")
+                response_json = error_json
+            else:
+                response.raise_for_status()
+                response_json = response.json()
+        else:
+            response.raise_for_status()
+            response_json = response.json()
         logging.info(f"Amboss Magma add_transaction response for {order_id}: {response_json}")
 
-        if "errors" in response_json:
+        if isinstance(response_json, dict) and response_json.get("errors"):
             error_message = response_json["errors"][0].get("message", "Unknown Amboss API error")
             log_content = (
                 f"Amboss API error in confirm_channel_point_to_amboss for order ID {order_id}, TX: {transaction}.\n"
@@ -824,8 +942,19 @@ def confirm_channel_point_to_amboss(order_id, transaction):
         logging.error(f"Timeout while confirming channel point to Amboss for order {order_id}.")
         return {"errors": [{"message": "Timeout during Amboss API call"}]}
     except requests.exceptions.RequestException as e:
-        logging.error(f"API request error confirming channel point to Amboss for order {order_id}: {e}")
-        return {"errors": [{"message": f"RequestException: {e}"}]}
+        err_resp = getattr(e, "response", None) or response
+        error_json, resp_text = _extract_error_details_from_response(err_resp)
+        if error_json and error_json.get("errors"):
+            logging.error(
+                f"API request error confirming channel point to Amboss for order {order_id}: {e} | "
+                f"GraphQL errors: {error_json.get('errors')} | Body: {resp_text}"
+            )
+            return error_json
+        logging.error(
+            f"API request error confirming channel point to Amboss for order {order_id}: {e}"
+            + (f" | Body: {resp_text}" if resp_text else "")
+        )
+        return {"errors": [{"message": f"RequestException: {e}" + (f" | Body: {resp_text}" if resp_text else "")}]}
     except json.JSONDecodeError as e:
         logging.error(f"Failed to decode JSON response when confirming channel point for order {order_id}: {e}")
         return {"errors": [{"message": f"JSONDecodeError: {e}"}]}
@@ -978,7 +1107,7 @@ def get_node_connection_details(peer_pubkey: str) -> list[dict]:
         logging.error(f"Failed to get extended details for {peer_pubkey} for connection.")
         return []
 
-    addresses_raw = node_details.get("graph_info", {}).get("node", {}).get("addresses", [])
+    addresses_raw = (((node_details.get("graph_info") or {}).get("node") or {}).get("addresses")) or []
     
     if not addresses_raw:
         logging.warning(f"No addresses found for {peer_pubkey} on Amboss.")
@@ -986,9 +1115,11 @@ def get_node_connection_details(peer_pubkey: str) -> list[dict]:
 
     connection_details = []
     for address_entry in addresses_raw:
+        if not isinstance(address_entry, dict):
+            continue
         addr = address_entry.get("addr")
         network = address_entry.get("network")
-        country = address_entry.get("ip_info", {}).get("country") if address_entry.get("ip_info") else None
+        country = (address_entry.get("ip_info") or {}).get("country")
 
         if addr and network:
             detail = {
@@ -1265,117 +1396,151 @@ def calculate_utxos_required_and_fees(amount_input, fee_per_vbyte):
 
 def get_orders_awaiting_channel_open():
     logging.info("Checking for Magma orders awaiting channel open (WAITING_FOR_CHANNEL_OPEN)...")
-    payload = {
-        "query": GET_SALES_QUERY,
-        "variables": {
-            "input": {"status": ["WAITING_FOR_CHANNEL_OPEN"]},
-            "page": {"limit": 25, "offset": 0}
+    offset = 0
+    page_size = 25
+    max_pages = 10
+
+    for _ in range(max_pages):
+        payload = {
+            "query": GET_SALES_QUERY,
+            "variables": {
+                "input": {"status": ["WAITING_FOR_CHANNEL_OPEN"]},
+                "page": {"limit": page_size, "offset": offset}
+            }
         }
-    }
-    
-    data = _execute_amboss_graphql_request(payload, "GetOrdersAwaitingChannelOpen", endpoint_url=MAGMA_GRAPHQL_URL)
+        
+        data = _execute_amboss_graphql_request(payload, "GetOrdersAwaitingChannelOpen", endpoint_url=MAGMA_GRAPHQL_URL)
 
-    if not data:
-        return None
+        if not data:
+            return None
 
-    sales_data = data.get("user", {}).get("market", {}).get("orders", {}).get("sales", {})
-    offer_orders = sales_data.get("list", [])
-    if not offer_orders:
-        offer_orders = data.get("getUser", {}).get("market", {}).get("offer_orders", {}).get("list", [])
-    
-    orders_to_open = [
-        offer for offer in offer_orders if offer.get("status") == "WAITING_FOR_CHANNEL_OPEN"
-    ]
+        sales_data = (((data.get("user") or {}).get("market") or {}).get("orders") or {}).get("sales") or {}
+        offer_orders = sales_data.get("list") or []
+        if not offer_orders:
+            legacy_sales = (((data.get("getUser") or {}).get("market") or {}).get("offer_orders") or {})
+            offer_orders = legacy_sales.get("list") or []
+            if not sales_data:
+                sales_data = legacy_sales
 
-    if not orders_to_open:
-        logging.info("No orders found with status 'WAITING_FOR_CHANNEL_OPEN'.")
-        return None 
-    
-    if len(orders_to_open) > 1:
-        logging.warning(f"Found {len(orders_to_open)} orders WAITING_FOR_CHANNEL_OPEN. Processing one: {orders_to_open[0]['id']}")
-    
-    found_offer = orders_to_open[0]
-    logging.info(f"Found order WAITING_FOR_CHANNEL_OPEN: {found_offer['id']}")
-    return found_offer
+        if not offer_orders:
+            break
+        
+        orders_to_open = [
+            offer for offer in offer_orders if isinstance(offer, dict) and offer.get("status") == "WAITING_FOR_CHANNEL_OPEN"
+        ]
+
+        if orders_to_open:
+            if len(orders_to_open) > 1:
+                logging.warning(f"Found {len(orders_to_open)} orders WAITING_FOR_CHANNEL_OPEN. Processing one: {orders_to_open[0]['id']}")
+            
+            found_offer = orders_to_open[0]
+            logging.info(f"Found order WAITING_FOR_CHANNEL_OPEN: {found_offer['id']}")
+            return found_offer
+
+        offset += len(offer_orders)
+        total_raw = sales_data.get("total")
+        total = int(total_raw) if isinstance(total_raw, (int, str)) and str(total_raw).isdigit() else len(offer_orders)
+        if offset >= total:
+            break
+
+    logging.info("No orders found with status 'WAITING_FOR_CHANNEL_OPEN'.")
+    return None 
 
 
 def get_offers_awaiting_seller_approval():
     global processed_banned_offer_ids
     logging.info("Checking for Magma offers awaiting seller approval (WAITING_FOR_SELLER_APPROVAL)...")
-    payload = {
-        "query": GET_SALES_QUERY,
-        "variables": {
-            "input": {"status": ["WAITING_FOR_SELLER_APPROVAL"]},
-            "page": {"limit": 25, "offset": 0}
+    offset = 0
+    page_size = 25
+    max_pages = 10
+
+    for _ in range(max_pages):
+        payload = {
+            "query": GET_SALES_QUERY,
+            "variables": {
+                "input": {"status": ["WAITING_FOR_SELLER_APPROVAL"]},
+                "page": {"limit": page_size, "offset": offset}
+            }
         }
-    }
 
-    data = _execute_amboss_graphql_request(payload, "GetOffersAwaitingSellerApproval", endpoint_url=MAGMA_GRAPHQL_URL)
+        data = _execute_amboss_graphql_request(payload, "GetOffersAwaitingSellerApproval", endpoint_url=MAGMA_GRAPHQL_URL)
 
-    if not data:
-        return None
+        if not data:
+            return None
 
-    sales_data = data.get("user", {}).get("market", {}).get("orders", {}).get("sales", {})
-    offer_orders_list = sales_data.get("list", [])
-    if not offer_orders_list:
-        offer_orders_list = data.get("getUser", {}).get("market", {}).get("offer_orders", {}).get("list", [])
+        sales_data = (((data.get("user") or {}).get("market") or {}).get("orders") or {}).get("sales") or {}
+        offer_orders_list = sales_data.get("list") or []
+        if not offer_orders_list:
+            legacy_sales = (((data.get("getUser") or {}).get("market") or {}).get("offer_orders") or {})
+            offer_orders_list = legacy_sales.get("list") or []
+            if not sales_data:
+                sales_data = legacy_sales
 
-    for offer in offer_orders_list:
-        order_info = extract_order_info(offer)
-        offer_id = order_info.get("id")
-        current_status = order_info.get("status")
-        destination_pubkey = order_info.get("customer_pubkey")
+        if not offer_orders_list:
+            break
 
-        logging.debug(f"Offer ID: {offer_id}, Status: {current_status}, Buyer Pubkey: {destination_pubkey}")
+        for offer in offer_orders_list:
+            order_info = extract_order_info(offer)
+            offer_id = order_info.get("id")
+            current_status = order_info.get("status")
+            destination_pubkey = order_info.get("customer_pubkey")
 
-        if current_status != "WAITING_FOR_SELLER_APPROVAL":
-            logging.debug(f"Offer {offer_id} has status '{current_status}', not 'WAITING_FOR_SELLER_APPROVAL'. Skipping.")
-            if offer_id in processed_banned_offer_ids and current_status in ["SELLER_REJECTED", "CANCELLED", "EXPIRED", "ERROR", "COMPLETED"]:
-                logging.info(f"Offer {offer_id} (previously auto-rejected) now has terminal status '{current_status}'. Removing from processed_banned_offer_ids.")
-                processed_banned_offer_ids.discard(offer_id)
-            continue
+            logging.debug(f"Offer ID: {offer_id}, Status: {current_status}, Buyer Pubkey: {destination_pubkey}")
 
-        if destination_pubkey in BANNED_PUBKEYS:
-            if offer_id not in processed_banned_offer_ids:
-                logging.info(
-                    f"Offer {offer_id} (status: {current_status}) from banned pubkey {destination_pubkey}. Attempting auto-rejection."
-                )
-                reject_response = reject_order(offer_id)
+            if current_status != "WAITING_FOR_SELLER_APPROVAL":
+                logging.debug(f"Offer {offer_id} has status '{current_status}', not 'WAITING_FOR_SELLER_APPROVAL'. Skipping.")
+                if offer_id in processed_banned_offer_ids and current_status in ["SELLER_REJECTED", "CANCELLED", "EXPIRED", "ERROR", "COMPLETED"]:
+                    logging.info(f"Offer {offer_id} (previously auto-rejected) now has terminal status '{current_status}'. Removing from processed_banned_offer_ids.")
+                    processed_banned_offer_ids.discard(offer_id)
+                continue
 
-                reject_data = reject_response.get("data") if isinstance(reject_response, dict) else None
-                is_rejected = (
-                    reject_response
-                    and not reject_response.get("errors")
-                    and isinstance(reject_data, dict)
-                    and (
-                        reject_data.get("market", {}).get("order", {}).get("seller", {}).get("reject", {}).get("success") is True
-                        or reject_data.get("sellerRejectOrder") is True
+            if destination_pubkey in BANNED_PUBKEYS:
+                if offer_id not in processed_banned_offer_ids:
+                    logging.info(
+                        f"Offer {offer_id} (status: {current_status}) from banned pubkey {destination_pubkey}. Attempting auto-rejection."
                     )
-                )
+                    reject_response = reject_order(offer_id)
 
-                if is_rejected:
-                    send_telegram_notification(
-                        f"🗑️ Auto-rejected offer `{offer_id}` (was WAITING_FOR_SELLER_APPROVAL) from banned pubkey: `{destination_pubkey}`.",
-                        level="warning", parse_mode="Markdown"
+                    reject_data = reject_response.get("data") if isinstance(reject_response, dict) else None
+                    is_rejected = (
+                        reject_response
+                        and not reject_response.get("errors")
+                        and isinstance(reject_data, dict)
+                        and (
+                            ((((reject_data.get("market") or {}).get("order") or {}).get("seller") or {}).get("reject") or {}).get("success") is True
+                            or reject_data.get("sellerRejectOrder") is True
+                        )
                     )
-                    processed_banned_offer_ids.add(offer_id)
-                    logging.info(f"Added {offer_id} to processed_banned_offer_ids after successful auto-rejection.")
-                elif reject_response and reject_response.get("errors"):
-                    logging.error(
-                        f"Failed to auto-reject offer {offer_id} from banned pubkey {destination_pubkey}. "
-                        f"Amboss errors: {reject_response.get('errors')}"
-                    )
+
+                    if is_rejected:
+                        send_telegram_notification(
+                            f"🗑️ Auto-rejected offer `{offer_id}` (was WAITING_FOR_SELLER_APPROVAL) from banned pubkey: `{destination_pubkey}`.",
+                            level="warning", parse_mode="Markdown"
+                        )
+                        processed_banned_offer_ids.add(offer_id)
+                        logging.info(f"Added {offer_id} to processed_banned_offer_ids after successful auto-rejection.")
+                    elif reject_response and reject_response.get("errors"):
+                        logging.error(
+                            f"Failed to auto-reject offer {offer_id} from banned pubkey {destination_pubkey}. "
+                            f"Amboss errors: {reject_response.get('errors')}"
+                        )
+                    else:
+                        logging.warning(
+                            f"Auto-rejection of offer {offer_id} from banned pubkey {destination_pubkey} "
+                            f"did not confirm success or failed. Response: {reject_response}. Will retry processing next cycle."
+                        )
                 else:
-                    logging.warning(
-                        f"Auto-rejection of offer {offer_id} from banned pubkey {destination_pubkey} "
-                        f"did not confirm success or failed. Response: {reject_response}. Will retry processing next cycle."
-                    )
-            else:
-                logging.debug(f"Offer {offer_id} from banned pubkey {destination_pubkey} was already attempted for auto-rejection. Skipping action this cycle.")
-            continue
+                    logging.debug(f"Offer {offer_id} from banned pubkey {destination_pubkey} was already attempted for auto-rejection. Skipping action this cycle.")
+                continue
 
-        logging.info(f"Found actionable offer WAITING_FOR_SELLER_APPROVAL: {offer_id}")
-        return offer
+            logging.info(f"Found actionable offer WAITING_FOR_SELLER_APPROVAL: {offer_id}")
+            return offer
+
+        offset += len(offer_orders_list)
+        total_raw = sales_data.get("total")
+        total = int(total_raw) if isinstance(total_raw, (int, str)) and str(total_raw).isdigit() else len(offer_orders_list)
+        if offset >= total:
+            break
 
     logging.info("No actionable offers found awaiting seller approval.")
     return None
@@ -1736,17 +1901,17 @@ def process_new_offers():
     extended_details_parts = []
     if destination_pubkey:
         node_details = get_node_extended_details(destination_pubkey)
-        if node_details:
+        if isinstance(node_details, dict) and node_details:
             # Amboss specific
-            amboss_info = node_details.get("amboss")
-            if amboss_info and amboss_info.get("is_claimed") is not None:
+            amboss_info = node_details.get("amboss") or {}
+            if isinstance(amboss_info, dict) and amboss_info.get("is_claimed") is not None:
                 extended_details_parts.append(f"Claimed: {'Yes' if amboss_info['is_claimed'] else 'No'}")
 
             # Graph Info
-            graph_info = node_details.get("graph_info")
-            if graph_info:
-                channels_info = graph_info.get("channels")
-                if channels_info:
+            graph_info = node_details.get("graph_info") or {}
+            if isinstance(graph_info, dict) and graph_info:
+                channels_info = graph_info.get("channels") or {}
+                if isinstance(channels_info, dict) and channels_info:
                     if channels_info.get("num_channels") is not None:
                         extended_details_parts.append(f"Channels: {channels_info['num_channels']}")
                     if channels_info.get("total_capacity"):
@@ -1756,12 +1921,28 @@ def process_new_offers():
                         except ValueError:
                             logging.warning(f"Could not parse total_capacity: {channels_info['total_capacity']}")
 
+                closure_types = graph_info.get("channel_closure_types") or []
+                if isinstance(closure_types, list) and closure_types:
+                    closure_summaries = []
+                    for ct in closure_types:
+                        if isinstance(ct, dict) and ct.get("type") is not None:
+                            ct_type = ct.get("type")
+                            ct_amount = ct.get("amount")
+                            ct_percent = ct.get("percent")
+                            if ct_amount is not None and ct_percent is not None:
+                                closure_summaries.append(f"{ct_type}: {ct_amount} ({ct_percent}%)")
+                            elif ct_amount is not None:
+                                closure_summaries.append(f"{ct_type}: {ct_amount}")
+                            else:
+                                closure_summaries.append(f"{ct_type}")
+                    if closure_summaries:
+                        extended_details_parts.append(f"Closures: {', '.join(closure_summaries)}")
 
             # Socials
-            socials = node_details.get("socials")
-            if socials:
-                social_info = socials.get("info")
-                if social_info:
+            socials = node_details.get("socials") or {}
+            if isinstance(socials, dict) and socials:
+                social_info = socials.get("info") or {}
+                if isinstance(social_info, dict) and social_info:
                     for key, label in [
                         ("email", "Email"), ("nostr_username", "Nostr"),
                         ("telegram", "Telegram"), ("twitter", "Twitter"),
@@ -1776,13 +1957,26 @@ def process_new_offers():
                                 value_display = str(value)
                             extended_details_parts.append(f"{label}: `{value_display}`")
                 
-                ll_info = socials.get("lightning_labs", {}).get("terminal_web")
-                if ll_info and ll_info.get("position") is not None:
-                    extended_details_parts.append(f"TermRank: {ll_info['position']}")
+                ll_info = ((socials.get("lightning_labs") or {}).get("terminal_web")) or {}
+                if isinstance(ll_info, dict):
+                    if ll_info.get("position") is not None:
+                        extended_details_parts.append(f"TermRank: {ll_info['position']}")
+                    bos_score_obj = ll_info.get("bos_score") if isinstance(ll_info.get("bos_score"), dict) else {}
+                    bos_score_val = ll_info.get("score") if ll_info.get("score") is not None else bos_score_obj.get("score")
+                    bos_updated = ll_info.get("updated") or bos_score_obj.get("updated")
+                    if bos_score_val is not None:
+                        if bos_updated:
+                            extended_details_parts.append(f"BOS Score: {bos_score_val} (Updated: {bos_updated})")
+                        else:
+                            extended_details_parts.append(f"BOS Score: {bos_score_val}")
                 
-                lnplus_info = socials.get("ln_plus", {}).get("rankings")
-                if lnplus_info and lnplus_info.get("rank_name"):
+                lnplus_info = (socials.get("ln_plus") or {}).get("rankings")
+                if isinstance(lnplus_info, dict) and lnplus_info.get("rank_name"):
                     extended_details_parts.append(f"LN+Rank: {lnplus_info['rank_name']}")
+                elif isinstance(lnplus_info, list):
+                    rank_names = [r.get("rank_name") for r in lnplus_info if isinstance(r, dict) and r.get("rank_name")]
+                    if rank_names:
+                        extended_details_parts.append(f"LN+Rank: {', '.join(rank_names)}")
     
     # Construct the prompt message
     prompt_lines = [

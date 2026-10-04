@@ -171,24 +171,55 @@ def fetch_amboss_data(
         variables = {"pubkey": pubkey, "timeRange": time_range}
         payload = {"query": query, "variables": variables}
         try:
-            response = requests.post(amboss_url, json=payload, headers=headers)
+            response = requests.post(
+                amboss_url, json=payload, headers=headers, timeout=20
+            )
+            if response.status_code >= 400:
+                body_snippet = (response.text or "")[:1000]
+                logging.error(
+                    f"Amboss API HTTP {response.status_code} for {time_range}: {body_snippet}"
+                )
+                raise AmbossAPIError(
+                    f"Amboss API HTTP {response.status_code} for {time_range}: {body_snippet}",
+                    status_code=response.status_code,
+                    response_data=body_snippet,
+                )
             response.raise_for_status()
             data = response.json()
             logging.debug(
                 f"Raw Amboss API response for {time_range}: {json.dumps(data)}"
             )
-            if data.get("errors"):
+            if isinstance(data, dict) and data.get("errors"):
                 logging.error(f"Amboss API error for {time_range}: {data['errors']}")
                 raise AmbossAPIError(
                     f"Amboss API error for {time_range}: {data['errors']}"
                 )
-            channels = data["data"]["getNode"]["graph_info"]["channels"]
-            if channels:
-                fee_info = channels["fee_info"]["remote"]
-                all_fee_data[time_range] = fee_info
+            if (
+                not isinstance(data, dict)
+                or not isinstance(data.get("data"), dict)
+                or not isinstance(data["data"].get("getNode"), dict)
+            ):
+                logging.error(
+                    f"Missing getNode data for {pubkey} in {time_range}: {data}"
+                )
+                raise AmbossAPIError(
+                    f"Missing getNode data for {pubkey} in {time_range}"
+                )
+            graph_info = data["data"]["getNode"].get("graph_info") or {}
+            channels = (
+                graph_info.get("channels") if isinstance(graph_info, dict) else None
+            )
+            fee_info_obj = (
+                channels.get("fee_info") if isinstance(channels, dict) else None
+            )
+            remote_fee_info = (
+                fee_info_obj.get("remote") if isinstance(fee_info_obj, dict) else None
+            )
+            if isinstance(remote_fee_info, dict):
+                all_fee_data[time_range] = remote_fee_info
             else:
                 logging.warning(
-                    f"No channels found for pubkey {pubkey} in time range {time_range}"
+                    f"No remote fee_info found for pubkey {pubkey} in time range {time_range}"
                 )
                 all_fee_data[time_range] = {}
         except requests.exceptions.RequestException as e:
