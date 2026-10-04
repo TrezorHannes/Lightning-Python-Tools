@@ -392,3 +392,32 @@ def test_import_has_no_logging_side_effects():
         isinstance(h, logging.FileHandler) and h.baseFilename.endswith("amboss-LNDg_changes.log")
         for h in root.handlers
     )
+
+
+def test_expired_lease_with_zero_blocks_marked_finished_not_active(isolated_module, requests_mock):
+    """An active order with blocks_until_can_be_closed == 0 must transition to finished."""
+    requests_mock.post(SPACE, json={"data": {"getEdgeInfoBatch": []}})
+    scid = "967276x1075x1"
+    orders = [
+        {**_simple("a", "VALID_CHANNEL_OPENING", scid),
+         "blocks_until_can_be_closed": 0,
+         "promises": {"locked_min_block_length": 8640, "locked_fee_rate_cap": {"sats": "1650"}}},
+    ]
+    active, finished, groups = amboss_pull.cluster_sold_channels(orders=orders)
+    assert active == []
+    assert groups == {}
+    assert finished == [long_id(scid)]
+
+
+def test_rejected_or_cancelled_order_with_channel_id_not_clustered(isolated_module, requests_mock):
+    """Non-lease orders must not be marked finished or active."""
+    requests_mock.post(SPACE, json={"data": {"getEdgeInfoBatch": []}})
+    scid = "967276x1075x1"
+    orders = [
+        _simple("rej", "SELLER_REJECTED", scid),
+        _simple("canc", "CANCELLED", "967276x1075x2"),
+    ]
+    active, finished, groups = amboss_pull.cluster_sold_channels(orders=orders)
+    assert active == []
+    assert finished == []
+    assert groups == {}

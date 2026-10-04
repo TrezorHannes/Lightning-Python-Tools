@@ -77,7 +77,7 @@ def get_current_timestamp() -> str:
 
 
 def lndg_channels_url() -> str:
-    return f"{LNDG_BASE_URL}/api/channels/?is_active=true&is_open=true&limit=300&offset=0"
+    return f"{LNDG_BASE_URL}/api/channels/?is_open=true&limit=1000&offset=0"
 
 
 def lndg_channel_url(chan_id: str) -> str:
@@ -188,7 +188,7 @@ def execute_graphql(
     for attempt in range(1, max_attempts + 1):
         try:
             response = requests.post(url, json=payload, headers=headers, timeout=timeout)
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        except requests.exceptions.RequestException as e:
             error = AmbossAPIError(f"{operation}: network error: {e}", transient=True)
         else:
             error = _classify_graphql_response(response, operation)
@@ -496,14 +496,14 @@ def cluster_sold_channels(
         min_block_length = info["locked_min_block_length"]
         fee_cap = info["locked_fee_rate_cap"]
 
-        if status in ACTIVE_LEASE_STATUSES:
+        if status in ACTIVE_LEASE_STATUSES and blocks_until_close > 0:
             fee_grace_calc = -1 * (min_block_length - blocks_until_close - fee_grace)
             active_channels_info.append((long_chan_id, blocks_until_close, fee_cap, fee_grace_calc))
             fee_cap_groups.setdefault(fee_cap, [])
             if long_chan_id not in fee_cap_groups[fee_cap]:
                 fee_cap_groups[fee_cap].append(long_chan_id)
 
-        elif status in FINISHED_LEASE_STATUSES or blocks_until_close == 0:
+        elif status in FINISHED_LEASE_STATUSES or (status in ACTIVE_LEASE_STATUSES and blocks_until_close <= 0):
             if long_chan_id not in non_active_chan_ids:
                 non_active_chan_ids.append(long_chan_id)
             logging.debug(f"Added to non_active_chan_ids: {long_chan_id}")
@@ -562,16 +562,16 @@ def update_notes_for_active_channels(active_channels_info: List[tuple]) -> Dict[
 
     for item in active_channels_info:
         try:
-            chan_id, blocks_until_close, fee_cap, min_block_length = item
+            chan_id, blocks_until_close, fee_cap, fee_grace_calc = item
         except (ValueError, TypeError):
             logging.error(f"Error unpacking item: {item}. Expected a 4-element tuple.")
             result["failed"] += 1
             continue
 
-        if min_block_length < 0:
+        if fee_grace_calc < 0:
             notes = f"Status: 🌋 Magma Channel Buy Order Active \n(Lease Expiration: {blocks_until_close} blocks). \nFee Cap: {fee_cap}. Proportional Fee Rate activated ✅"
         else:
-            notes = f"Status: 🌋 Magma Channel Buy Order Active \n(Lease Expiration: {blocks_until_close} blocks). \nFee Cap: {fee_cap}. Proportional Fee Rate in: {min_block_length}."
+            notes = f"Status: 🌋 Magma Channel Buy Order Active \n(Lease Expiration: {blocks_until_close} blocks). \nFee Cap: {fee_cap}. Proportional Fee Rate in: {fee_grace_calc}."
 
         payload = {"chan_id": chan_id, "auto_fees": False, "notes": notes}
         if _put_lndg_channel(chan_id, payload):
