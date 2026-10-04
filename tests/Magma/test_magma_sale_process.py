@@ -1105,10 +1105,12 @@ def test_graphql_http_400_validation_error_surfaces_response_body(magma_module, 
         assert any('Cannot query field "bos_score"' in r.message for r in caplog.records)
 
         caplog.clear()
+        mock_file_open = mocker.patch("builtins.open", mocker.mock_open())
         res_confirm = magma_module.confirm_channel_point_to_amboss("order_400", "txid:0")
         assert "errors" in res_confirm
         assert 'Cannot query field "bos_score"' in res_confirm["errors"][0]["message"]
         assert any('Cannot query field "bos_score"' in r.message for r in caplog.records)
+        mock_file_open.assert_called_with(magma_module.CRITICAL_ERROR_FILE_PATH, "a")
 
 
 def test_get_offers_awaiting_seller_approval_paginates_when_needed(magma_module):
@@ -1207,4 +1209,23 @@ def test_get_orders_awaiting_channel_open_paginates_when_needed(magma_module):
     second_vars = magma_module.requests.post.call_args_list[1][1]["json"]["variables"]
     assert first_vars["page"] == {"limit": 25, "offset": 0}
     assert second_vars["page"] == {"limit": 25, "offset": 25}
+
+
+def test_confirm_channel_point_http_error_with_null_errors_field(magma_module):
+    """Verify confirm_channel_point_to_amboss handles HTTP >= 400 payload with 'errors': None or [] without TypeError/IndexError."""
+    import requests as real_requests
+
+    for empty_err in (None, []):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 502
+        mock_resp.text = f'{{"errors": { "null" if empty_err is None else "[]" }}}'
+        mock_resp.json.return_value = {"errors": empty_err}
+        mock_resp.raise_for_status.side_effect = real_requests.exceptions.HTTPError(
+            "502 Server Error: Bad Gateway", response=mock_resp
+        )
+        magma_module.requests.post = MagicMock(return_value=mock_resp)
+        res = magma_module.confirm_channel_point_to_amboss("order_502", "txid:0")
+        assert "errors" in res
+        assert "502 Server Error" in res["errors"][0]["message"]
+
 

@@ -579,3 +579,20 @@ def test_fetch_my_current_offers_paginates_multiple_pages(fee_module):
     assert [o["id"] for o in my_offers] == ["my_off_p1", "my_off_p2"]
     assert fee_module.requests.post.call_count == 2
 
+
+def test_fetch_my_offer_details_handles_null_intermediate_objects(fee_module, mocker):
+    """Verify fetch_my_offer_details returns {} when GraphQL returns explicit null intermediate objects."""
+    mocker.patch.object(
+        fee_module,
+        "_execute_amboss_graphql_request",
+        side_effect=[
+            {"user": None},
+            {"user": {"market": None}},
+            {"user": {"market": {"offers": None}}},
+            {"user": {"market": {"offers": {"get_offer": None}}}},
+        ],
+    )
+    for _ in range(4):
+        assert fee_module.fetch_my_offer_details("off_null") == {}
+
+

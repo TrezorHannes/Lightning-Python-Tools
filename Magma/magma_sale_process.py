@@ -799,7 +799,7 @@ def accept_order(order_id, payment_request):
             logging.error(
                 f"HTTP {status_code} error accepting Amboss Magma order {order_id}. Body: {resp_text}"
             )
-            if error_json and "errors" in error_json:
+            if error_json and error_json.get("errors"):
                 logging.error(f"GraphQL errors accepting order {order_id}: {error_json.get('errors')}")
                 return error_json
         response.raise_for_status()
@@ -812,7 +812,7 @@ def accept_order(order_id, payment_request):
     except requests.exceptions.RequestException as e:
         err_resp = getattr(e, "response", None) or response
         error_json, resp_text = _extract_error_details_from_response(err_resp)
-        if error_json and "errors" in error_json:
+        if error_json and error_json.get("errors"):
             logging.error(
                 f"API request error accepting Amboss Magma order {order_id}: {e} | "
                 f"GraphQL errors: {error_json.get('errors')} | Body: {resp_text}"
@@ -855,7 +855,7 @@ def reject_order(order_id):
             logging.error(
                 f"HTTP {status_code} error rejecting Amboss Magma order {order_id}. Body: {resp_text}"
             )
-            if error_json and "errors" in error_json:
+            if error_json and error_json.get("errors"):
                 logging.error(f"GraphQL errors rejecting order {order_id}: {error_json.get('errors')}")
                 return error_json
         response.raise_for_status()
@@ -868,7 +868,7 @@ def reject_order(order_id):
     except requests.exceptions.RequestException as e:
         err_resp = getattr(e, "response", None) or response
         error_json, resp_text = _extract_error_details_from_response(err_resp)
-        if error_json and "errors" in error_json:
+        if error_json and error_json.get("errors"):
             logging.error(
                 f"API request error rejecting Amboss Magma order {order_id}: {e} | "
                 f"GraphQL errors: {error_json.get('errors')} | Body: {resp_text}"
@@ -912,7 +912,7 @@ def confirm_channel_point_to_amboss(order_id, transaction):
             logging.error(
                 f"HTTP {status_code} error confirming channel point to Amboss for order {order_id}. Body: {resp_text}"
             )
-            if error_json and "errors" in error_json:
+            if error_json and error_json.get("errors"):
                 logging.error(f"GraphQL errors confirming channel point for order {order_id}: {error_json.get('errors')}")
                 response_json = error_json
             else:
@@ -923,7 +923,7 @@ def confirm_channel_point_to_amboss(order_id, transaction):
             response_json = response.json()
         logging.info(f"Amboss Magma add_transaction response for {order_id}: {response_json}")
 
-        if "errors" in response_json:
+        if isinstance(response_json, dict) and response_json.get("errors"):
             error_message = response_json["errors"][0].get("message", "Unknown Amboss API error")
             log_content = (
                 f"Amboss API error in confirm_channel_point_to_amboss for order ID {order_id}, TX: {transaction}.\n"
@@ -944,7 +944,7 @@ def confirm_channel_point_to_amboss(order_id, transaction):
     except requests.exceptions.RequestException as e:
         err_resp = getattr(e, "response", None) or response
         error_json, resp_text = _extract_error_details_from_response(err_resp)
-        if error_json and "errors" in error_json:
+        if error_json and error_json.get("errors"):
             logging.error(
                 f"API request error confirming channel point to Amboss for order {order_id}: {e} | "
                 f"GraphQL errors: {error_json.get('errors')} | Body: {resp_text}"

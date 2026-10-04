@@ -994,9 +994,7 @@ def fetch_my_offer_details(offer_id, amboss_token=None):
     if not isinstance(data, dict):
         return {}
     offer_details = (
-        data.get("user", {})
-        .get("market", {})
-        .get("offers", {})
+        (((data.get("user") or {}).get("market") or {}).get("offers") or {})
         .get("get_offer")
     )
     if isinstance(offer_details, dict):
