@@ -948,3 +948,263 @@ def test_telegram_logging_handler_no_duplicate_dispatches(magma_module):
     logging.error("Single operational failure on root logger")
     assert magma_module.bot.send_message.call_count == 1
 
+
+def test_get_node_extended_details_live_schema_contract(magma_module):
+    """Verify get_node_extended_details sends live Amboss Space schema contract ($from, score, no bos_score)."""
+    mock_response = {
+        "data": {
+            "getNode": {
+                "amboss": {"is_claimed": True},
+                "graph_info": {
+                    "channels": {"num_channels": 10, "total_capacity": "50000000"},
+                    "channel_closure_types": [{"type": "COOPERATIVE", "amount": 5, "percent": 100.0}],
+                    "node": {"addresses": []},
+                },
+                "socials": {
+                    "info": {"email": "node@example.com"},
+                    "lightning_labs": {"terminal_web": {"score": 91.2, "position": 12}},
+                    "ln_plus": {"rankings": []},
+                },
+            }
+        }
+    }
+    mock_post = MagicMock()
+    mock_post.status_code = 200
+    mock_post.json.return_value = mock_response
+    mock_post.raise_for_status.return_value = None
+    magma_module.requests.post = MagicMock(return_value=mock_post)
+
+    details = magma_module.get_node_extended_details("03pubkey_live", amboss_token="custom_tok")
+    assert details["amboss"]["is_claimed"] is True
+
+    call_args = magma_module.requests.post.call_args
+    assert call_args[0][0] == magma_module.AMBOSS_SPACE_GRAPHQL_URL
+    payload = call_args[1]["json"]
+    query = payload["query"]
+    variables = payload["variables"]
+
+    assert "query GetNodeDetails($pubkey: String!, $from: String!)" in query
+    assert "channel_closure_types(from: $from)" in query
+    assert "terminal_web" in query
+    assert "score" in query
+    assert "bos_score" not in query
+    assert variables == {"pubkey": "03pubkey_live", "from": "1970-01-01"}
+
+
+def test_process_new_offers_extended_details_null_safety_and_direct_bos_score(magma_module, mocker):
+    """Verify process_new_offers handles live terminal_web.score, legacy bos_score, and explicit None fields safely."""
+    sample_offer = {
+        "id": "offer_ext_001",
+        "status": "WAITING_FOR_SELLER_APPROVAL",
+        "amount": {"satoshi": {"sats": "2000000"}},
+        "fees": {"seller": {"sats": "4000"}},
+        "destination": {"pubkey": "03buyer_ext_123456", "alias": "ExtBuyer"},
+    }
+    magma_module.pending_user_confirmations.clear()
+    mocker.patch.object(magma_module, "get_offers_awaiting_seller_approval", return_value=sample_offer)
+    mocker.patch.object(magma_module, "get_node_alias", return_value="ExtBuyer")
+
+    mock_msg = MagicMock()
+    mock_msg.message_id = 101
+    mock_send = mocker.patch.object(magma_module, "send_telegram_notification", return_value=mock_msg)
+
+    # Case 1: Live-shaped data with direct terminal_web.score
+    live_extended = {
+        "amboss": {"is_claimed": True},
+        "graph_info": {
+            "channels": {"num_channels": 20, "total_capacity": "100000000"},
+            "channel_closure_types": [{"type": "COOPERATIVE", "amount": 8, "percent": 80.0}],
+        },
+        "socials": {
+            "info": {"telegram": "@extbuyer"},
+            "lightning_labs": {"terminal_web": {"score": 88.5, "position": 42}},
+            "ln_plus": {"rankings": {"rank_name": "Diamond"}},
+        },
+    }
+    mocker.patch.object(magma_module, "get_node_extended_details", return_value=live_extended)
+    magma_module.process_new_offers()
+
+    sent_prompt_1 = mock_send.call_args[0][0]
+    assert "88.5" in sent_prompt_1
+    assert "TermRank: 42" in sent_prompt_1
+
+    # Case 2: Nullable nested objects returned as explicit None
+    magma_module.pending_user_confirmations.clear()
+    mock_send.reset_mock()
+    null_extended = {
+        "amboss": None,
+        "graph_info": {
+            "channels": None,
+            "channel_closure_types": None,
+            "node": None,
+        },
+        "socials": {
+            "info": None,
+            "lightning_labs": {"terminal_web": None},
+            "ln_plus": {"rankings": None},
+        },
+    }
+    mocker.patch.object(magma_module, "get_node_extended_details", return_value=null_extended)
+    # Must not raise AttributeError
+    magma_module.process_new_offers()
+    assert mock_send.called
+
+    # Case 3: Top-level lightning_labs and ln_plus are None, or legacy bos_score dict is used
+    magma_module.pending_user_confirmations.clear()
+    mock_send.reset_mock()
+    legacy_and_null_extended = {
+        "amboss": {"is_claimed": False},
+        "graph_info": None,
+        "socials": {
+            "info": None,
+            "lightning_labs": {"terminal_web": {"bos_score": {"score": 79.1, "updated": "2026-01-01"}}},
+            "ln_plus": None,
+        },
+    }
+    mocker.patch.object(magma_module, "get_node_extended_details", return_value=legacy_and_null_extended)
+    magma_module.process_new_offers()
+    sent_prompt_3 = mock_send.call_args[0][0]
+    assert "79.1" in sent_prompt_3
+
+
+def test_graphql_http_400_validation_error_surfaces_response_body(magma_module, mocker, caplog):
+    """Verify HTTP 400 GraphQL validation errors log response body and return GraphQL errors."""
+    error_payload = {
+        "errors": [
+            {
+                "message": 'Cannot query field "bos_score" on type "TerminalWebScore". Did you mean "score"?',
+                "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"},
+            }
+        ]
+    }
+    mock_resp = MagicMock()
+    mock_resp.status_code = 400
+    mock_resp.text = '{"errors":[{"message":"Cannot query field \\"bos_score\\" on type \\"TerminalWebScore\\". Did you mean \\"score\\"?"}]}'
+    mock_resp.json.return_value = error_payload
+    mock_resp.raise_for_status.side_effect = magma_module.requests.exceptions.HTTPError(
+        "400 Client Error: Bad Request", response=mock_resp
+    )
+    magma_module.requests.post = MagicMock(return_value=mock_resp)
+    mocker.patch.object(magma_module, "send_telegram_notification")
+
+    with caplog.at_level(logging.ERROR):
+        res_exec = magma_module._execute_amboss_graphql_request({"query": "{ bad }"}, "TestBadQuery")
+        assert res_exec is None
+        assert any('Cannot query field "bos_score"' in r.message for r in caplog.records)
+
+        caplog.clear()
+        res_accept = magma_module.accept_order("order_400", "lnbc123")
+        assert "errors" in res_accept
+        assert 'Cannot query field "bos_score"' in res_accept["errors"][0]["message"]
+        assert any('Cannot query field "bos_score"' in r.message for r in caplog.records)
+
+        caplog.clear()
+        res_reject = magma_module.reject_order("order_400")
+        assert "errors" in res_reject
+        assert 'Cannot query field "bos_score"' in res_reject["errors"][0]["message"]
+        assert any('Cannot query field "bos_score"' in r.message for r in caplog.records)
+
+        caplog.clear()
+        res_confirm = magma_module.confirm_channel_point_to_amboss("order_400", "txid:0")
+        assert "errors" in res_confirm
+        assert 'Cannot query field "bos_score"' in res_confirm["errors"][0]["message"]
+        assert any('Cannot query field "bos_score"' in r.message for r in caplog.records)
+
+
+def test_get_offers_awaiting_seller_approval_paginates_when_needed(magma_module):
+    """Verify get_offers_awaiting_seller_approval paginates across pages when total > 25."""
+    page1_orders = [
+        {
+            "id": f"order_skip_{i}",
+            "status": "COMPLETED",
+            "amount": {"satoshi": {"sats": "1000000"}},
+            "fees": {"seller": {"sats": "1000"}},
+            "destination": {"pubkey": f"02pub_{i}", "alias": f"Node{i}"},
+        }
+        for i in range(25)
+    ]
+    page2_orders = [
+        {
+            "id": "order_target_page2",
+            "status": "WAITING_FOR_SELLER_APPROVAL",
+            "amount": {"satoshi": {"sats": "3000000"}},
+            "fees": {"seller": {"sats": "6000"}},
+            "destination": {"pubkey": "02goodbuyer_p2", "alias": "Page2Buyer"},
+        }
+    ]
+
+    resp_page1 = MagicMock()
+    resp_page1.status_code = 200
+    resp_page1.raise_for_status.return_value = None
+    resp_page1.json.return_value = {
+        "data": {"user": {"market": {"orders": {"sales": {"total": 26, "list": page1_orders}}}}}
+    }
+
+    resp_page2 = MagicMock()
+    resp_page2.status_code = 200
+    resp_page2.raise_for_status.return_value = None
+    resp_page2.json.return_value = {
+        "data": {"user": {"market": {"orders": {"sales": {"total": 26, "list": page2_orders}}}}}
+    }
+
+    magma_module.requests.post = MagicMock(side_effect=[resp_page1, resp_page2])
+
+    offer = magma_module.get_offers_awaiting_seller_approval()
+    assert offer is not None
+    assert offer["id"] == "order_target_page2"
+    assert magma_module.requests.post.call_count == 2
+
+    first_vars = magma_module.requests.post.call_args_list[0][1]["json"]["variables"]
+    second_vars = magma_module.requests.post.call_args_list[1][1]["json"]["variables"]
+    assert first_vars["page"] == {"limit": 25, "offset": 0}
+    assert second_vars["page"] == {"limit": 25, "offset": 25}
+
+
+def test_get_orders_awaiting_channel_open_paginates_when_needed(magma_module):
+    """Verify get_orders_awaiting_channel_open paginates across pages when total > 25."""
+    page1_orders = [
+        {
+            "id": f"order_other_{i}",
+            "status": "WAITING_FOR_BUYER_PAYMENT",
+            "amount": {"satoshi": {"sats": "1000000"}},
+            "fees": {"seller": {"sats": "1000"}},
+            "destination": {"pubkey": f"03pub_{i}", "alias": f"Node{i}"},
+        }
+        for i in range(25)
+    ]
+    page2_orders = [
+        {
+            "id": "order_channel_open_page2",
+            "status": "WAITING_FOR_CHANNEL_OPEN",
+            "amount": {"satoshi": {"sats": "4000000"}},
+            "fees": {"seller": {"sats": "8000"}},
+            "destination": {"pubkey": "03peer_p2", "alias": "PeerPage2"},
+        }
+    ]
+
+    resp_page1 = MagicMock()
+    resp_page1.status_code = 200
+    resp_page1.raise_for_status.return_value = None
+    resp_page1.json.return_value = {
+        "data": {"user": {"market": {"orders": {"sales": {"total": 26, "list": page1_orders}}}}}
+    }
+
+    resp_page2 = MagicMock()
+    resp_page2.status_code = 200
+    resp_page2.raise_for_status.return_value = None
+    resp_page2.json.return_value = {
+        "data": {"user": {"market": {"orders": {"sales": {"total": 26, "list": page2_orders}}}}}
+    }
+
+    magma_module.requests.post = MagicMock(side_effect=[resp_page1, resp_page2])
+
+    order = magma_module.get_orders_awaiting_channel_open()
+    assert order is not None
+    assert order["id"] == "order_channel_open_page2"
+    assert magma_module.requests.post.call_count == 2
+
+    first_vars = magma_module.requests.post.call_args_list[0][1]["json"]["variables"]
+    second_vars = magma_module.requests.post.call_args_list[1][1]["json"]["variables"]
+    assert first_vars["page"] == {"limit": 25, "offset": 0}
+    assert second_vars["page"] == {"limit": 25, "offset": 25}
+
