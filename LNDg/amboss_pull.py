@@ -1,15 +1,19 @@
-# Purpose: This script downloads active and expired Magma orders from Amboss.
+# Purpose: This script downloads active and expired Magma sales from Amboss.
 # It writes long-channel-IDs into charge-lnd rule files by fee cap, removes channels
 # once the lease expires, re-enables AutoFees in LNDg, and logs status notes in LNDg.
+#
+# Failure policy (fail closed): if the Amboss API cannot be read completely, no
+# charge-lnd rule file and no LNDg channel is touched, and the process exits non-zero.
 
 import requests
 import os
+import re
+import sys
 import datetime
 import time
 import logging
+import tempfile
 import configparser
-import json
-import re
 from typing import Dict, List, Tuple, Optional, Any
 
 # Grace period in blocks until charge-lnd changes from static to proportional fee strategy
@@ -30,92 +34,94 @@ AMBOSS_TOKEN = config.get("credentials", "amboss_authorization", fallback="")
 LNDG_USERNAME = config.get("credentials", "lndg_username", fallback="")
 LNDG_PASSWORD = config.get("credentials", "lndg_password", fallback="")
 LNDG_BASE_URL = config.get("lndg", "lndg_api_url", fallback="http://localhost:8889")
-LNDG_CHANNELS_URL = f"{LNDG_BASE_URL}/api/channels/?is_active=true&is_open=true&limit=300&offset=0"
 
 # Output Paths
 CHARGE_LND_PATH = config.get("paths", "charge_lnd_path", fallback="/tmp/charge-lnd")
-FINISHED_FILE_PATH = os.path.join(CHARGE_LND_PATH, "magma-finished.txt")
+FINISHED_FILE_NAME = "magma-finished.txt"
+FEE_CAP_FILE_PATTERN = re.compile(r"^magma-channels_(\d+)\.txt$")
 LOG_FILE_PATH = os.path.join(parent_dir, "..", "logs", "amboss-LNDg_changes.log")
 
-# Setup Logging
-logs_dir = os.path.join(parent_dir, "..", "logs")
-if not os.path.exists(logs_dir):
-    try:
-        os.makedirs(logs_dir, exist_ok=True)
-    except Exception:
-        pass
+# --- Magma order lifecycle ---
+# Only orders we SOLD carry a seller fee-cap promise; purchases are intentionally excluded.
+ACTIVE_LEASE_STATUSES = frozenset({"VALID_CHANNEL_OPENING"})
+FINISHED_LEASE_STATUSES = frozenset({"CHANNEL_MONITORING_FINISHED"})
 
-logging.basicConfig(
-    filename=LOG_FILE_PATH,
-    level=logging.DEBUG,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+SALES_PAGE_SIZE = 100
+MAX_SALES_PAGES = 50  # hard guard against runaway pagination (5000 orders)
+RESPONSE_BODY_LOG_LIMIT = 1000
 
 
 class AmbossAPIError(Exception):
     """Represents an error when interacting with Amboss GraphQL APIs."""
-    def __init__(self, message, status_code=None, response_data=None):
+    def __init__(self, message, status_code=None, response_data=None, transient=False):
         super().__init__(message)
         self.status_code = status_code
         self.response_data = response_data
+        self.transient = transient
+
+
+def configure_logging() -> None:
+    """Configure file logging. Called from main() only, so importing has no side effects."""
+    os.makedirs(os.path.dirname(LOG_FILE_PATH), exist_ok=True)
+    logging.basicConfig(
+        filename=LOG_FILE_PATH,
+        level=logging.DEBUG,
+        format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+    # urllib3 connection chatter adds no diagnostic value over our own request logging
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
 def get_current_timestamp() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-# --- GraphQL Queries ---
+def lndg_channels_url() -> str:
+    return f"{LNDG_BASE_URL}/api/channels/?is_active=true&is_open=true&limit=300&offset=0"
 
-GET_USER_ORDERS_QUERY = """
-query GetUserOrders($input: OrderInput, $page: PageInput) {
+
+def lndg_channel_url(chan_id: str) -> str:
+    return f"{LNDG_BASE_URL}/api/channels/{chan_id}/"
+
+
+# --- GraphQL Queries ---
+# NOTE: list items are `SimpleMarketOrder`, which does NOT expose `promises` or
+# `blocks_until_can_be_closed`. Those live on the full `MarketOrder` (get_order).
+
+GET_SALES_PAGE_QUERY = """
+query GetMagmaSales($page: PageInput) {
   user {
     market {
       orders {
-        sales(input: $input, page: $page) {
+        sales(page: $page) {
           total
-          pagination {
-            limit
-            offset
-          }
           list {
             id
             status
             channel_id
             created_at
-            amount {
-              satoshi {
-                sats
-              }
-            }
-            promises {
-              locked_min_block_length
-              locked_fee_rate_cap {
-                sats
-              }
-            }
           }
         }
-        purchases(input: $input, page: $page) {
-          total
-          pagination {
-            limit
-            offset
-          }
-          list {
-            id
-            status
-            channel_id
-            created_at
-            amount {
-              satoshi {
-                sats
-              }
-            }
-            promises {
-              locked_min_block_length
-              locked_fee_rate_cap {
-                sats
-              }
+      }
+    }
+  }
+}
+"""
+
+GET_ORDER_LEASE_DETAILS_QUERY = """
+query GetOrderLeaseDetails($orderId: String!) {
+  user {
+    market {
+      orders {
+        get_order(order_id: $orderId) {
+          id
+          status
+          channel_id
+          blocks_until_can_be_closed
+          promises {
+            locked_min_block_length
+            locked_fee_rate_cap {
+              sats
             }
           }
         }
@@ -133,6 +139,112 @@ query GetEdgeInfoBatch($ids: [String!]!) {
   }
 }
 """
+
+
+def _truncate(text: Optional[str]) -> str:
+    text = text or ""
+    return text if len(text) <= RESPONSE_BODY_LOG_LIMIT else text[:RESPONSE_BODY_LOG_LIMIT] + "...[truncated]"
+
+
+def _dig(data: Any, *keys: str) -> Any:
+    for key in keys:
+        if not isinstance(data, dict):
+            return None
+        data = data.get(key)
+    return data
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    """Coerces GraphQL Int/Float/String scalars (e.g. 8640, 8640.0, "1650") to int."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def execute_graphql(
+    query: str,
+    variables: Optional[dict],
+    operation: str,
+    url: str = MAGMA_GRAPHQL_URL,
+    amboss_token: Optional[str] = None,
+    max_attempts: int = 5,
+    timeout: int = 15,
+    retry_delay: float = 2.0,
+) -> dict:
+    """
+    Executes a GraphQL request and returns its `data` object.
+
+    Transient failures (network errors, timeouts, HTTP 429/5xx) are retried. Deterministic
+    failures (HTTP 4xx, GraphQL `errors`, malformed bodies) raise immediately, with the
+    server's error body logged so schema drift is diagnosable from the log alone.
+    """
+    token = amboss_token or AMBOSS_TOKEN
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {"query": query, "variables": variables or {}}
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            error = AmbossAPIError(f"{operation}: network error: {e}", transient=True)
+        else:
+            error = _classify_graphql_response(response, operation)
+            if error is None:
+                return response.json()["data"]
+
+        if not error.transient:
+            logging.error(str(error))
+            raise error
+
+        logging.warning(f"{error} (attempt {attempt}/{max_attempts})")
+        if attempt == max_attempts:
+            raise AmbossAPIError(
+                f"{operation}: exceeded {max_attempts} attempts; last error: {error}",
+                status_code=error.status_code,
+                response_data=error.response_data,
+                transient=True,
+            )
+        time.sleep(retry_delay)
+
+    raise AmbossAPIError(f"{operation}: max_attempts must be >= 1")  # pragma: no cover
+
+
+def _classify_graphql_response(response: Any, operation: str) -> Optional[AmbossAPIError]:
+    """Returns None for a usable response, otherwise an AmbossAPIError describing the failure."""
+    status = response.status_code
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+
+    if status == 429 or status >= 500:
+        return AmbossAPIError(
+            f"{operation}: HTTP {status}: {_truncate(response.text)}",
+            status_code=status, response_data=body, transient=True,
+        )
+    if status >= 400:
+        return AmbossAPIError(
+            f"{operation}: HTTP {status}: {_truncate(response.text)}",
+            status_code=status, response_data=body,
+        )
+    if not isinstance(body, dict):
+        return AmbossAPIError(
+            f"{operation}: non-JSON response body: {_truncate(response.text)}", status_code=status,
+        )
+    if body.get("errors"):
+        messages = "; ".join(str(e.get("message", e)) if isinstance(e, dict) else str(e) for e in body["errors"])
+        return AmbossAPIError(
+            f"{operation}: GraphQL errors: {_truncate(messages)}", status_code=status, response_data=body,
+        )
+    if not isinstance(body.get("data"), dict):
+        return AmbossAPIError(
+            f"{operation}: response has no data object: {_truncate(response.text)}",
+            status_code=status, response_data=body,
+        )
+    return None
 
 
 def scid_to_short_channel_id(scid_str: Optional[str]) -> Optional[str]:
@@ -166,26 +278,22 @@ def convert_short_to_long_chan_id(short_chan_ids: List[str], amboss_token: Optio
     if not short_chan_ids:
         return {}
 
-    token = amboss_token or AMBOSS_TOKEN
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-    variables = {"ids": list(short_chan_ids)}
-    payload = {"query": GET_EDGE_INFO_BATCH_QUERY, "variables": variables}
-
     long_chan_id_map: Dict[str, str] = {}
 
     try:
-        response = requests.post(AMBOSS_SPACE_GRAPHQL_URL, json=payload, headers=headers, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-
-        if "data" in data and data["data"] and "getEdgeInfoBatch" in data["data"] and data["data"]["getEdgeInfoBatch"]:
-            for edge in data["data"]["getEdgeInfoBatch"]:
-                if edge and "short_channel_id" in edge and "long_channel_id" in edge:
-                    long_chan_id_map[edge["short_channel_id"]] = str(edge["long_channel_id"])
-    except Exception as e:
+        data = execute_graphql(
+            GET_EDGE_INFO_BATCH_QUERY,
+            {"ids": list(short_chan_ids)},
+            "GetEdgeInfoBatch",
+            url=AMBOSS_SPACE_GRAPHQL_URL,
+            amboss_token=amboss_token,
+            max_attempts=1,
+            timeout=10,
+        )
+        for edge in data.get("getEdgeInfoBatch") or []:
+            if edge and edge.get("short_channel_id") and edge.get("long_channel_id"):
+                long_chan_id_map[edge["short_channel_id"]] = str(edge["long_channel_id"])
+    except AmbossAPIError as e:
         logging.warning(f"Failed to query getEdgeInfoBatch from Space API: {e}. Using mathematical fallback.")
 
     # Mathematical fallback for any missing channel IDs
@@ -200,105 +308,179 @@ def convert_short_to_long_chan_id(short_chan_ids: List[str], amboss_token: Optio
     return long_chan_id_map
 
 
-def get_fee_cap_file_path(fee_cap: Any) -> str:
+def get_fee_cap_file_path(fee_cap: Any, output_dir: Optional[str] = None) -> str:
     """Returns the file path for charge-lnd rules for a specific fee cap."""
-    return os.path.join(CHARGE_LND_PATH, f"magma-channels_{fee_cap}.txt")
+    return os.path.join(output_dir or CHARGE_LND_PATH, f"magma-channels_{fee_cap}.txt")
 
 
 def extract_order_channel_info(order: dict) -> dict:
-    """Extracts normalized fields from a Magma Order object (supporting both modern and legacy shapes)."""
+    """Extracts normalized lease fields from a (detail-enriched) Magma Order object."""
     if not order:
         return {}
 
-    order_id = order.get("id")
-    status = str(order.get("status", "UNKNOWN")).upper()
-    channel_id = order.get("channel_id")
-    created_at = order.get("created_at")
+    promises = order.get("promises")
+    if not isinstance(promises, dict):
+        promises = {}
 
-    # Promises (fee cap & min block length)
-    promises = order.get("promises", {})
-    if isinstance(promises, dict):
-        min_block_length = int(promises.get("locked_min_block_length") or 0)
-        fee_cap_obj = promises.get("locked_fee_rate_cap")
-        if isinstance(fee_cap_obj, dict):
-            fee_cap = int(fee_cap_obj.get("sats", 0) or 0)
-        elif isinstance(fee_cap_obj, (int, str)) and str(fee_cap_obj).isdigit():
-            fee_cap = int(fee_cap_obj)
-        else:
-            fee_cap = int(promises.get("fee_rate_cap") or 0)
+    fee_cap_obj = promises.get("locked_fee_rate_cap")
+    if isinstance(fee_cap_obj, dict):
+        fee_cap = _to_int(fee_cap_obj.get("sats"))
     else:
-        min_block_length = int(order.get("locked_min_block_length") or order.get("min_block_length") or 0)
-        fee_cap = int(order.get("locked_fee_rate_cap") or order.get("fee_rate_cap") or 0)
-
-    blocks_until_close = int(order.get("blocks_until_can_be_closed") or order.get("blocks_until_close") or 0)
+        fee_cap = _to_int(fee_cap_obj)
 
     return {
-        "id": order_id,
-        "status": status,
-        "channel_id": channel_id,
-        "locked_min_block_length": min_block_length,
+        "id": order.get("id"),
+        "status": str(order.get("status") or "UNKNOWN").upper(),
+        "channel_id": order.get("channel_id"),
+        "locked_min_block_length": _to_int(promises.get("locked_min_block_length")),
         "locked_fee_rate_cap": fee_cap,
-        "blocks_until_close": blocks_until_close,
-        "created_at": created_at,
+        "blocks_until_close": _to_int(order.get("blocks_until_can_be_closed")),
+        "created_at": order.get("created_at"),
         "raw_order": order
     }
 
 
-def fetch_magma_orders(amboss_token: Optional[str] = None, max_attempts: int = 5, timeout: int = 15) -> List[dict]:
-    """Fetches user's active/historical Magma orders (both sales and purchases) from Magma GraphQL API."""
-    token = amboss_token or AMBOSS_TOKEN
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-    payload = {"query": GET_USER_ORDERS_QUERY, "variables": {"page": {"limit": 100, "offset": 0}}}
+def fetch_magma_sales(
+    amboss_token: Optional[str] = None,
+    page_size: int = SALES_PAGE_SIZE,
+    max_pages: int = MAX_SALES_PAGES,
+) -> List[dict]:
+    """Fetches ALL of the user's Magma sales (paginated). Raises AmbossAPIError on any failure."""
+    orders: List[dict] = []
+    seen_ids = set()
+    offset = 0
 
-    data = None
-    for attempt in range(max_attempts):
+    for _ in range(max_pages):
+        data = execute_graphql(
+            GET_SALES_PAGE_QUERY,
+            {"page": {"limit": page_size, "offset": offset}},
+            "GetMagmaSales",
+            amboss_token=amboss_token,
+        )
+        sales = _dig(data, "user", "market", "orders", "sales")
+        if not isinstance(sales, dict) or not isinstance(sales.get("list"), list):
+            raise AmbossAPIError(f"GetMagmaSales: unexpected response shape: {_truncate(str(data))}")
+
+        page = sales["list"]
+        total = _to_int(sales.get("total"))
+        for order in page:
+            order_id = order.get("id") if isinstance(order, dict) else None
+            if order_id and order_id not in seen_ids:
+                seen_ids.add(order_id)
+                orders.append(order)
+
+        offset += len(page)
+        if not page or offset >= total:
+            logging.debug(f"Fetched {len(orders)} Magma sales (server total {total}).")
+            return orders
+
+    raise AmbossAPIError(f"GetMagmaSales: pagination exceeded {max_pages} pages of {page_size}")
+
+
+def fetch_order_lease_details(order_id: str, amboss_token: Optional[str] = None) -> dict:
+    """Fetches the full MarketOrder (promises, blocks_until_can_be_closed). Raises on failure."""
+    data = execute_graphql(
+        GET_ORDER_LEASE_DETAILS_QUERY,
+        {"orderId": order_id},
+        f"GetOrderLeaseDetails-{order_id}",
+        amboss_token=amboss_token,
+    )
+    order = _dig(data, "user", "market", "orders", "get_order")
+    if not isinstance(order, dict):
+        raise AmbossAPIError(f"GetOrderLeaseDetails-{order_id}: order missing in response")
+    return order
+
+
+def fetch_magma_orders(amboss_token: Optional[str] = None) -> List[dict]:
+    """
+    Fetches all Magma sales and enriches active leases with their lease promises.
+    Raises AmbossAPIError if any part fails, so callers never act on partial data.
+    """
+    orders = []
+    for order in fetch_magma_sales(amboss_token=amboss_token):
+        status = str(order.get("status") or "").upper()
+        if status in ACTIVE_LEASE_STATUSES and order.get("channel_id"):
+            order = {**order, **fetch_order_lease_details(order["id"], amboss_token=amboss_token)}
+        orders.append(order)
+    return orders
+
+
+def _atomic_write_lines(path: str, lines: List[str]) -> None:
+    """Atomically replaces `path`, so charge-lnd never reads a partially written file.
+    Preserves the existing file mode (tempfile defaults to 0600, which would lock out
+    charge-lnd running as a different user); new files get 0644."""
+    directory = os.path.dirname(path) or "."
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except FileNotFoundError:
+        mode = 0o644
+
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=f".{os.path.basename(path)}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as tmp_file:
+            tmp_file.writelines(f"{line}\n" for line in lines)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except BaseException:
         try:
-            response = requests.post(MAGMA_GRAPHQL_URL, json=payload, headers=headers, timeout=timeout)
-            response.raise_for_status()
-            data = response.json()
-            break
-        except Exception as e:
-            logging.error(f"Error fetching data from Magma API (attempt {attempt+1}/{max_attempts}): {e}")
-            if attempt == max_attempts - 1:
-                logging.error("Exceeded max retry attempts fetching Magma orders.")
-                return []
-            time.sleep(2)
-
-    if not data or "data" not in data or not data["data"]:
-        logging.warning(f"No order data returned from Magma API: {data}")
-        return []
-
-    orders_node = data["data"].get("user", {}).get("market", {}).get("orders", {})
-    sales = orders_node.get("sales", {}).get("list", []) if isinstance(orders_node, dict) else []
-    purchases = orders_node.get("purchases", {}).get("list", []) if isinstance(orders_node, dict) else []
-
-    all_orders = []
-    if isinstance(sales, list):
-        all_orders.extend(sales)
-    if isinstance(purchases, list):
-        all_orders.extend(purchases)
-
-    return all_orders
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
-def cluster_sold_channels(orders: Optional[List[dict]] = None, fee_grace: int = 2016) -> Tuple[List[tuple], List[str], Dict[Any, List[str]]]:
+def write_charge_lnd_rule_files(
+    fee_cap_groups: Dict[int, List[str]],
+    non_active_chan_ids: List[str],
+    output_dir: Optional[str] = None,
+) -> None:
+    """
+    Writes one rule file per active fee cap plus the finished-lease file. Existing fee-cap
+    files with no remaining active lease are emptied (not deleted, since charge-lnd config
+    references them), so expired channels stop being governed by a stale cap.
+    """
+    output_dir = output_dir or CHARGE_LND_PATH
+    os.makedirs(output_dir, exist_ok=True)
+
+    stale_caps = set()
+    for name in os.listdir(output_dir):
+        match = FEE_CAP_FILE_PATTERN.match(name)
+        if match and int(match.group(1)) not in fee_cap_groups:
+            stale_caps.add(int(match.group(1)))
+
+    for fee_cap, channel_ids in fee_cap_groups.items():
+        _atomic_write_lines(get_fee_cap_file_path(fee_cap, output_dir), channel_ids)
+    for fee_cap in sorted(stale_caps):
+        logging.info(f"Clearing stale fee-cap rule file for cap {fee_cap} (no active Magma lease).")
+        _atomic_write_lines(get_fee_cap_file_path(fee_cap, output_dir), [])
+
+    _atomic_write_lines(os.path.join(output_dir, FINISHED_FILE_NAME), non_active_chan_ids)
+
+
+def cluster_sold_channels(
+    orders: Optional[List[dict]] = None,
+    fee_grace: int = fee_grace_period,
+    output_dir: Optional[str] = None,
+) -> Tuple[List[tuple], List[str], Dict[int, List[str]]]:
     """
     Categorizes channels, writes channel lists to charge-lnd directory by fee cap,
     and returns categorized channel structures.
+
+    Raises AmbossAPIError (fetch) or OSError (write) without partially applying changes
+    from incomplete data.
     """
     if orders is None:
         orders = fetch_magma_orders()
 
     valid_orders = [o for o in orders if o and o.get("channel_id")]
-    short_chan_ids = [o["channel_id"] for o in valid_orders]
+    short_chan_ids = list(dict.fromkeys(o["channel_id"] for o in valid_orders))
     long_chan_id_map = convert_short_to_long_chan_id(short_chan_ids)
 
     active_channels_info: List[tuple] = []
     non_active_chan_ids: List[str] = []
-    fee_cap_groups: Dict[Any, List[str]] = {}
+    fee_cap_groups: Dict[int, List[str]] = {}
 
     for order in valid_orders:
         info = extract_order_channel_info(order)
@@ -314,88 +496,76 @@ def cluster_sold_channels(orders: Optional[List[dict]] = None, fee_grace: int = 
         min_block_length = info["locked_min_block_length"]
         fee_cap = info["locked_fee_rate_cap"]
 
-        if status in ("VALID_CHANNEL_OPENING", "WAITING_FOR_CHANNEL_OPEN", "ACTIVE"):
+        if status in ACTIVE_LEASE_STATUSES:
             fee_grace_calc = -1 * (min_block_length - blocks_until_close - fee_grace)
             active_channels_info.append((long_chan_id, blocks_until_close, fee_cap, fee_grace_calc))
+            fee_cap_groups.setdefault(fee_cap, [])
+            if long_chan_id not in fee_cap_groups[fee_cap]:
+                fee_cap_groups[fee_cap].append(long_chan_id)
 
-            if fee_cap not in fee_cap_groups:
-                fee_cap_groups[fee_cap] = []
-            fee_cap_groups[fee_cap].append(long_chan_id)
-
-        elif status in ("CHANNEL_MONITORING_FINISHED", "CLOSED", "EXPIRED") or blocks_until_close == 0:
-            non_active_chan_ids.append(long_chan_id)
+        elif status in FINISHED_LEASE_STATUSES or blocks_until_close == 0:
+            if long_chan_id not in non_active_chan_ids:
+                non_active_chan_ids.append(long_chan_id)
             logging.debug(f"Added to non_active_chan_ids: {long_chan_id}")
 
         else:
             logging.info(f"Channel {long_chan_id} with status {status} and blocks {blocks_until_close} not clustered.")
 
-    # Write active fee cap files if charge_lnd_path exists or can be created
-    try:
-        os.makedirs(CHARGE_LND_PATH, exist_ok=True)
-        for fee_cap, channel_ids in fee_cap_groups.items():
-            file_path = get_fee_cap_file_path(fee_cap)
-            with open(file_path, "w") as output_file:
-                for chan_id in channel_ids:
-                    output_file.write(f"{chan_id}\n")
+    # A channel with any active lease must never be treated as finished (AutoFees re-enable)
+    active_ids = {chan_id for ids in fee_cap_groups.values() for chan_id in ids}
+    non_active_chan_ids = [c for c in non_active_chan_ids if c not in active_ids]
 
-        with open(FINISHED_FILE_PATH, "w") as finished_file:
-            for chan_id in non_active_chan_ids:
-                finished_file.write(f"{chan_id}\n")
-    except Exception as e:
-        logging.error(f"Error writing charge-lnd channel files: {e}")
+    write_charge_lnd_rule_files(fee_cap_groups, non_active_chan_ids, output_dir)
 
     return active_channels_info, non_active_chan_ids, fee_cap_groups
 
 
-def update_autofees(non_active_chan_ids: List[str]):
-    """Update auto_fees and notes in LNDg for expired Magma channels."""
-    timestamp = get_current_timestamp()
+def update_autofees(non_active_chan_ids: List[str]) -> Dict[str, int]:
+    """Re-enable auto_fees and set notes in LNDg for expired Magma channels.
+    Returns counts of updated and failed channels; a failed state fetch counts as one failure."""
+    result = {"updated": 0, "failed": 0}
+    if not non_active_chan_ids:
+        return result
 
-    def fetch_current_channel_states() -> Dict[str, bool]:
-        current_states = {}
-        try:
-            response = requests.get(LNDG_CHANNELS_URL, auth=(LNDG_USERNAME, LNDG_PASSWORD), timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                for channel in data.get("results", []):
-                    chan_id = str(channel.get("chan_id", ""))
-                    auto_fees = channel.get("auto_fees", False)
-                    if not auto_fees:
-                        current_states[chan_id] = False
-            else:
-                logging.error(f"{timestamp} Failed to fetch LNDg channel states: {response.status_code}")
-        except Exception as e:
-            logging.error(f"{timestamp} Error fetching current channel states: {e}")
-        return current_states
+    try:
+        response = requests.get(lndg_channels_url(), auth=(LNDG_USERNAME, LNDG_PASSWORD), timeout=10)
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error fetching LNDg channel states: {e}")
+        result["failed"] += 1
+        return result
+    if response.status_code != 200:
+        logging.error(f"Failed to fetch LNDg channel states: HTTP {response.status_code}")
+        result["failed"] += 1
+        return result
 
-    current_channel_states = fetch_current_channel_states()
-    channels_to_update = [c for c in non_active_chan_ids if str(c) in current_channel_states]
+    autofees_disabled = {
+        str(channel.get("chan_id", ""))
+        for channel in response.json().get("results", [])
+        if not channel.get("auto_fees", False)
+    }
+    channels_to_update = [c for c in non_active_chan_ids if str(c) in autofees_disabled]
 
     for chan_id in channels_to_update:
         notes = "Status: ⛰️ Magma Channel Buy Order Expired"
         payload = {"chan_id": chan_id, "auto_fees": True, "notes": notes}
-        try:
-            put_url = f"{LNDG_BASE_URL}/api/channels/{chan_id}/"
-            response = requests.put(put_url, json=payload, auth=(LNDG_USERNAME, LNDG_PASSWORD), timeout=10)
-            if response.status_code == 200:
-                with open(LOG_FILE_PATH, "a") as log_file:
-                    log_file.write(f"{timestamp}: Updated auto_fees for channel {chan_id}\n")
-                logging.info(f"Updated auto_fees for channel {chan_id}")
-            else:
-                logging.error(f"{timestamp}: Failed to update auto_fees for channel {chan_id}: {response.status_code}")
-        except Exception as e:
-            logging.error(f"Error updating auto_fees for channel {chan_id}: {e}")
+        if _put_lndg_channel(chan_id, payload):
+            logging.info(f"Updated auto_fees for channel {chan_id}")
+            result["updated"] += 1
+        else:
+            result["failed"] += 1
+    return result
 
 
-def update_notes_for_active_channels(active_channels_info: List[tuple]):
-    """Update notes in LNDg for active leased Magma channels."""
-    timestamp = get_current_timestamp()
+def update_notes_for_active_channels(active_channels_info: List[tuple]) -> Dict[str, int]:
+    """Update notes in LNDg for active leased Magma channels. Returns updated/failed counts."""
+    result = {"updated": 0, "failed": 0}
 
     for item in active_channels_info:
         try:
             chan_id, blocks_until_close, fee_cap, min_block_length = item
         except (ValueError, TypeError):
             logging.error(f"Error unpacking item: {item}. Expected a 4-element tuple.")
+            result["failed"] += 1
             continue
 
         if min_block_length < 0:
@@ -404,20 +574,48 @@ def update_notes_for_active_channels(active_channels_info: List[tuple]):
             notes = f"Status: 🌋 Magma Channel Buy Order Active \n(Lease Expiration: {blocks_until_close} blocks). \nFee Cap: {fee_cap}. Proportional Fee Rate in: {min_block_length}."
 
         payload = {"chan_id": chan_id, "auto_fees": False, "notes": notes}
-        try:
-            put_url = f"{LNDG_BASE_URL}/api/channels/{chan_id}/"
-            response = requests.put(put_url, json=payload, auth=(LNDG_USERNAME, LNDG_PASSWORD), timeout=10)
-            if response.status_code == 200:
-                with open(LOG_FILE_PATH, "a") as log_file:
-                    log_file.write(f"{timestamp}: Updated notes for channel {chan_id}\n")
-                logging.debug(f"Updated notes for channel {chan_id}")
-            else:
-                logging.error(f"{timestamp}: Failed to update notes for channel {chan_id}: {response.status_code}")
-        except Exception as e:
-            logging.error(f"Error updating notes for channel {chan_id}: {e}")
+        if _put_lndg_channel(chan_id, payload):
+            logging.debug(f"Updated notes for channel {chan_id}")
+            result["updated"] += 1
+        else:
+            result["failed"] += 1
+    return result
+
+
+def _put_lndg_channel(chan_id: str, payload: dict) -> bool:
+    try:
+        response = requests.put(lndg_channel_url(chan_id), json=payload, auth=(LNDG_USERNAME, LNDG_PASSWORD), timeout=10)
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error updating LNDg channel {chan_id}: {e}")
+        return False
+    if response.status_code != 200:
+        logging.error(f"Failed to update LNDg channel {chan_id}: HTTP {response.status_code}")
+        return False
+    return True
+
+
+def main() -> int:
+    """Runs one lease sync. Returns 0 on full success, 1 on any failure."""
+    try:
+        active_info, non_active_ids, fee_groups = cluster_sold_channels()
+    except AmbossAPIError as e:
+        logging.error(f"Magma lease sync aborted; charge-lnd files and LNDg left unchanged: {e}")
+        return 1
+    except OSError as e:
+        logging.error(f"Failed writing charge-lnd rule files; LNDg left unchanged: {e}")
+        return 1
+
+    autofees = update_autofees(non_active_ids)
+    notes = update_notes_for_active_channels(active_info)
+    logging.info(
+        f"Magma lease sync complete: {len(active_info)} active leases across fee caps "
+        f"{sorted(fee_groups)}, {len(non_active_ids)} finished; LNDg autofees "
+        f"updated={autofees['updated']} failed={autofees['failed']}, notes "
+        f"updated={notes['updated']} failed={notes['failed']}."
+    )
+    return 1 if autofees["failed"] or notes["failed"] else 0
 
 
 if __name__ == "__main__":
-    active_info, non_active_ids, fee_groups = cluster_sold_channels()
-    update_autofees(non_active_ids)
-    update_notes_for_active_channels(active_info)
+    configure_logging()
+    sys.exit(main())
