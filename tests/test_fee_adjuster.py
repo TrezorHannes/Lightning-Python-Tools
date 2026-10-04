@@ -293,5 +293,156 @@ def test_determine_ar_out_target_update_restores_custom_baseline():
     assert new_target == 45
 
 
+def test_fetch_amboss_data_success_and_timeout(monkeypatch):
+    """
+    Verifies fetch_amboss_data passes timeout=20 and extracts remote fee info across time ranges.
+    """
+    import requests
+    from fee_adjuster import fetch_amboss_data
 
-    
+    recorded_calls = []
+
+    class DummyResponse:
+        status_code = 200
+        text = '{"data": {}}'
+
+        def __init__(self, time_range):
+            self._time_range = time_range
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "data": {
+                    "getNode": {
+                        "graph_info": {
+                            "channels": {
+                                "fee_info": {
+                                    "remote": {
+                                        "max": "1500",
+                                        "mean": "350",
+                                        "median": "250" if self._time_range == "TODAY" else "200",
+                                        "weighted": "275",
+                                        "weighted_corrected": "260",
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        recorded_calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
+        return DummyResponse(json["variables"]["timeRange"])
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    config = {"credentials": {"amboss_authorization": "test-token"}}
+
+    result = fetch_amboss_data("02abc", config, time_ranges=["TODAY", "ONE_DAY"])
+
+    assert len(recorded_calls) == 2
+    assert all(call["timeout"] == 20 for call in recorded_calls)
+    assert result["TODAY"]["median"] == "250"
+    assert result["ONE_DAY"]["median"] == "200"
+
+
+def test_fetch_amboss_data_handles_null_fee_info_or_remote_gracefully(monkeypatch):
+    """
+    Verifies that when channels, fee_info, or remote is None for a time range,
+    fetch_amboss_data returns {} for that time range instead of raising TypeError,
+    and raises AmbossAPIError when getNode is None.
+    """
+    import requests
+    from fee_adjuster import fetch_amboss_data, AmbossAPIError
+
+    payload_by_range = {
+        "TODAY": {"data": {"getNode": {"graph_info": {"channels": None}}}},
+        "ONE_DAY": {"data": {"getNode": {"graph_info": {"channels": {"fee_info": None}}}}},
+        "ONE_WEEK": {"data": {"getNode": {"graph_info": {"channels": {"fee_info": {"remote": None}}}}}},
+        "ONE_MONTH": {"data": {"getNode": {"graph_info": None}}},
+    }
+
+    class DummyResponse:
+        status_code = 200
+        text = "{}"
+
+        def __init__(self, body):
+            self._body = body
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._body
+
+    monkeypatch.setattr(
+        requests,
+        "post",
+        lambda url, json=None, headers=None, timeout=None: DummyResponse(
+            payload_by_range[json["variables"]["timeRange"]]
+        ),
+    )
+    config = {"credentials": {"amboss_authorization": "test-token"}}
+
+    result = fetch_amboss_data(
+        "02abc", config, time_ranges=["TODAY", "ONE_DAY", "ONE_WEEK", "ONE_MONTH"]
+    )
+    assert result == {
+        "TODAY": {},
+        "ONE_DAY": {},
+        "ONE_WEEK": {},
+        "ONE_MONTH": {},
+    }
+
+    # Also verify getNode=None raises AmbossAPIError rather than TypeError
+    monkeypatch.setattr(
+        requests,
+        "post",
+        lambda url, json=None, headers=None, timeout=None: DummyResponse(
+            {"data": {"getNode": None}}
+        ),
+    )
+    with pytest.raises(AmbossAPIError, match="Missing getNode data"):
+        fetch_amboss_data("02abc", config, time_ranges=["TODAY"])
+
+
+def test_fetch_amboss_data_raises_amboss_api_error_on_http_400_with_body(monkeypatch, caplog):
+    """
+    Verifies that an HTTP 400 GRAPHQL_VALIDATION_FAILED response logs the GraphQL error
+    message and raises AmbossAPIError with the response details.
+    """
+    import logging
+    import requests
+    from fee_adjuster import fetch_amboss_data, AmbossAPIError
+
+    error_body = (
+        '{"errors":[{"message":"Cannot query field \\"bad_field\\" on type \\"FeeInfo\\".",'
+        '"extensions":{"code":"GRAPHQL_VALIDATION_FAILED"}}]}'
+    )
+
+    class Dummy400Response:
+        status_code = 400
+        text = error_body
+
+        def raise_for_status(self):
+            raise requests.exceptions.HTTPError("400 Client Error: Bad Request")
+
+        def json(self):
+            import json
+            return json.loads(error_body)
+
+    monkeypatch.setattr(
+        requests,
+        "post",
+        lambda url, json=None, headers=None, timeout=None: Dummy400Response(),
+    )
+    config = {"credentials": {"amboss_authorization": "test-token"}}
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(AmbossAPIError) as exc_info:
+            fetch_amboss_data("02abc", config, time_ranges=["TODAY"])
+
+    assert "GRAPHQL_VALIDATION_FAILED" in str(exc_info.value)
+    assert any("GRAPHQL_VALIDATION_FAILED" in rec.message for rec in caplog.records)
