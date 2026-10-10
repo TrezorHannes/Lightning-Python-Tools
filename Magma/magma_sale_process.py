@@ -75,9 +75,12 @@ INVOICE_INCLUDE_ROUTE_HINTS = config.getboolean("magma", "invoice_include_route_
 MAX_FEE_PERCENTAGE_OF_INVOICE = config.getfloat("magma", "max_fee_percentage_of_invoice", fallback=0.90)
 CHANNEL_FEE_RATE_PPM = config.getint("magma", "channel_fee_rate_ppm", fallback=350)
 MEMPOOL_FEES_API_URL = config.get("urls", "mempool_fees_api", fallback="https://mempool.space/api/v1/fees/recommended")
-CONNECT_RETRY_DELAY_SECONDS = config.getint("magma", "connect_retry_delay_seconds", fallback=60)
-MAX_CONNECT_RETRIES = config.getint("magma", "max_connect_retries", fallback=30)
+CONNECT_RETRY_DELAY_SECONDS = config.getint("magma", "connect_retry_delay_seconds", fallback=10)
+MAX_CONNECT_RETRIES = config.getint("magma", "max_connect_retries", fallback=3)
+UNREACHABLE_PEER_COOLDOWN_SECONDS = config.getint("magma", "unreachable_peer_cooldown_seconds", fallback=1800)
 POLLING_INTERVAL_MINUTES = config.getint("magma", "polling_interval_minutes", fallback=10)
+
+failed_order_connection_attempts: dict[str, float] = {}
 
 BANNED_PUBKEYS = config.get("pubkey", "banned_magma_pubkeys", fallback="").split(",")
 
@@ -1057,17 +1060,17 @@ def connect_to_node(peer_pubkey: str, connection_details_list: list[dict], max_r
                     logging.info(f"Peer {node_key_address} is already connected.")
                     return 0, node_key_address, None  # Already connected is also a success
                 else:
-                    logging.error(
+                    logging.warning(
                         f"Error connecting to node {node_key_address} (attempt {retries + 1}): {current_stderr}"
                     )
             except subprocess.CalledProcessError as e:
                 current_stderr = e.stderr.strip() if e.stderr else "N/A"
                 overall_last_stderr = current_stderr
-                logging.error(f"CalledProcessError executing lncli connect (attempt {retries + 1}): {e}. stderr: {current_stderr}")
+                logging.warning(f"CalledProcessError executing lncli connect (attempt {retries + 1}): {e}. stderr: {current_stderr}")
             except Exception as e:
                 current_stderr = f"Unexpected Exception: {str(e)}"
                 overall_last_stderr = current_stderr
-                logging.error(f"Unexpected error executing lncli connect (attempt {retries + 1}): {current_stderr}")
+                logging.warning(f"Unexpected error executing lncli connect (attempt {retries + 1}): {current_stderr}")
             
             retries += 1
             if retries < max_retries:
@@ -1876,6 +1879,18 @@ def process_paid_order(order_details):
             logging.error(f"Missing critical fields in order_details for order {order_id}: Pubkey={customer_pubkey}, Size={channel_size_str}, InvoiceAmount={seller_invoice_amount_str}")
             send_telegram_notification(f"🔥 Critical internal error: Incomplete data for processing paid order `{order_id}`. Check logs.", level="error", parse_mode="Markdown")
             return
+
+        current_time = time.time()
+        if order_id in failed_order_connection_attempts:
+            last_failed_time = failed_order_connection_attempts[order_id]
+            if current_time - last_failed_time < UNREACHABLE_PEER_COOLDOWN_SECONDS:
+                remaining_cooldown = int(UNREACHABLE_PEER_COOLDOWN_SECONDS - (current_time - last_failed_time))
+                logging.info(
+                    f"Order {order_id} is in connection cooldown ({remaining_cooldown}s remaining). Skipping connection retry this cycle."
+                )
+                return
+            else:
+                failed_order_connection_attempts.pop(order_id, None)
         
         # Ensure numeric types are correctly handled, Amboss provides strings.
         try:
@@ -1919,6 +1934,7 @@ def process_paid_order(order_details):
                  success_msg += f" ({connected_addr})"
             send_telegram_notification(success_msg, parse_mode="Markdown")
         else:
+            failed_order_connection_attempts[order_id] = time.time()
             tg_error_msg = (
                 f"⚠️ Could not connect to `{buyer_alias}` for order `{order_id}` after trying all addresses.\n"
                 f"Last error: `{conn_error_msg}`\n"
@@ -1931,10 +1947,13 @@ def process_paid_order(order_details):
         funding_tx, msg_open_or_error = open_channel(customer_pubkey, channel_size, seller_invoice_amount)
 
         if funding_tx is None:
+            failed_order_connection_attempts[order_id] = time.time()
             error_msg = f"🔥 Failed to open channel for order `{order_id}`.\n`lncli` error: `{msg_open_or_error}`"
             logging.error(error_msg) 
             send_telegram_notification(error_msg, level="error", parse_mode="Markdown")
             return
+
+        failed_order_connection_attempts.pop(order_id, None)
         
         send_telegram_notification(
             f"✅ Channel opening initiated for order `{order_id}`.\nFunding TX: `{funding_tx}`\nDetails: `{msg_open_or_error}`", 
