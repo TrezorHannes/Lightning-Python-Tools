@@ -949,6 +949,81 @@ def test_telegram_logging_handler_no_duplicate_dispatches(magma_module):
     assert magma_module.bot.send_message.call_count == 1
 
 
+def test_connect_to_node_intermediate_retries_log_warning_not_error(magma_module, mocker, caplog):
+    """Test that intermediate lncli connect failures log as WARNING and do not trigger ERROR alerts."""
+    mock_run = mocker.patch("subprocess.run")
+    fail_res = MagicMock(returncode=1, stderr="[lncli] rpc error: code = Unknown desc = EOF", stdout="")
+    success_res = MagicMock(returncode=0, stderr="", stdout="")
+    mock_run.side_effect = [fail_res, success_res]
+    mocker.patch("time.sleep")
+
+    addresses = [{"addr": "54.214.32.132:20315", "network": "tcp", "country": "US"}]
+    with caplog.at_level(logging.DEBUG):
+        status, addr, err = magma_module.connect_to_node("03pubkey", addresses, max_retries=3)
+
+    assert status == 0
+    assert addr == "03pubkey@54.214.32.132:20315"
+    error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    warning_logs = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(error_logs) == 0
+    assert any("attempt 1" in r.message for r in warning_logs)
+
+
+def test_connect_to_node_all_addresses_exhausted_logs_summary_error(magma_module, mocker, caplog):
+    """Test that exhausted retries across all addresses log intermediate WARNINGs and only one summary ERROR."""
+    mock_run = mocker.patch("subprocess.run")
+    fail_res = MagicMock(returncode=1, stderr="[lncli] rpc error: code = Unknown desc = EOF", stdout="")
+    mock_run.return_value = fail_res
+    mocker.patch("time.sleep")
+
+    addresses = [
+        {"addr": "54.214.32.132:20315", "network": "tcp", "country": "US"},
+        {"addr": "peer.onion:9735", "network": "tcp", "country": None}
+    ]
+    with caplog.at_level(logging.DEBUG):
+        status, addr, err = magma_module.connect_to_node("03pubkey", addresses, max_retries=2)
+
+    assert status == 1
+    assert addr is None
+    assert "Failed to connect to peer" in err
+    warning_logs = [r for r in caplog.records if r.levelno == logging.WARNING]
+    error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(warning_logs) >= 2
+    assert len(error_logs) == 1
+    assert "Failed to connect to peer 03pubkey after trying all available addresses" in error_logs[0].message
+
+
+def test_process_paid_order_unreachable_cooldown(magma_module, mocker, caplog):
+    """Test that an order whose connection failed enters a cooldown and is skipped on immediate re-run."""
+    magma_module.failed_order_connection_attempts.clear()
+    mocker.patch.object(magma_module, "get_node_alias", return_value="TestBuyer")
+    mocker.patch.object(magma_module, "get_node_connection_details", return_value=[{"addr": "1.2.3.4:9735", "network": "tcp", "country": None}])
+    mocker.patch.object(magma_module, "connect_to_node", return_value=(1, None, "Connection refused"))
+    mocker.patch.object(magma_module, "open_channel", return_value=(None, "not connected"))
+    mocker.patch.object(magma_module, "send_telegram_notification")
+
+    sample_order = {
+        "id": "order_cooldown_123",
+        "status": "WAITING_FOR_CHANNEL_OPEN",
+        "amount": {"satoshi": {"sats": "5000000"}},
+        "fees": {"seller": {"sats": "1000"}},
+        "destination": {"pubkey": "03deadbeef", "alias": "TestBuyer"},
+    }
+
+    # First attempt: should execute and register cooldown
+    with caplog.at_level(logging.INFO):
+        magma_module.process_paid_order(sample_order)
+
+    assert "order_cooldown_123" in magma_module.failed_order_connection_attempts
+
+    # Second immediate attempt: should skip due to cooldown
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        magma_module.process_paid_order(sample_order)
+
+    assert any("is in connection cooldown" in r.message for r in caplog.records)
+
+
 def test_get_node_extended_details_live_schema_contract(magma_module):
     """Verify get_node_extended_details sends live Amboss Space schema contract ($from, score, no bos_score)."""
     mock_response = {
