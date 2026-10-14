@@ -55,7 +55,7 @@ import subprocess
 import time
 import os
 import schedule
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import configparser
 import logging
 from logging.handlers import RotatingFileHandler
@@ -78,9 +78,11 @@ MEMPOOL_FEES_API_URL = config.get("urls", "mempool_fees_api", fallback="https://
 CONNECT_RETRY_DELAY_SECONDS = config.getint("magma", "connect_retry_delay_seconds", fallback=10)
 MAX_CONNECT_RETRIES = config.getint("magma", "max_connect_retries", fallback=3)
 UNREACHABLE_PEER_COOLDOWN_SECONDS = config.getint("magma", "unreachable_peer_cooldown_seconds", fallback=1800)
+FAILED_OFFER_ACCEPTANCE_COOLDOWN_SECONDS = config.getint("magma", "failed_offer_acceptance_cooldown_seconds", fallback=1800)
 POLLING_INTERVAL_MINUTES = config.getint("magma", "polling_interval_minutes", fallback=10)
 
 failed_order_connection_attempts: dict[str, float] = {}
+failed_offer_acceptance_attempts: dict[str, float] = {}
 
 BANNED_PUBKEYS = config.get("pubkey", "banned_magma_pubkeys", fallback="").split(",")
 
@@ -538,6 +540,11 @@ def _execute_amboss_graphql_request(
         response_json = response.json()
 
         if response_json.get("errors"):
+            if response_json.get("data"):
+                logging.warning(
+                    f"GraphQL partial errors during {operation_name}: {response_json.get('errors')}"
+                )
+                return response_json.get("data")
             logging.error(f"GraphQL errors during {operation_name}: {response_json.get('errors')}")
             return None
 
@@ -642,10 +649,13 @@ def get_node_alias(pubkey: str) -> str:
         logging.warning(f"No alias returned in getNodeAlias data for {pubkey}.")
         return "AliasNotFound"
 
-def get_node_extended_details(pubkey: str, amboss_token: str | None = None) -> dict:
+def get_node_extended_details(pubkey: str, amboss_token: str | None = None, from_date: str | None = None) -> dict:
     """Fetches extended details for a given node pubkey from Amboss."""
     if not pubkey:
         return {} # Return empty dict if no pubkey
+
+    if from_date is None:
+        from_date = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
 
     logging.info(f"Fetching extended details for pubkey: {pubkey}")
     payload = {
@@ -699,7 +709,7 @@ def get_node_extended_details(pubkey: str, amboss_token: str | None = None) -> d
               }
             }
         """,
-        "variables": {"pubkey": pubkey, "from": "1970-01-01"}
+        "variables": {"pubkey": pubkey, "from": from_date}
     }
 
     if amboss_token is not None:
@@ -1491,11 +1501,24 @@ def get_offers_awaiting_seller_approval():
             logging.debug(f"Offer ID: {offer_id}, Status: {current_status}, Buyer Pubkey: {destination_pubkey}")
 
             if current_status != "WAITING_FOR_SELLER_APPROVAL":
+                failed_offer_acceptance_attempts.pop(offer_id, None)
                 logging.debug(f"Offer {offer_id} has status '{current_status}', not 'WAITING_FOR_SELLER_APPROVAL'. Skipping.")
                 if offer_id in processed_banned_offer_ids and current_status in ["SELLER_REJECTED", "CANCELLED", "EXPIRED", "ERROR", "COMPLETED"]:
                     logging.info(f"Offer {offer_id} (previously auto-rejected) now has terminal status '{current_status}'. Removing from processed_banned_offer_ids.")
                     processed_banned_offer_ids.discard(offer_id)
                 continue
+
+            if offer_id in failed_offer_acceptance_attempts:
+                last_failed_time = failed_offer_acceptance_attempts[offer_id]
+                current_time = time.time()
+                if current_time - last_failed_time < FAILED_OFFER_ACCEPTANCE_COOLDOWN_SECONDS:
+                    remaining_cooldown = int(FAILED_OFFER_ACCEPTANCE_COOLDOWN_SECONDS - (current_time - last_failed_time))
+                    logging.info(
+                        f"Offer {offer_id} is in acceptance cooldown ({remaining_cooldown}s remaining). Skipping offer processing this cycle."
+                    )
+                    continue
+                else:
+                    failed_offer_acceptance_attempts.pop(offer_id, None)
 
             if destination_pubkey in BANNED_PUBKEYS:
                 if offer_id not in processed_banned_offer_ids:
@@ -1683,6 +1706,7 @@ def _complete_offer_approval_process(order_id, order_details):
         )
     )
     if is_accepted:
+        failed_offer_acceptance_attempts.pop(order_id, None)
         success_message = f"⏳ Order `{order_id}` accepted on Amboss. Invoice sent. Monitoring for buyer payment."
         send_telegram_notification(success_message, parse_mode="Markdown")
         logging.info(success_message)
@@ -1699,8 +1723,8 @@ def _complete_offer_approval_process(order_id, order_details):
                 if "Timeout during Amboss API call" in error_message_detail:
                     is_timeout_error = True
         
+        failed_offer_acceptance_attempts[order_id] = time.time()
         failure_message = f"🔥 Failed to accept approved order `{order_id}` on Amboss. Details: `{error_message_detail}`"
-        logging.error(failure_message)
         send_telegram_notification(failure_message, level="error", parse_mode="Markdown")
 
         if is_timeout_error:
@@ -1756,7 +1780,7 @@ def handle_order_decision_callback(call):
                 parse_mode="Markdown"
             )
         except Exception as e:
-            logging.error(f"Error editing Telegram message for order {order_id} after decision: {e}")
+            logging.warning(f"Error editing Telegram message for order {order_id} after decision: {e}")
 
         if action == "approve":
             send_telegram_notification(f"▶️ Proceeding with approved order `{order_id}` ({buyer_alias}).", parse_mode="Markdown")
@@ -1770,6 +1794,7 @@ def handle_order_decision_callback(call):
                 send_telegram_notification(msg, level="warning", parse_mode="Markdown")
 
         elif action == "reject":
+            failed_offer_acceptance_attempts.pop(order_id, None)
             send_telegram_notification(f"🗑️ Rejecting order `{order_id}` ({buyer_alias}) on Amboss.", parse_mode="Markdown")
             # Thread rejection as well to be safe and responsive
             threading.Thread(target=reject_order, args=(order_id,), name=f"Reject-{order_id}").start()
@@ -1817,7 +1842,7 @@ def _handle_timeout_for_offer(order_id, confirmation_info):
                     parse_mode="Markdown"
                 )
         except Exception as e:
-            logging.error(f"Error editing Telegram message for timed-out order {order_id}: {e}")
+            logging.warning(f"Error editing Telegram message for timed-out order {order_id}: {e}")
         
         order_details_fresh = get_order_details_from_amboss(order_id) 
         if order_details_fresh:
