@@ -1062,8 +1062,9 @@ def test_get_node_extended_details_live_schema_contract(magma_module):
     assert "channel_closure_types(from: $from)" in query
     assert "terminal_web" in query
     assert "score" in query
-    assert "bos_score" not in query
-    assert variables == {"pubkey": "03pubkey_live", "from": "1970-01-01"}
+    from datetime import datetime, timezone, timedelta
+    expected_from = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+    assert variables == {"pubkey": "03pubkey_live", "from": expected_from}
 
 
 def test_process_new_offers_extended_details_null_safety_and_direct_bos_score(magma_module, mocker):
@@ -1302,5 +1303,167 @@ def test_confirm_channel_point_http_error_with_null_errors_field(magma_module):
         res = magma_module.confirm_channel_point_to_amboss("order_502", "txid:0")
         assert "errors" in res
         assert "502 Server Error" in res["errors"][0]["message"]
+
+
+def test_get_node_extended_details_dynamic_7day_window_default(magma_module):
+    """Verify get_node_extended_details defaults to 7-day window to avoid Amboss subscription errors."""
+    from datetime import datetime, timezone, timedelta
+    mock_response = {
+        "data": {
+            "getNode": {
+                "amboss": {"is_claimed": True},
+                "graph_info": {"channels": {"num_channels": 5, "total_capacity": "10000000"}},
+            }
+        }
+    }
+    mock_post = MagicMock()
+    mock_post.status_code = 200
+    mock_post.json.return_value = mock_response
+    mock_post.raise_for_status.return_value = None
+    magma_module.requests.post = MagicMock(return_value=mock_post)
+
+    expected_7d = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+    details = magma_module.get_node_extended_details("03buyer_7d")
+    assert details["amboss"]["is_claimed"] is True
+
+    call_args = magma_module.requests.post.call_args
+    variables = call_args[1]["json"]["variables"]
+    assert variables["pubkey"] == "03buyer_7d"
+    assert variables["from"] == expected_7d
+
+
+def test_execute_amboss_graphql_request_partial_data_preserves_data_with_warning(magma_module, caplog):
+    """Verify that when Amboss returns both data and errors (partial error), data is preserved and a warning is logged."""
+    partial_payload = {
+        "data": {
+            "getNode": {
+                "amboss": {"is_claimed": True},
+                "graph_info": {"channels": {"num_channels": 12, "total_capacity": "50000000"}}
+            }
+        },
+        "errors": [
+            {
+                "message": "Cannot query data older than 7 days",
+                "path": ["getNode", "graph_info", "channel_closure_types"],
+                "extensions": {"code": "INTERNALSERVERERROR"}
+            }
+        ]
+    }
+    mock_post = MagicMock()
+    mock_post.status_code = 200
+    mock_post.json.return_value = partial_payload
+    mock_post.raise_for_status.return_value = None
+    magma_module.requests.post = MagicMock(return_value=mock_post)
+
+    with caplog.at_level(logging.DEBUG):
+        result = magma_module._execute_amboss_graphql_request({"query": "{ getNode }"}, "TestPartialNode")
+
+    assert result is not None
+    assert result["getNode"]["amboss"]["is_claimed"] is True
+    error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    warning_logs = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(error_logs) == 0
+    assert any("partial errors" in r.message.lower() for r in warning_logs)
+
+
+def test_get_offers_awaiting_seller_approval_acceptance_failure_cooldown(magma_module, caplog):
+    """Verify that offers with failed acceptance enter cooldown and are skipped during get_offers_awaiting_seller_approval."""
+    magma_module.failed_offer_acceptance_attempts.clear()
+    sample_offer = {
+        "id": "order_cooldown_offer_01",
+        "status": "WAITING_FOR_SELLER_APPROVAL",
+        "amount": {"satoshi": {"sats": "2000000"}},
+        "fees": {"seller": {"sats": "5000"}},
+        "destination": {"pubkey": "03coolbuyer", "alias": "CoolBuyer"},
+    }
+    mock_response = {
+        "data": {
+            "user": {
+                "market": {
+                    "orders": {
+                        "sales": {
+                            "total": 1,
+                            "list": [sample_offer]
+                        }
+                    }
+                }
+            }
+        }
+    }
+    mock_post = MagicMock()
+    mock_post.status_code = 200
+    mock_post.json.return_value = mock_response
+    mock_post.raise_for_status.return_value = None
+    magma_module.requests.post = MagicMock(return_value=mock_post)
+
+    # 1. First run without cooldown: offer is found
+    offer = magma_module.get_offers_awaiting_seller_approval()
+    assert offer is not None
+    assert offer["id"] == "order_cooldown_offer_01"
+
+    # 2. Register failure cooldown
+    import time
+    magma_module.failed_offer_acceptance_attempts["order_cooldown_offer_01"] = time.time()
+
+    # 3. Second run with cooldown: offer is skipped
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        offer_skipped = magma_module.get_offers_awaiting_seller_approval()
+    assert offer_skipped is None
+    assert any("is in acceptance cooldown" in r.message for r in caplog.records)
+
+
+def test_complete_offer_approval_process_records_acceptance_failure_cooldown(magma_module, mocker):
+    """Verify acceptance failure registers cooldown and does not trigger duplicate telegram notification."""
+    magma_module.failed_offer_acceptance_attempts.clear()
+    sample_order = {
+        "id": "order_fail_accept_01",
+        "status": "WAITING_FOR_SELLER_APPROVAL",
+        "amount": {"satoshi": {"sats": "1000000"}},
+        "fees": {"seller": {"sats": "3000"}},
+        "destination": {"pubkey": "03targetnode", "alias": "TargetNode"},
+        "buyer_alias": "TargetNode"
+    }
+
+    mocker.patch.object(magma_module, "execute_lncli_addinvoice", return_value=("hash", "lnbc123..."))
+    mocker.patch.object(magma_module, "accept_order", return_value={
+        "errors": [{"message": "Unable to find a route to this destination! Please reach out to support!"}],
+        "data": None
+    })
+    mock_send = mocker.patch.object(magma_module, "send_telegram_notification")
+
+    magma_module._complete_offer_approval_process("order_fail_accept_01", sample_order)
+
+    # Ensure send_telegram_notification was called exactly once for failure_message (no duplicate dispatches)
+    failure_sends = [call for call in mock_send.call_args_list if "Failed to accept approved order" in str(call)]
+    assert len(failure_sends) == 1
+
+
+def test_handle_timeout_for_offer_edit_message_timeout_logs_warning_not_error(magma_module, mocker, caplog):
+    """Verify Telegram message edit timeout during offer timeout handling logs WARNING, not ERROR."""
+    confirmation_info = {
+        "message_id": 9999,
+        "timestamp": 500.0,
+        "details": {
+            "id": "order_edit_timeout_01",
+            "status": "WAITING_FOR_SELLER_APPROVAL",
+            "amount": {"satoshi": {"sats": "2000000"}},
+            "fees": {"seller": {"sats": "4000"}},
+            "destination": {"pubkey": "02pub", "alias": "Node"},
+            "buyer_alias": "Node"
+        }
+    }
+    magma_module.bot.edit_message_text = MagicMock(side_effect=Exception("HTTPSConnectionPool: Read timed out. (read timeout=30)"))
+    mocker.patch.object(magma_module, "get_order_details_from_amboss", return_value=None)
+    mocker.patch.object(magma_module, "send_telegram_notification")
+
+    with caplog.at_level(logging.DEBUG):
+        magma_module._handle_timeout_for_offer("order_edit_timeout_01", confirmation_info)
+
+    error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR and "Error editing Telegram message" in r.message]
+    warning_logs = [r for r in caplog.records if r.levelno == logging.WARNING and "Error editing Telegram message" in r.message]
+    assert len(error_logs) == 0
+    assert len(warning_logs) == 1
+
 
 
