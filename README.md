@@ -148,6 +148,8 @@ After=network.target lnd.service
 Type=simple
 User=admin
 WorkingDirectory=/home/admin/Lightning-Python-Tools
+Environment="SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"
+Environment="REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt"
 ExecStart=/home/admin/Lightning-Python-Tools/.venv/bin/python3 /home/admin/Lightning-Python-Tools/Magma/magma_sale_process.py
 Restart=always
 RestartSec=10

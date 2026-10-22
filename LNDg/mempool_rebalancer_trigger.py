@@ -13,6 +13,8 @@ After=network.target
 
 [Service]
 Type=simple
+Environment="SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"
+Environment="REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt"
 ExecStart=/usr/bin/python3 /path/to/mempool_rebalancer_trigger.py
 Restart=on-failure
 
