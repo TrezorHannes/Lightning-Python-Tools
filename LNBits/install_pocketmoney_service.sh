@@ -85,6 +85,8 @@ After=network.target
 Type=oneshot
 User=$SUDO_USER
 WorkingDirectory=$SCRIPT_DIR
+Environment="SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"
+Environment="REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt"
 ExecStart=$VENV_PYTHON $POCKETMONEY_SCRIPT --run-once
 EOF
 

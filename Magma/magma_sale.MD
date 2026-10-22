@@ -75,6 +75,8 @@ Create a systemd service file to manage the script.
     # and that Magma/magma_sale_process.py can be found.
     # Example: if your project is at /opt/lightning-tools/
     WorkingDirectory=/opt/lightning-tools/
+    Environment="SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"
+    Environment="REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt"
 
     # Path to the Python interpreter IN YOUR VIRTUAL ENVIRONMENT and the script
     # Example: /opt/lightning-tools/.venv/bin/python3 /opt/lightning-tools/Magma/magma_sale_process.py
