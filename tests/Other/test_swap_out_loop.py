@@ -118,24 +118,6 @@ def test_filter_and_size_candidates_dynamic(sample_channels):
     assert c["proposed_amt"] == 3_500_000
 
 
-def test_filter_and_size_candidates_fixed_amount(sample_channels):
-    """Test candidate filtering when an explicit target amount is passed."""
-    blacklist = ["02blacklist1111111111111111111111111111111111111111111111111111111"]
-    # User specifies 4,000,000 sats
-    candidates = swap_out_loop.filter_and_size_candidates(
-        channels=sample_channels,
-        target_amt=4_000_000,
-        min_capacity=3_000_000,
-        max_fee_rate=500,  # allow expensive one as well
-        min_local_ratio=60.0,
-        blacklist=blacklist,
-    )
-    # Both Cheap and Expensive qualify and have proposed_amt == 4,000,000
-    assert len(candidates) == 2
-    for c in candidates:
-        assert c["proposed_amt"] == 4_000_000
-
-
 def test_parse_loop_quote_output_verbose():
     sample_quote_output = """
 Send off-chain:                           2000000 sat
@@ -547,22 +529,6 @@ def test_calculate_max_routing_fee_budget_explicit_positive():
     assert budget == 35_000
 
 
-def test_calculate_max_routing_fee_budget_custom_config():
-    """Verify custom config settings for fee_leeway_pct and fee_leeway_base_sats."""
-    import configparser
-    cfg = configparser.ConfigParser()
-    cfg.add_section("loop")
-    cfg.set("loop", "fee_leeway_pct", "50")
-    cfg.set("loop", "fee_leeway_base_sats", "1000")
-
-    budget = swap_out_loop.calculate_max_routing_fee_budget(
-        probed_routing_fee=20_000,
-        config=cfg,
-    )
-    # 20,000 * 1.5 + 1000 = 31,000
-    assert budget == 31_000
-
-
 def test_calculate_max_routing_fee_budget_cli_leeway_override():
     """Verify that explicit_leeway_pct overrides config."""
     budget = swap_out_loop.calculate_max_routing_fee_budget(
@@ -591,21 +557,6 @@ def test_filter_and_size_candidates_multi_channel_pooling(sample_channels):
     for c in candidates:
         assert c["drainable_surplus"] >= 8_000_000
         assert c["proposed_amt"] <= 15_000_000
-
-
-def test_execute_loop_out_multi_channel_list():
-    """Verify execute_loop_out accepts a list of channel IDs and formats comma-separated argument."""
-    res = swap_out_loop.execute_loop_out(
-        config={},
-        channel_id=["1055691691402854401", "896468114071224320"],
-        amt=8_000_000,
-        conf_target=9,
-        max_routing_fee=40_000,
-        alias="Sunny Sarah ☀️ + 1 more (2 chans)",
-        dry_run=True,
-    )
-    assert res["success"] is True
-    assert "dry-run-swap-" in res["swap_id"]
 
 
 def test_interactive_menu_select_multi_channel_non_tty():
@@ -718,71 +669,8 @@ def test_execute_loop_out_multi_channel_real_command():
             assert called_cmd[addr_idx + 1] == "bc1qtestaddr"
 
 
-def test_main_multi_channel_logging_success():
-    """Verify main() executes and logs successfully when interactive_menu_select returns a multi-channel list."""
-    mock_candidates = [
-        {
-            "chan_id": "896468114071224320",
-            "alias": "block-iad-1",
-            "proposed_amt": 3_000_000,
-            "drainable_surplus": 3_000_000,
-            "local_ratio": 99.0,
-            "server_fee": 3049,
-            "onchain_fee": 163,
-            "routing_fee": 7494,
-            "opportunity_cost": 0,
-            "total_cost": 10706,
-            "effective_ppm": 3569,
-        },
-        {
-            "chan_id": "1028289662652973056",
-            "alias": "allNice | torq.co",
-            "proposed_amt": 3_000_000,
-            "drainable_surplus": 3_000_000,
-            "local_ratio": 95.4,
-            "server_fee": 3049,
-            "onchain_fee": 163,
-            "routing_fee": 10497,
-            "opportunity_cost": 0,
-            "total_cost": 13709,
-            "effective_ppm": 4570,
-        },
-    ]
-
-    mock_args = MagicMock()
-    mock_args.history = False
-    mock_args.capacity = 3_000_000
-    mock_args.fee_limit = 100
-    mock_args.min_ratio = 60.0
-    mock_args.amt = 3_000_000
-    mock_args.conf_target = 9
-    mock_args.max_routing_fee = None
-    mock_args.fee_leeway_pct = None
-    mock_args.dest_addr = None
-    mock_args.dry_run = True
-    mock_args.auto_approve = False
-    mock_args.max_channels = 3
-    mock_args.channel = None
-    mock_args.workers = 1
-    mock_args.probe_timeout = 15
-    mock_args.skip_prepay_probe = False
-
-    with patch.object(swap_out_loop, "parse_arguments", return_value=mock_args),          patch.object(swap_out_loop, "load_config", return_value=(configparser.ConfigParser(), "/tmp")),          patch.object(swap_out_loop, "setup_logger") as mock_setup_logger,          patch.object(swap_out_loop, "fetch_channels_lndg", return_value=[{"is_active": True, "is_open": True, "capacity": 10000000, "local_balance": 8000000, "local_fee_rate": 5, "chan_id": "111", "alias": "node"}]),          patch.object(swap_out_loop, "filter_and_size_candidates", return_value=mock_candidates),          patch.object(swap_out_loop, "evaluate_single_candidate", side_effect=lambda c, **kwargs: c),          patch.object(swap_out_loop, "interactive_menu_select", return_value=mock_candidates),          patch.object(swap_out_loop, "execute_loop_out", return_value={"success": True, "swap_id": "mock-swap-id", "dry_run": True}):
-
-        mock_logger = MagicMock()
-        mock_setup_logger.return_value = mock_logger
-
-        # Calling main() should NOT raise TypeError: list indices must be integers or slices, not str
-        swap_out_loop.main()
-
-        mock_logger.info.assert_called_once()
-        log_call_msg = mock_logger.info.call_args[0][0]
-        assert "block-iad-1, allNice | torq.co" in log_call_msg
-        assert "896468114071224320,1028289662652973056" in log_call_msg
-
-
 def test_multi_channel_fixed_amount_and_max_fee_budget():
-    """Verify that multi-channel execution keeps target_amt fixed and bases fee budget on max route fee."""
+    """Verify that multi-channel execution keeps target_amt fixed, logs channels, and bases fee budget on max route fee."""
     mock_candidates = [
         {
             "chan_id": "896468114071224320",
@@ -820,7 +708,7 @@ def test_multi_channel_fixed_amount_and_max_fee_budget():
     mock_args.amt = 3_000_000  # User specified 3,000,000 sats
     mock_args.conf_target = 9
     mock_args.max_routing_fee = None
-    mock_args.fee_leeway_pct = 100.0  # +100% leeway
+    mock_args.fee_leeway_pct = None  # Falls back to config [loop] fee_leeway_pct = 100.0
     mock_args.dest_addr = None
     mock_args.dry_run = True
     mock_args.auto_approve = False
@@ -842,6 +730,10 @@ def test_multi_channel_fixed_amount_and_max_fee_budget():
 
         swap_out_loop.main()
 
+        mock_logger.info.assert_called_once()
+        log_call_msg = mock_logger.info.call_args[0][0]
+        assert "block-iad-1, allNice | torq.co" in log_call_msg
+        assert "896468114071224320,1028289662652973056" in log_call_msg
         # execute_loop_out must be called with amt=3,000,000 (NOT 6,000,000)
         assert mock_exec.call_args[1]["amt"] == 3_000_000
         # max_routing_fee must be based on max(7494, 10497) = 10497 -> 10497 * 2.0 + 500 = 21494

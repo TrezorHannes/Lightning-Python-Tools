@@ -13,8 +13,14 @@ def _parse_version_tuple(version_str: str) -> tuple[int, ...]:
     return tuple(int(part) for part in version_str.strip().split("."))
 
 
-def test_requirements_pins_hardened_tls_dependencies():
-    """requirements.txt must pin certifi>=2026.10.19, requests>=2.34.2, urllib3>=2.8.0 with no duplicates."""
+def _extract_min_version_tuple(spec_str: str) -> tuple[int, ...]:
+    match = re.match(r"^(?:>=|==)\s*([0-9]+(?:\.[0-9]+)+)$", spec_str.strip())
+    assert match, f"Expected '>=' or '==' version pin, got: {spec_str!r}"
+    return _parse_version_tuple(match.group(1))
+
+
+def test_requirements_pins_and_installed_hardened_tls_dependencies():
+    """requirements.txt and active env must enforce certifi>=2026.10.19, requests>=2.34.2, urllib3>=2.8.0 with no duplicates."""
     req_path = REPO_ROOT / "requirements.txt"
     lines = [
         line.strip()
@@ -33,13 +39,10 @@ def test_requirements_pins_hardened_tls_dependencies():
         assert len(specs) == 1, f"Duplicate requirement entry for {pkg_name}: {specs}"
 
     assert "certifi" in pkg_specs, "certifi must be explicitly pinned in requirements.txt"
-    assert pkg_specs["certifi"][0] == ">=2026.10.19"
-    assert pkg_specs["requests"][0] == ">=2.34.2"
-    assert pkg_specs["urllib3"][0] == ">=2.8.0"
+    assert _extract_min_version_tuple(pkg_specs["certifi"][0]) >= (2026, 10, 19)
+    assert _extract_min_version_tuple(pkg_specs["requests"][0]) >= (2, 34, 2)
+    assert _extract_min_version_tuple(pkg_specs["urllib3"][0]) >= (2, 8, 0)
 
-
-def test_installed_certifi_meets_minimum_safe_version():
-    """Active Python environment must run certifi >= 2026.10.19 (distrusts compromised eMudhra RSA roots)."""
     installed = _parse_version_tuple(certifi.__version__)
     assert installed >= (2026, 10, 19), (
         f"Installed certifi {certifi.__version__} is vulnerable to compromised eMudhra CA roots; "

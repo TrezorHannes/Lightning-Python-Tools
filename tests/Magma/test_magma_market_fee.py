@@ -103,12 +103,6 @@ def test_extract_market_offer_info_new_api(fee_module):
     assert info["seller_score"] == 92.5
 
 
-def test_calculate_apr(fee_module):
-    """Test APR calculation formula."""
-    apr = fee_module.calculate_apr(1000, 500, 5000000, 30.0)
-    assert 0.85 <= apr <= 0.86
-
-
 def test_fetch_public_magma_offers_filtering(fee_module):
     """Test fetching public offers filters out own pubkey and low seller scores."""
     mock_response = {
@@ -165,12 +159,13 @@ def test_fetch_public_magma_offers_filtering(fee_module):
     mock_post.raise_for_status.return_value = None
     fee_module.requests.post = MagicMock(return_value=mock_post)
 
-    magma_config = MagicMock()
-    magma_config.get = MagicMock(return_value="75.0")
+    cfg = real_configparser.ConfigParser()
+    cfg.read_string("[magma_autoprice]\nmin_seller_score_filter = 75.0 # inline comment\n")
 
-    offers = fee_module.fetch_public_magma_offers("03mypubkey123456", magma_config)
+    offers = fee_module.fetch_public_magma_offers("03mypubkey123456", cfg)
     assert len(offers) == 1
     assert offers[0]["id"] == "off_valid"
+    assert 0.85 <= fee_module.calculate_apr(1000, 500, 5000000, 30.0) <= 0.86
 
 
 def test_fetch_my_current_offers(fee_module):
@@ -388,56 +383,6 @@ def test_fetch_my_current_offers_enriches_min_max_amount_and_offer_type(fee_modu
     assert offer["total_size"] == 15000000
     assert offer["available_size"] == 10000000
     assert offer["offer_type"] == "CHANNEL"
-
-
-def test_fetch_public_magma_offers_reads_magma_autoprice_config_section(fee_module):
-    """Test that fetch_public_magma_offers reads min_seller_score_filter from [magma_autoprice] in a real ConfigParser."""
-    mock_response = {
-        "data": {
-            "market": {
-                "offer": {
-                    "offers": {
-                        "total": 2,
-                        "list": [
-                            {
-                                "id": "off_high",
-                                "status": "ENABLED",
-                                "side": "SELL",
-                                "node": {"pubkey": "03peer_high", "alias": "HighScore"},
-                                "total_amount": {"satoshi": {"sats": "5000000"}},
-                                "locked_amount": {"satoshi": {"sats": "0"}},
-                                "fees": {"fixed": {"sats": "500"}, "variable": {"sats": "300"}},
-                                "promises": {"min_block_length": 4320},
-                                "seller_score": 90.0,
-                            },
-                            {
-                                "id": "off_below_85",
-                                "status": "ENABLED",
-                                "side": "SELL",
-                                "node": {"pubkey": "03peer_mid", "alias": "MidScore"},
-                                "total_amount": {"satoshi": {"sats": "5000000"}},
-                                "locked_amount": {"satoshi": {"sats": "0"}},
-                                "fees": {"fixed": {"sats": "500"}, "variable": {"sats": "300"}},
-                                "promises": {"min_block_length": 4320},
-                                "seller_score": 80.0,
-                            },
-                        ],
-                    }
-                }
-            }
-        }
-    }
-    mock_post = MagicMock()
-    mock_post.json.return_value = mock_response
-    mock_post.raise_for_status.return_value = None
-    fee_module.requests.post = MagicMock(return_value=mock_post)
-
-    cfg = real_configparser.ConfigParser()
-    cfg.read_string("[magma_autoprice]\nmin_seller_score_filter = 85.0 # inline comment\n")
-
-    offers = fee_module.fetch_public_magma_offers("03mypubkey123456", cfg)
-    assert len(offers) == 1
-    assert offers[0]["id"] == "off_high"
 
 
 def test_fetch_public_magma_offers_paginates_multiple_pages(fee_module):
