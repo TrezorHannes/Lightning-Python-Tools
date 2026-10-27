@@ -107,5 +107,5 @@ Configuration files follow standard INI (`configparser`) and JSON formats:
 - `tests/Magma/test_magma_sale_process.py`: Sales order lifecycle, GraphQL queries/mutations, invoice generation, UTXO vbyte calculations, and Telegram alerts.
   - `tests/Magma/test_magma_market_fee.py`: Public offers analysis, APR calculations, offer creation/updates/toggles, and dry-run simulations.
   - `tests/test_fee_adjuster.py`: Liquidity curve calculations, stuck-channel discounts, and fee protections.
-- **CI/CD Matrix**: `.github/workflows/tests.yml` executes on every push and pull request across Python `3.10`, `3.11`, and `3.12`.
+- **CI/CD Matrix**: `.github/workflows/tests.yml` executes on every push and pull request across Python `3.11`, `3.12`, and `3.13`.
 - **Development Policy**: All new features and bugfixes must adhere to strict Test-Driven Development (TDD) and ensure 100% passing tests before merging.

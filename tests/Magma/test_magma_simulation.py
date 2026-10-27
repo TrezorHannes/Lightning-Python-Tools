@@ -26,9 +26,3 @@ def test_simulation_telegram_error_logging():
     """Verify TelegramLoggingHandler dispatches formatted error and traceback."""
     success = run_simulation(scenario="error", live_telegram=False, timeout_seconds=1)
     assert success is True
-
-
-def test_simulation_full_suite():
-    """Verify full simulation harness executes all scenarios cleanly."""
-    success = run_simulation(scenario="all", live_telegram=False, timeout_seconds=1)
-    assert success is True

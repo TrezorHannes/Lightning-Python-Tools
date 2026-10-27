@@ -222,6 +222,8 @@ def test_simple_market_order_vs_market_order_boundary():
     whereas single-order queries use `get_order` (MarketOrder).
     """
     # 1. LNDg/amboss_pull.py GET_SALES_PAGE_QUERY
+    assert "purchases" not in AMBOSS_PULL_SRC.constants["GET_SALES_PAGE_QUERY"]
+    assert "sales" in AMBOSS_PULL_SRC.constants["GET_SALES_PAGE_QUERY"]
     sales_list_body = _extract_block(AMBOSS_PULL_SRC.constants["GET_SALES_PAGE_QUERY"], "list")
     fields, _ = _parse_immediate_fields(sales_list_body)
     assert fields, "GET_SALES_PAGE_QUERY list selection must not be empty"

@@ -49,3 +49,10 @@ logs/
 data/
 bos
 PR_DESCRIPTION_TEMP.md
+
+# Testing and Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/

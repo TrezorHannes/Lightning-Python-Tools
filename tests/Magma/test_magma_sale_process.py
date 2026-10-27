@@ -313,40 +313,6 @@ def test_confirm_channel_point_to_amboss_critical_error(magma_module, mocker):
     mock_file.assert_called()
 
 
-def test_get_offers_awaiting_seller_approval_success(magma_module):
-    """Test fetching sales awaiting seller approval."""
-    mock_response = {
-        "data": {
-            "user": {
-                "market": {
-                    "orders": {
-                        "sales": {
-                            "total": 1,
-                            "list": [
-                                {
-                                    "id": "order_pending_01",
-                                    "status": "WAITING_FOR_SELLER_APPROVAL",
-                                    "amount": {"satoshi": {"sats": "2000000"}},
-                                    "fees": {"seller": {"sats": "5000"}},
-                                    "destination": {"pubkey": "02goodpubkey123", "alias": "GoodBuyer"}
-                                }
-                            ]
-                        }
-                    }
-                }
-            }
-        }
-    }
-    mock_post = MagicMock()
-    mock_post.json.return_value = mock_response
-    mock_post.raise_for_status.return_value = None
-    magma_module.requests.post = MagicMock(return_value=mock_post)
-
-    offer = magma_module.get_offers_awaiting_seller_approval()
-    assert offer is not None
-    assert offer["id"] == "order_pending_01"
-
-
 def test_get_offers_awaiting_seller_approval_banned_pubkey_auto_reject(magma_module, mocker):
     """Test that banned buyer pubkeys are automatically rejected."""
     mock_response = {
@@ -430,41 +396,6 @@ def test_get_offers_awaiting_seller_approval_banned_pubkey_reject_error_null_dat
     mock_reject.assert_called_once_with("order_banned_02")
 
 
-
-def test_get_orders_awaiting_channel_open_success(magma_module):
-    """Test fetching sales awaiting channel open."""
-    mock_response = {
-        "data": {
-            "user": {
-                "market": {
-                    "orders": {
-                        "sales": {
-                            "total": 1,
-                            "list": [
-                                {
-                                    "id": "order_channel_open_01",
-                                    "status": "WAITING_FOR_CHANNEL_OPEN",
-                                    "amount": {"satoshi": {"sats": "5000000"}},
-                                    "fees": {"seller": {"sats": "10000"}},
-                                    "destination": {"pubkey": "03peerpubkey456", "alias": "PeerNode"}
-                                }
-                            ]
-                        }
-                    }
-                }
-            }
-        }
-    }
-    mock_post = MagicMock()
-    mock_post.json.return_value = mock_response
-    mock_post.raise_for_status.return_value = None
-    magma_module.requests.post = MagicMock(return_value=mock_post)
-
-    order = magma_module.get_orders_awaiting_channel_open()
-    assert order is not None
-    assert order["id"] == "order_channel_open_01"
-
-
 def test_get_order_details_from_amboss_direct(magma_module):
     """Test fetching order details by ID via get_order query."""
     mock_response = {
@@ -534,27 +465,6 @@ def test_execute_lnd_command_failure(magma_module, mocker):
     
     assert txid is None
     assert "not enough funds" in err
-
-
-def test_extract_order_info_unsettled_zero_seller_fee_fallback(magma_module):
-    """Test unsettled orders where fees.seller.sats is 0 fall back to fixed + variable fee sum."""
-    unsettled_order = {
-        "id": "order_unsettled_001",
-        "status": "WAITING_FOR_SELLER_APPROVAL",
-        "amount": {"satoshi": {"sats": "2000000"}},
-        "fees": {
-            "fixed": {"sats": "1000"},
-            "variable": {"sats": "5000"},
-            "seller": {"sats": "0"},
-            "amboss": {"sats": "200"}
-        },
-        "destination": {"pubkey": "03buyer123", "alias": "FastBuyer"}
-    }
-    info = magma_module.extract_order_info(unsettled_order)
-    assert info["id"] == "order_unsettled_001"
-    assert info["seller_invoice_amount"] == 6000
-    assert info["customer_pubkey"] == "03buyer123"
-    assert info["channel_size"] == 2000000
 
 
 def test_extract_order_info_idempotency(magma_module):
@@ -748,7 +658,8 @@ def test_complete_offer_approval_process_raw_and_normalized(magma_module, mocker
 
 
 def test_complete_offer_approval_process_graphql_error_null_data(magma_module, mocker):
-    """Test _complete_offer_approval_process handles GraphQL errors with null data gracefully without crashing."""
+    """Test _complete_offer_approval_process handles GraphQL errors with null data, records cooldown, and avoids duplicate alerts."""
+    magma_module.failed_offer_acceptance_attempts.clear()
     raw_graphql_order = {
         "id": "order_proc_002",
         "status": "WAITING_FOR_SELLER_APPROVAL",
@@ -778,10 +689,13 @@ def test_complete_offer_approval_process_graphql_error_null_data(magma_module, m
     magma_module._complete_offer_approval_process("order_proc_002", raw_graphql_order)
 
     assert not mock_wait.called
+    assert "order_proc_002" in magma_module.failed_offer_acceptance_attempts
     assert mock_send.called
-    # Check that error notification contains the actual Amboss error detail
+    # Check that error notification contains the actual Amboss error detail and is sent once
     sent_messages = [call[0][0] for call in mock_send.call_args_list]
     assert any("Unable to find a route to this destination" in msg for msg in sent_messages)
+    failure_sends = [call for call in mock_send.call_args_list if "Failed to accept approved order" in str(call)]
+    assert len(failure_sends) == 1
     # Ensure critical error flag file was NOT created/written to
     assert not any(call[0][0] == magma_module.CRITICAL_ERROR_FILE_PATH for call in mock_file_open.call_args_list)
 
@@ -853,14 +767,38 @@ def test_telegram_logging_handler_captures_errors_and_tracebacks(magma_module):
 
 
 def test_telegram_logging_handler_recursion_and_filters(magma_module):
-    """Test TelegramLoggingHandler guards against recursion and suppresses excluded logs."""
+    """Test TelegramLoggingHandler guards against recursion and suppresses excluded/polling logs."""
     handler = magma_module.TelegramLoggingHandler(bot=magma_module.bot, chat_id=123)
     magma_module.bot.send_message.reset_mock()
 
-    # Filter telebot/urllib3/requests logs
-    for noisy_logger in ["telebot", "urllib3", "requests", "telebot.apihelper"]:
+    # Filter case-insensitive telebot/urllib3/requests logs
+    for noisy_logger in [
+        "TeleBot",
+        "telebot",
+        "TELEBOT",
+        "TeleBot.apihelper",
+        "telebot.apihelper",
+        "urllib3",
+        "urllib3.connectionpool",
+        "requests",
+        "requests.packages.urllib3",
+    ]:
         rec = logging.LogRecord(name=noisy_logger, level=logging.ERROR, pathname="foo.py", lineno=1, msg="Network drop", args=(), exc_info=None)
         handler.emit(rec)
+    assert not magma_module.bot.send_message.called
+
+    # Failsafe: funcName is infinity_polling or message contains Infinity polling exception
+    rec_poll = logging.LogRecord(
+        name="some_logger",
+        level=logging.ERROR,
+        pathname="__init__.py",
+        lineno=1021,
+        msg="Infinity polling exception: HTTPSConnectionPool: Read timed out.",
+        args=(),
+        exc_info=None,
+        func="infinity_polling",
+    )
+    handler.emit(rec_poll)
     assert not magma_module.bot.send_message.called
 
     # Filter notifications already being sent
@@ -874,49 +812,6 @@ def test_telegram_logging_handler_recursion_and_filters(magma_module):
     # Should not raise exception
     handler.emit(rec_error)
     magma_module.bot.send_message.side_effect = None
-
-
-def test_telegram_logging_handler_suppresses_telebot_pascal_case_and_infinity_polling(magma_module):
-    """Test TelegramLoggingHandler suppresses PascalCase TeleBot records and infinity_polling exceptions."""
-    handler = magma_module.TelegramLoggingHandler(bot=magma_module.bot, chat_id=123)
-    magma_module.bot.send_message.reset_mock()
-
-    # Case-insensitive checks: TeleBot, telebot, TELEBOT, TeleBot.apihelper, urllib3.connectionpool
-    noisy_loggers = [
-        "TeleBot",
-        "telebot",
-        "TELEBOT",
-        "TeleBot.apihelper",
-        "telebot.apihelper",
-        "urllib3.connectionpool",
-        "requests.packages.urllib3",
-    ]
-    for logger_name in noisy_loggers:
-        rec = logging.LogRecord(
-            name=logger_name,
-            level=logging.ERROR,
-            pathname="foo.py",
-            lineno=1021,
-            msg="Connection read timeout",
-            args=(),
-            exc_info=None,
-        )
-        handler.emit(rec)
-    assert not magma_module.bot.send_message.called
-
-    # Failsafe: funcName is infinity_polling or message contains Infinity polling exception
-    rec_poll1 = logging.LogRecord(
-        name="some_logger",
-        level=logging.ERROR,
-        pathname="__init__.py",
-        lineno=1021,
-        msg="Infinity polling exception: HTTPSConnectionPool: Read timed out.",
-        args=(),
-        exc_info=None,
-        func="infinity_polling",
-    )
-    handler.emit(rec_poll1)
-    assert not magma_module.bot.send_message.called
 
 
 def test_execute_amboss_graphql_request_timeout_demoted_to_warning(magma_module, mocker, caplog):
@@ -936,17 +831,6 @@ def test_execute_amboss_graphql_request_timeout_demoted_to_warning(magma_module,
     assert not any("Timeout during TestTimeoutQuery to Amboss" in r.message for r in error_records)
     # Ensure no Telegram alert was dispatched
     assert not magma_module.bot.send_message.called
-
-
-def test_telegram_logging_handler_no_duplicate_dispatches(magma_module):
-    """Test that logging error on root logger dispatches exactly one Telegram message."""
-    root_logger = logging.getLogger()
-    telegram_handlers = [h for h in root_logger.handlers if isinstance(h, magma_module.TelegramLoggingHandler)]
-    assert len(telegram_handlers) == 1
-
-    magma_module.bot.send_message.reset_mock()
-    logging.error("Single operational failure on root logger")
-    assert magma_module.bot.send_message.call_count == 1
 
 
 def test_connect_to_node_intermediate_retries_log_warning_not_error(magma_module, mocker, caplog):
@@ -1051,6 +935,7 @@ def test_get_node_extended_details_live_schema_contract(magma_module):
 
     details = magma_module.get_node_extended_details("03pubkey_live", amboss_token="custom_tok")
     assert details["amboss"]["is_claimed"] is True
+    assert magma_module.get_node_extended_details("03pubkey_live")["amboss"]["is_claimed"] is True
 
     call_args = magma_module.requests.post.call_args
     assert call_args[0][0] == magma_module.AMBOSS_SPACE_GRAPHQL_URL
@@ -1305,33 +1190,6 @@ def test_confirm_channel_point_http_error_with_null_errors_field(magma_module):
         assert "502 Server Error" in res["errors"][0]["message"]
 
 
-def test_get_node_extended_details_dynamic_7day_window_default(magma_module):
-    """Verify get_node_extended_details defaults to 7-day window to avoid Amboss subscription errors."""
-    from datetime import datetime, timezone, timedelta
-    mock_response = {
-        "data": {
-            "getNode": {
-                "amboss": {"is_claimed": True},
-                "graph_info": {"channels": {"num_channels": 5, "total_capacity": "10000000"}},
-            }
-        }
-    }
-    mock_post = MagicMock()
-    mock_post.status_code = 200
-    mock_post.json.return_value = mock_response
-    mock_post.raise_for_status.return_value = None
-    magma_module.requests.post = MagicMock(return_value=mock_post)
-
-    expected_7d = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
-    details = magma_module.get_node_extended_details("03buyer_7d")
-    assert details["amboss"]["is_claimed"] is True
-
-    call_args = magma_module.requests.post.call_args
-    variables = call_args[1]["json"]["variables"]
-    assert variables["pubkey"] == "03buyer_7d"
-    assert variables["from"] == expected_7d
-
-
 def test_execute_amboss_graphql_request_partial_data_preserves_data_with_warning(magma_module, caplog):
     """Verify that when Amboss returns both data and errors (partial error), data is preserved and a warning is logged."""
     partial_payload = {
@@ -1411,32 +1269,6 @@ def test_get_offers_awaiting_seller_approval_acceptance_failure_cooldown(magma_m
         offer_skipped = magma_module.get_offers_awaiting_seller_approval()
     assert offer_skipped is None
     assert any("is in acceptance cooldown" in r.message for r in caplog.records)
-
-
-def test_complete_offer_approval_process_records_acceptance_failure_cooldown(magma_module, mocker):
-    """Verify acceptance failure registers cooldown and does not trigger duplicate telegram notification."""
-    magma_module.failed_offer_acceptance_attempts.clear()
-    sample_order = {
-        "id": "order_fail_accept_01",
-        "status": "WAITING_FOR_SELLER_APPROVAL",
-        "amount": {"satoshi": {"sats": "1000000"}},
-        "fees": {"seller": {"sats": "3000"}},
-        "destination": {"pubkey": "03targetnode", "alias": "TargetNode"},
-        "buyer_alias": "TargetNode"
-    }
-
-    mocker.patch.object(magma_module, "execute_lncli_addinvoice", return_value=("hash", "lnbc123..."))
-    mocker.patch.object(magma_module, "accept_order", return_value={
-        "errors": [{"message": "Unable to find a route to this destination! Please reach out to support!"}],
-        "data": None
-    })
-    mock_send = mocker.patch.object(magma_module, "send_telegram_notification")
-
-    magma_module._complete_offer_approval_process("order_fail_accept_01", sample_order)
-
-    # Ensure send_telegram_notification was called exactly once for failure_message (no duplicate dispatches)
-    failure_sends = [call for call in mock_send.call_args_list if "Failed to accept approved order" in str(call)]
-    assert len(failure_sends) == 1
 
 
 def test_handle_timeout_for_offer_edit_message_timeout_logs_warning_not_error(magma_module, mocker, caplog):

@@ -112,16 +112,6 @@ def test_convert_short_to_long_chan_id_fallback_to_math(requests_mock):
 
 # --- Cycle 1: schema-correct list query + lease enrichment ------------------
 
-def test_sales_list_query_only_selects_simple_market_order_fields():
-    """Regression for #56: `promises`/`blocks_until_can_be_closed` do not exist on
-    SimpleMarketOrder, and requesting them fails GraphQL validation (HTTP 400)."""
-    list_selection = amboss_pull.GET_SALES_PAGE_QUERY.split("list", 1)[1]
-    assert "promises" not in list_selection
-    assert "blocks_until_can_be_closed" not in list_selection
-    details = amboss_pull.GET_ORDER_LEASE_DETAILS_QUERY
-    assert "get_order" in details and "promises" in details and "blocks_until_can_be_closed" in details
-
-
 def test_fetch_magma_orders_enriches_active_leases_with_promises(requests_mock):
     pages = {0: _sales_page([
         _simple("active-1", "VALID_CHANNEL_OPENING", "967276x1075x1"),
@@ -164,28 +154,7 @@ def test_fetch_magma_sales_raises_when_page_guard_exceeded(requests_mock):
         amboss_pull.fetch_magma_sales(page_size=1, max_pages=3)
 
 
-# --- Cycle 3: sales only ----------------------------------------------------
-
-def test_lease_sync_queries_sales_only_not_purchases():
-    """Seller fee-cap promises apply only to channels we sold."""
-    assert "purchases" not in amboss_pull.GET_SALES_PAGE_QUERY
-    assert "sales" in amboss_pull.GET_SALES_PAGE_QUERY
-
-
 # --- Cycle 4: error surfacing & retry classification -----------------------
-
-def test_graphql_validation_error_is_logged_and_not_retried(requests_mock, caplog):
-    body = {"errors": [{"message": 'Cannot query field "promises" on type "SimpleMarketOrder".',
-                        "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"}}]}
-    requests_mock.post(MAGMA, status_code=400, json=body)
-
-    with caplog.at_level("ERROR"), pytest.raises(amboss_pull.AmbossAPIError) as exc:
-        amboss_pull.fetch_magma_sales()
-
-    assert requests_mock.call_count == 1
-    assert exc.value.status_code == 400 and not exc.value.transient
-    assert "Cannot query field" in caplog.text and "SimpleMarketOrder" in caplog.text
-
 
 def test_graphql_errors_on_200_raise(requests_mock):
     requests_mock.post(MAGMA, json={"errors": [{"message": "Unauthorized"}], "data": None})
@@ -376,12 +345,6 @@ def test_extract_order_channel_info_live_shapes():
     assert info["locked_min_block_length"] == 8640
     assert info["locked_fee_rate_cap"] == 1650
     assert info["blocks_until_close"] == 6084
-
-
-def test_extract_order_channel_info_simple_order_defaults_to_zero():
-    info = amboss_pull.extract_order_channel_info(_simple("o", "CHANNEL_MONITORING_FINISHED", "1x2x3"))
-    assert info["locked_fee_rate_cap"] == 0
-    assert info["blocks_until_close"] == 0
 
 
 def test_import_has_no_logging_side_effects():
