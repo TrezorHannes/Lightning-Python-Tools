@@ -175,6 +175,7 @@ def modify_channels(channels):
 
             if response.status_code == 200:
                 # Log the changes
+                os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
                 with open(log_file_path, "a") as log_file:
                     log_file.write(
                         f"{timestamp}: Changed 'local_base_fee' to 0 for channel {chan_id}\n"

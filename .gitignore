@@ -28,6 +28,7 @@ ENV/
 
 # Configuration and Secrets
 config.ini
+Magma/magma_config.ini
 feeConfig.json
 wallets.json
 .env

@@ -1,91 +1,85 @@
-## Guidelines for the Fee Adjuster Script
+# Guidelines for the Fee Adjuster Script (`Other/fee_adjuster.py`)
 
-This script automates the adjustment of channel fees based on network conditions, peer behavior,
-and local liquidity using data from the Amboss API and LNDg API.
+`Other/fee_adjuster.py` automates outbound and inbound channel fee adjustments based on Amboss Space network statistics, forward activity, and local liquidity balances via the Amboss GraphQL API and LNDg REST API.
 
-### Configuration Settings:
-- base_adjustment_percentage: Percentage adjustment applied to the selected fee base (median, mean, etc.).
-- group_adjustment_percentage: Additional adjustment based on node group membership.
-- max_cap: Maximum allowed fee rate (in ppm).
-- trend_sensitivity: Multiplier for the influence of Amboss fee trends on the adjustment.
-- fee_base: Statistical measure from Amboss used as the fee calculation base ("median", "mean", etc.).
-- groups: Node categories for applying differentiated strategies via group_adjustment_percentage.
-- fee_bands: (Optional) Dynamic fee adjustments based on local liquidity.
-  - enabled: true/false.
-  - discount: Negative percentage adjustment for high local balance (80-100%).
-  - premium: Positive percentage adjustment for low local balance (0-40%).
-- stuck_channel_adjustment: (Optional) Gradually reduces fees for channels without recent forwards.
-  - enabled: true/false.
-  - stuck_time_period: Number of days defining one 'stuck period' interval (e.g., 7).
-- inbound_protection: (Optional) Configures protection against unprofitable rebalance feedback loops.
-  - enabled: true/false.
-  - max_inbound_discount_ppm: Hard cap on negative inbound fee discounts (default: 250 ppm).
-  - lock_ar_out_target_on_discount: Automatically sets ar_out_target = 100% when an inbound discount is active to prevent rebalance drainage.
-  - default_restored_ar_out_target: Restores ar_out_target (e.g. 75%) once channel balance is restored and discount is removed.
-  - restore_liquidity_threshold: Local liquidity ratio required before unlocking (default: 75.0%).
+## Configuration (`feeConfig.json`)
 
-### Inbound Discount Protection & Rebalance Guard:
-When inbound discounts are offered on depleted channels, `fee_adjuster.py` and `rebalance_guard.py` ensure:
-1. Inbound discounts are capped at `max_inbound_discount_ppm` to prevent routing payments at net losses against exit channels.
-2. The channel is locked (`ar_out_target = 100%`) while offering discounts so LNDg will not cannibalize refilling liquidity as a rebalance donor.
-3. When local liquidity recovers and discounts are lifted, standard `ar_out_target` settings are restored.
+Copy `feeConfig.json.example` to `feeConfig.json` in the repository root:
 
-### Standalone Rebalance Guard Tool:
-`rebalance_guard.py` audits all open channels in LNDg across both native `af.py` and `fee_adjuster.py` channels:
+- `Terminal_output`: Print adjustment summary tables to stdout (`true`/`false`).
+- `LNDg_fee_update`: Push calculated outbound/inbound fees directly to the LNDg API (`true`/`false`).
+- `write_charge_lnd_file`: Export rule stanzas to `<charge_lnd_path>/fee_adjuster.txt` (`true`/`false`).
+- `update_channel_notes`: Write fee calculation summaries into LNDg channel notes (`true`/`false`).
+- `inbound_protection`: Protects channels from unprofitable circular rebalance loops:
+  - `lock_ar_out_target_on_discount`: Locks `ar_out_target` to `lock_target` whenever a negative inbound fee discount is active (`default: true`).
+  - `lock_target`: Target outbound auto-rebalance percentage applied while locked (`default: 100`).
+  - `default_restored_ar_out_target`: Fallback `ar_out_target` restored if no prior baseline was recorded (`default: 75`).
+  - `restore_liquidity_threshold`: Minimum local liquidity percentage required before unlocking (`default: 75.0`).
+  - `max_inbound_discount_ppm`: Optional cap on negative inbound fee discounts in ppm (`null` by default for uncapped, or set e.g. `250` to cap at `-250 ppm`).
+- `groups`: Named peer strategy profiles (for example `sink`, `expensive`) defining:
+  - `group_adjustment_percentage`: Multiplier offset applied to the selected `fee_base`.
+  - `max_cap`: Maximum allowed outbound fee rate in ppm.
+  - `trend_sensitivity`: Multiplier weighting Amboss fee trend deltas.
+  - `fee_base`: Statistical measure from Amboss (`"median"`, `"mean"`, etc.).
+  - `fee_delta_threshold`: Minimum change in ppm required before pushing an update to LNDg.
+  - `inbound_auto_fee_enabled`: Enables dynamic negative inbound fee discounts scaled by LNDg `ar_max_cost` in low-liquidity bands (`true`/`false`).
+  - `fee_bands`: Liquidity-based fee adjustments across 5 balance bands (`0-20%`, `20-40%`, `40-60%`, `60-80%`, `80-100%`):
+    - `enabled`: `true`/`false`.
+    - `discount`: Negative percentage adjustment for high local balance (`80-100%`).
+    - `premium`: Positive percentage adjustment for low local balance (capped at the `20-40%` band).
+  - `stuck_channel_adjustment`: Progressively steps down the liquidity band for channels without recent outbound forwards:
+    - `enabled`: `true`/`false`.
+    - `stuck_time_period`: Days without an outbound forward per 1-band step-down (capped at 4 bands).
+    - `min_local_balance_for_stuck_discount`: Minimum aggregate peer local liquidity ratio (for example `0.2` for `20%`) required before applying stuck discounts.
+    - `min_updates_for_discount`: Minimum channel `num_updates` threshold to avoid discounting newly opened channels.
+- `nodes`: Per-peer list mapping `pubkey` to a `group` (with optional per-node overrides or custom `fee_conditions`).
+
+## Inbound Discount Protection & Standalone Rebalance Guard
+
+When inbound discounts are active on depleted channels, `Other/fee_adjuster.py` and `Other/rebalance_guard.py` coordinate to prevent rebalance cannibalization:
+1. Optional `max_inbound_discount_ppm` caps negative inbound discounts so transit forwards do not route at a net loss.
+2. Discounted channels are locked (`ar_out_target = 100%`), recording their prior baseline target in `data/rebalance_targets_baseline.json`.
+3. Once local liquidity recovers to `restore_liquidity_threshold` and the inbound discount is lifted, the channel's baseline `ar_out_target` is automatically restored.
+
+Run the standalone guard across all open LNDg channels (covering both native LNDg Auto-Fees and `fee_adjuster.py`):
 ```bash
-# Dry run check
-python3 Other/rebalance_guard.py --dry-run
+# Dry-run audit
+.venv/bin/python3 Other/rebalance_guard.py --dry-run
 
 # Live execution
-python3 Other/rebalance_guard.py
-```
-Allows tailored fee strategies for nodes in specific categories (e.g., "sink", "expensive").
-
-### Fee Bands:
-Adjusts fees based on local balance ratio, dividing liquidity into 5 bands (0-20%, 20-40%, 40-60%, 60-80%, 80-100%). A graduated adjustment is applied between the configured discount (high local balance) and premium (low local balance). The premium is capped at the 20-40% liquidity band to avoid excessively high fees on nearly drained channels.
-
-### Stuck Channel Adjustment:
-This feature incrementally reduces fees for channels that haven't forwarded payments recently.
-For each multiple of the `stuck_time_period` (in days) that a peer's channels have gone without an *outbound* forwarding, the fee band is moved down by one level (towards the maximum discount).
-The adjustment is capped at moving down 4 bands (reaching the maximum discount band).
-If an outbound forward is detected for any channel of the peer, the stuck adjustment is reset to 0 bands down.
-This adjustment is automatically skipped if the aggregate local liquidity for the peer is below 20%, preventing discounts on heavily imbalanced channels needing rebalancing. The script queries the LNDg API to find the timestamp of the last outbound forward for the peer.
-
-### Usage:
-- Configure nodes and their settings in `feeConfig.json`.
-- Run the script to automatically adjust fees based on configured settings.
-- Requires a running LNDg instance for local channel details and fee updates.
-
-### Test Suite:
-New features and refactors are guarded by a suite of unit tests. To run them locally:
-
-```bash
-# Activate your venv first if not active
-source .venv/bin/activate
-
-# Install test dependencies
-pip install -r requirements-dev.txt
-
-# Run the tests (pytest auto-discovers tests in the current directory)
-pytest
+.venv/bin/python3 Other/rebalance_guard.py
 ```
 
-### Command Line Arguments:
-- --debug: Enable detailed debug output, including stuck channel check results.
+## Command-Line Arguments
 
-### Charge-lnd Details:
-Configure charge-lnd to use the output file:
+- `--debug`: Prints detailed fee and stuck-channel diagnostics while skipping live LNDg API mutations and `charge-lnd` file writes.
+
+## `charge-lnd` Integration
+
+Ensure `charge_lnd_path` is set under `[paths]` in `config.ini` (defaults to `~/.chargelnd/.config`), and reference the generated file in `charge-lnd.config`:
 ```ini
-# charge-lnd.config
-[🤖 FeeAdjuster Import]
+[FeeAdjuster Import]
 strategy = use_config
-config_file = file:///path/to/your/charge-lnd/.config/fee_adjuster.txt
+config_file = file:///home/admin/.chargelnd/.config/fee_adjuster.txt
 ```
 
-### Installation:
-Add to crontab or use the systemd installer script:
+## Installation (systemd Timer or Crontab)
+
+Use the included installer script to set up `fee_adjuster.service` and an hourly `fee_adjuster.timer`:
 ```bash
-crontab -e
-# Add the following line (adjust path as needed)
-0 * * * * /path/Lightning-Python-Tools/.venv/bin/python3 /path/Lightning-Python-Tools/Other/fee_adjuster.py >/dev/null 2>&1
+chmod +x Other/install_fee_adjuster_service.sh
+sudo ./Other/install_fee_adjuster_service.sh
+```
+
+Or schedule via `crontab -e`:
+```cron
+0 * * * * /path/to/Lightning-Python-Tools/.venv/bin/python3 /path/to/Lightning-Python-Tools/Other/fee_adjuster.py >> /path/to/Lightning-Python-Tools/logs/cron_fee.log 2>&1
+```
+
+## Running Tests
+
+```bash
+source .venv/bin/activate
+pip install -r requirements-dev.txt
+pytest tests/test_fee_adjuster.py tests/test_rebalance_guard.py -v
 ```

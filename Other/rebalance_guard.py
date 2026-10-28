@@ -26,6 +26,7 @@ parent_dir = os.path.dirname(os.path.abspath(__file__))
 config_file_path = os.path.join(parent_dir, "..", "config.ini")
 fee_config_file_path = os.path.join(parent_dir, "..", "feeConfig.json")
 log_file_path = os.path.join(parent_dir, "..", "logs", "rebalance-guard.log")
+os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
 
 # Setup logging
 logging.basicConfig(

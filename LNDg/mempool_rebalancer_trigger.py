@@ -63,6 +63,7 @@ password = config["credentials"]["lndg_password"]
 
 # Logfile definition
 log_file_path = os.path.join(parent_dir, "..", "logs", "mempool_rebalancer_trigger.log")
+os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
 logging.basicConfig(filename=log_file_path, level=logging.DEBUG)
 
 

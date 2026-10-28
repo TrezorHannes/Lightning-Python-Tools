@@ -243,6 +243,7 @@ def write_bos_tags():
                     ]
                 }
 
+                os.makedirs(os.path.dirname(file_path_to_bos), exist_ok=True)
                 with open(file_path_to_bos, "w") as file:
                     json.dump(tags_data, file, indent=2)
 
@@ -262,6 +263,7 @@ def main():
     if args.file_export:
         chan_ids = get_chan_ids_to_write()
         if chan_ids:
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
             with open(file_path, "w") as file:
                 file.write(",".join(chan_ids) + "\n")
             print(f"Channel-ID data written to {file_path}")

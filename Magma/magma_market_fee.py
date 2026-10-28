@@ -22,10 +22,10 @@
 # - Includes a --dry-run mode to simulate actions without making live API changes.
 #
 # How to Run:
-# 1. Ensure Python 3 is installed.
-# 2. Install required Python packages: `pip install requests telebot configparser`
+# 1. Ensure Python 3.11+ is installed.
+# 2. Install required Python packages: `pip install -r requirements.txt`
 # 3. Ensure `../config.ini` exists and is configured (see config.ini.example).
-# 4. Create `Magma/magma_config.ini` for Magma-specific settings.
+# 4. Copy `Magma/magma_config.ini.example` to `Magma/magma_config.ini` and customize offer settings.
 # 5. Make the script executable: `chmod +x magma_market_fee.py`
 # 6. Run the script: `python /path/to/Magma/magma_market_fee.py`
 #    For dry run: `python /path/to/Magma/magma_market_fee.py --dry-run`
@@ -1338,7 +1338,8 @@ def main():
 
     if not os.path.exists(MAGMA_CONFIG_FILE_PATH):
         logging.critical(
-            f"CRITICAL: Magma-specific configuration file {MAGMA_CONFIG_FILE_PATH} not found. Exiting."
+            f"CRITICAL: Magma-specific configuration file {MAGMA_CONFIG_FILE_PATH} not found "
+            "(copy Magma/magma_config.ini.example to Magma/magma_config.ini). Exiting."
         )
         return
     magma_specific_config.read(MAGMA_CONFIG_FILE_PATH)
