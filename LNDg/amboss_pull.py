@@ -36,7 +36,9 @@ LNDG_PASSWORD = config.get("credentials", "lndg_password", fallback="")
 LNDG_BASE_URL = config.get("lndg", "lndg_api_url", fallback="http://localhost:8889")
 
 # Output Paths
-CHARGE_LND_PATH = config.get("paths", "charge_lnd_path", fallback="/tmp/charge-lnd")
+CHARGE_LND_PATH = os.path.expanduser(
+    config.get("paths", "charge_lnd_path", fallback="/tmp/charge-lnd")
+)
 FINISHED_FILE_NAME = "magma-finished.txt"
 FEE_CAP_FILE_PATTERN = re.compile(r"^magma-channels_(\d+)\.txt$")
 LOG_FILE_PATH = os.path.join(parent_dir, "..", "logs", "amboss-LNDg_changes.log")

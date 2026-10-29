@@ -26,8 +26,8 @@
 # - (Optional) Attempts to record income via BOS `send` command after successful channel open.
 #
 # How to Run:
-# 1. Ensure Python 3 is installed.
-# 2. Install required Python packages: `pip install pyTelegramBotAPI requests schedule`
+# 1. Ensure Python 3.11+ is installed.
+# 2. Install required Python packages: `pip install -r requirements.txt`
 # 3. Copy `config.ini.example` to `config.ini` in the script's parent directory and fill in
 #    all necessary details (API tokens, Telegram bot info, LND/BOS paths, etc.).
 # 4. Make the script executable: `chmod +x magma_sale_process.py`
@@ -46,7 +46,7 @@
 # - `pyTelegramBotAPI` library
 # - `schedule` library
 
-# Import Lybraries
+# Import Libraries
 import requests
 import telebot
 import json

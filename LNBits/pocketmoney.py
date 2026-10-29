@@ -10,6 +10,14 @@ from logging.handlers import RotatingFileHandler
 from telebot import TeleBot
 import argparse
 
+def normalize_lnbits_base_url(raw_url):
+    """Normalize LNbits base URL so /api/v1/... endpoints are never doubled."""
+    url = (raw_url or "").strip().rstrip("/")
+    if url.endswith("/api/v1"):
+        url = url[: -len("/api/v1")].rstrip("/")
+    return url
+
+
 # Get the path to the parent directory
 parent_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -19,15 +27,15 @@ config = configparser.ConfigParser()
 config.read(config_file_path)
 
 # Parse scheduling preferences
-recurrence_raw = config["Schedule"]["recurrence"]
+recurrence_raw = config.get("Schedule", "recurrence", fallback="weekly")
 RECURRENCE = recurrence_raw.split("#")[0].strip().lower()
 
 # Verify RECURRENCE
 if RECURRENCE not in ["daily", "weekly"]:
     raise ValueError("Invalid recurrence setting. Choose from 'daily' or 'weekly'.")
 
-TIME = config["Schedule"]["time"].strip()
-DAY_OF_WEEK = config["Schedule"].get("day_of_week", "friday").strip()
+TIME = config.get("Schedule", "time", fallback="09:00").strip()
+DAY_OF_WEEK = config.get("Schedule", "day_of_week", fallback="friday").strip().lower()
 
 # Check if TIME is valid
 try:
@@ -36,17 +44,18 @@ except ValueError:
     raise ValueError("Invalid time format. Use HH:MM (e.g., 09:00).")
 
 # Other configuration variables
-ADMIN_KEY = config["LNBits"]["admin_key"]
-LNBITS_URL = config["LNBits"]["base_url"]
-TOKEN = config["telegram"]["lnbits_bot_token"]
-CHAT_ID = config["telegram"]["telegram_user_id"]
+ADMIN_KEY = config.get("LNBits", "admin_key", fallback="").strip()
+LNBITS_URL = normalize_lnbits_base_url(config.get("LNBits", "base_url", fallback=""))
+TOKEN = config.get("telegram", "lnbits_bot_token", fallback="").strip()
+CHAT_ID = config.get("telegram", "telegram_user_id", fallback="").strip()
 THRESHOLD_BALANCE = 1000000
 
-# Initialize Telegram bot
-bot = TeleBot(TOKEN)
+# Initialize Telegram bot (safe placeholder when imported without config.ini in tests)
+bot = TeleBot(TOKEN if (TOKEN and ":" in TOKEN) else "123456:fake_token_for_testing")
 
 # Set up logging
 log_file_path = os.path.join(os.path.dirname(__file__), "..", "logs", "pocketmoney.log")
+os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
 handler = RotatingFileHandler(log_file_path, maxBytes=10 * 1024 * 1024, backupCount=5)
 logging.basicConfig(
     level=logging.DEBUG,
@@ -233,6 +242,20 @@ def schedule_transfers():
         raise ValueError("Invalid recurrence setting. Choose from 'daily' or 'weekly'.")
 
 
+def validate_runtime_config():
+    missing = []
+    if not LNBITS_URL:
+        missing.append("[LNBits] base_url")
+    if not ADMIN_KEY:
+        missing.append("[LNBits] admin_key")
+    if not TOKEN or ":" not in TOKEN:
+        missing.append("[telegram] lnbits_bot_token")
+    if not CHAT_ID:
+        missing.append("[telegram] telegram_user_id")
+    if missing:
+        raise ValueError(f"Missing or invalid config.ini settings: {', '.join(missing)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Pocket Money Scheduler")
     parser.add_argument(
@@ -241,6 +264,7 @@ def main():
         help="Run the transfer once and exit, best for cronjobs",
     )
     args = parser.parse_args()
+    validate_runtime_config()
 
     if args.run_once:
         scheduled_transfer()

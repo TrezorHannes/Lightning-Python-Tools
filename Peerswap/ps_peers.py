@@ -93,6 +93,6 @@ def main():
 
     print(table)
 
-get_lbtc_balance()
+
 if __name__ == "__main__":
     main()

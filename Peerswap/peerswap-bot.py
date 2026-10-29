@@ -40,6 +40,7 @@ PATH_COMMAND = config['system']['path_command']
 
 # Logging
 log_file_path = os.path.join(parent_dir, '..', 'logs', 'peerswap-bot.log')
+os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
 logging.basicConfig(filename=log_file_path, level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 bot = telebot.TeleBot(BOT_TOKEN)

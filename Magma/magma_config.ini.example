@@ -1,5 +1,5 @@
-# Magma/magma_config.ini
-# This file contains Magma-specific settings for the magma_market_fee.py script.
+# Magma/magma_config.ini.example
+# Copy to Magma/magma_config.ini and customize settings for Magma/magma_market_fee.py.
 
 [magma_autoprice]
 # Enable/disable the magma auto-pricing script

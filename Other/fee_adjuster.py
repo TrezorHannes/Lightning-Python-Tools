@@ -121,6 +121,7 @@ config_file_path = os.path.join(parent_dir, "..", "config.ini")
 
 # File path for the log file
 log_file_path = os.path.join(parent_dir, "..", "logs", "fee-adjuster.log")
+os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
 
 # Logfile definition
 logging.basicConfig(filename=log_file_path, level=logging.DEBUG)
@@ -1824,8 +1825,14 @@ def main():
                     and updated_any_channel
                     and not skip_charge_lnd_file_write
                 ):
+                    charge_lnd_dir = os.path.expanduser(
+                        config.get(
+                            "paths", "charge_lnd_path", fallback="~/.chargelnd/.config"
+                        )
+                    )
+                    os.makedirs(charge_lnd_dir, exist_ok=True)
                     charge_lnd_file_path = os.path.join(
-                        config["paths"]["charge_lnd_path"], "fee_adjuster.txt"
+                        charge_lnd_dir, "fee_adjuster.txt"
                     )
                     # Pass the inbound fee details to write_charge_lnd_file
                     # calculated_inbound_ppm_for_peer is the peer-level summary calculated earlier

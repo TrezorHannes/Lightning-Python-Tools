@@ -56,6 +56,7 @@ def get_chan_ids_to_write():
 chan_ids = get_chan_ids_to_write()
 print(f"Channel-IDs: {chan_ids}")
 
+os.makedirs(os.path.dirname(file_path), exist_ok=True)
 if chan_ids:
     with open(file_path, "w") as file:
         for chan_id in chan_ids:
