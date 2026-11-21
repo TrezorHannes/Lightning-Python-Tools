@@ -20,13 +20,15 @@ Rather than simply finding channels with high local balances, `swap_out-loop.py`
 - **Two-Stage Route Validation & Real Liquidity Probing**:
   - **Stage 1 (`lncli queryroutes`)**: Fast graph traversal to verify route existence and compute theoretical off-chain hop fees to the Loop server node.
   - **Stage 2 (Mandatory Live Prepay Probe)**: Probes the route with a random 32-byte fake hash via `lncli sendpayment`. Proves actual downstream liquidity without risking funds. Ghost liquidity paths from gossip graphs that fail live probing are automatically filtered out.
-  - **Direct 2-Hop Route Fallback**: If multi-hop routes fail due to intermediate bottlenecks or dead gossip nodes, the tool automatically checks if the candidate peer maintains a direct channel to the Loop node (`021c97a9...`), constructing the route via `lncli buildroute` and probing it with `lncli sendtoroute` to accurately capture the exact verified route fee.
+  - **Direct 2-Hop Route Fallback**: If multi-hop routes fail due to intermediate bottlenecks or dead gossip nodes, the tool automatically checks if the candidate peer maintains a direct channel to the Loop node (`021c97a9...`), constructing the route via `lncli buildroute --outgoing_chan_id <chan_id>` and probing it with `lncli sendtoroute` to accurately capture the exact verified route fee.
+  - **PPM Ceiling Awareness**: When `--max-routing-fee <ppm>` (or `[loop] max_routing_fee_ppm`) is set, the converted satoshi cap is forwarded to `lncli queryroutes` and `lncli sendpayment` via `--fee_limit`, and candidates whose verified `Route PPM` exceeds the cap are flagged with `!` in the selection table.
 - **Concurrent Worker Probing (`--workers <N>`)**:
   - Probes candidates sequentially by default for zero downstream HTLC collision, or in parallel via `--workers 2` using `ThreadPoolExecutor` with thread-safe output formatting, cutting scanning time in half.
 - **Multi-Channel Outbound Candidates & Route Diversity (`--channel <id1>,<id2>...`, `--max-channels <N>`)**:
   - Fixed Net Swap Size: The defined swap amount (`--amt`, e.g. 3,000,000 sats) remains fixed as the total swap volume. Activating multiple channels provides LND with multiple outbound route options and enables Multi-Path Payments (MPP) across chosen peers.
-  - Cost & PPM Range: Dynamically calculates and displays the effective cost range (from the cheapest candidate's PPM up to the most expensive candidate's PPM, e.g. `3,569 – 4,570 ppm`), keeping fee expectations realistic regardless of which path LND selects.
-  - Bounded Routing Fee Budget: Calculates the off-chain fee ceiling from the most expensive selected outbound candidate (`max(probed_routing_fee) + leeway`), ensuring LND has sufficient fee room without overpaying.
+  - Cost & PPM Range: Dynamically calculates and displays the effective cost range (from the cheapest candidate's PPM up to the most expensive candidate's PPM, e.g. `3,569 – 4,570 ppm`), plus the conservative weighted MPP routing fee estimate across selected channels.
+  - Bounded Routing Fee Budget (PPM Ceiling or Weighted MPP Leeway): Supports setting an explicit PPM ceiling via `--max-routing-fee <ppm>` (e.g., `4000` for `0.4%`, automatically converted to satoshis for `litloop out --max_swap_routing_fee`). When omitted, computes a conservative weighted MPP routing fee across selected channels (summing shard costs when `--amt` exceeds any single channel's drainable surplus) plus configurable leeway (`fee_leeway_pct` + `fee_leeway_base_sats`).
+  - Pre-Flight Liquidity & MPP Headroom Check: Verifies combined drainable liquidity covers the swap amount, routing fee budget, and Loop prepay invoice, warning when multi-channel headroom drops below `10%` (where LND's power-of-2 MPP retries commonly hit channel reserve limits).
   - Passes comma-separated channel IDs directly to `litloop out --channel <id1>,<id2>...` (native Loop daemon feature).
   - Bypasses single-channel bottlenecks, avoids stranded prepayments if a single peer experiences churn or mass channel closures, and optimizes routing path diversity.
 - **Interactive Terminal UI with Multi-Select**:
@@ -98,10 +100,14 @@ target_local_ratio = 50
 workers = 1
 # Timeout in seconds for individual route prepay probes (default: 15)
 probe_timeout = 15
+# Optional default max off-chain routing fee ceiling in PPM (e.g., 4000 for 0.4%). Leave unset to use fee_leeway_pct.
+# max_routing_fee_ppm = 4000
 # Percentage leeway added on top of probed routing fee for max off-chain fee limit (default: 100 for +100% / 2x headroom)
 fee_leeway_pct = 100
 # Base satoshis buffer added to fee leeway to absorb base fees and small fluctuations (default: 500)
 fee_leeway_base_sats = 500
+# Optional per-attempt off-chain payment timeout passed to litloop out (Go duration, e.g., 10m, 600s)
+# payment_timeout = 10m
 ```
 
 ---
@@ -114,6 +120,9 @@ python3 Other/swap_out-loop.py
 
 # Specify an explicit swap amount (e.g., 5,000,000 sats)
 python3 Other/swap_out-loop.py --amt 5000000
+
+# Cap off-chain routing fee at 4,000 ppm (automatically converted to sats for litloop out) with 10m payment timeout
+python3 Other/swap_out-loop.py --amt 22000000 -f 30 --conf-target 6 --max-routing-fee 4000 --payment-timeout 10m -w 2
 
 # Fast parallel route evaluation with 2 workers
 python3 Other/swap_out-loop.py --amt 8000000 --workers 2
@@ -155,8 +164,9 @@ python3 Other/swap_out-loop.py --history --csv
 | `-w`, `--workers` | `int` | Config / `1` | Number of concurrent worker threads for route probing (recommended: `1` or `2`). |
 | `--probe-timeout` | `int` | Config / `15` | Timeout in seconds for individual route prepay probes. |
 | `--skip-prepay-probe` | `flag` | `False` | Skip active prepay probing and rely on queryroutes theoretical fees (not recommended). |
-| `--max-routing-fee`| `int` | Leeway buffer | Upper limit on off-chain routing fees in satoshis. Set to 0 to omit fee limit (uses Loop daemon default). |
-| `--fee-leeway-pct` | `float`| Config / `100%` | Percentage leeway added on top of probed routing fee for max off-chain fee budget (e.g. 100 = 2x headroom). |
+| `--max-routing-fee`| `int` | Leeway buffer | Upper limit on off-chain routing fees in **PPM** (e.g., `4000` for `0.4%`, automatically converted to satoshis for `litloop out --max_swap_routing_fee`). Set to `0` to omit fee limit (uses Loop daemon default). |
+| `--fee-leeway-pct` | `float`| Config / `100%` | Percentage leeway added on top of estimated routing fee for max off-chain fee budget when no PPM cap is set (e.g. `100` = 2x headroom). |
+| `--payment-timeout` | `str` | Loop default (`1h`) | Optional per-attempt off-chain payment timeout passed to `litloop out --payment_timeout` (Go duration, e.g. `10m`, `600s`). Helps prevent canceled swaps from leaving prepay payments retrying for 1+ hour. |
 | `--max-channels` | `int` | Config / `3` | Maximum number of outgoing channels to batch in a multi-channel Loop Out. |
 | `--channel`, `--channels` | `str` | `None` | Comma-separated list of short channel IDs to target directly. |
 | `--dest-addr` | `str` | LND wallet | Custom destination address for swept on-chain funds. |
@@ -198,3 +208,16 @@ python3 Other/swap_out-loop.py --history
 # Export to CSV spreadsheet
 python3 Other/swap_out-loop.py --history --csv
 ```
+
+---
+
+## 7. Troubleshooting Off-Chain Swap Failures (`FAILURE_REASON_OFFCHAIN`)
+
+If Loop Out swaps fail off-chain despite passing route probing:
+
+1. **Check `lnd.conf` pathfinder attempt cost (`routerrpc.attemptcostppm`)**:
+   - LND defaults to `routerrpc.attemptcostppm=1000`. Setting it very low (e.g., `10`) causes LND to grind through dozens or hundreds of cheap 9–12 hop routes with dead liquidity rather than using a verified 2-hop direct channel to `LOOP` (typically `3,400–5,000 ppm`). Raising `attemptcostppm` closer to `500–1000` dramatically improves Loop Out routing convergence.
+2. **Keep ≥ 10% MPP Liquidity Headroom**:
+   - LND splits multi-channel MPP payments into power-of-2 shards (`50%`, `25%`, `12.5%`, ...) and keeps slow shards in-flight while retrying. Filling selected channels above ~90% of their combined drainable surplus frequently triggers `commitment transaction dips peer below chan reserve`. Lower `--amt` or select an additional channel.
+3. **Avoid Stuck 1-Hour Prepay Retries**:
+   - Pass `--payment-timeout 10m` (or configure `payment_timeout = 10m` under `[loop]`) so if a swap fails off-chain, `loopd` does not leave the `30,000` sat prepay payment retrying for an hour after the swap is already canceled.
