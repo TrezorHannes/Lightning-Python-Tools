@@ -1146,14 +1146,15 @@ def test_execute_loop_out_payment_timeout_and_dry_run_parity(capsys):
         assert "--payment_timeout 15m" in out
         assert "--max_swap_routing_fee 20000" in out
 
-    with pytest.raises(ValueError, match="payment_timeout"):
-        swap_out_loop.execute_loop_out(
-            config={},
-            channel_id="111",
-            amt=5_000_000,
-            payment_timeout="badvalue",
-            dry_run=True,
-        )
+    for bad_timeout in ("badvalue", "0s", "0m", "0h", "00m"):
+        with pytest.raises(ValueError, match="payment_timeout"):
+            swap_out_loop.execute_loop_out(
+                config={},
+                channel_id="111",
+                amt=5_000_000,
+                payment_timeout=bad_timeout,
+                dry_run=True,
+            )
 
 
 def test_parse_arguments_probe_timeout_defaults_none_and_ppm_flags():
@@ -1346,3 +1347,161 @@ def test_run_command_parses_streaming_json_objects():
         assert err is None
         assert data["status"] == "FAILED"
         assert mock_sub.call_args[1]["stdin"] is swap_out_loop.subprocess.DEVNULL
+
+
+def test_read_single_keypress_pty_arrow_and_bare_esc():
+    """Verify unbuffered os.read in read_single_keypress handles PTY arrow escape sequences and bare Esc."""
+    import pty
+    import threading
+    import time
+
+    master_fd, slave_fd = pty.openpty()
+    try:
+        def send_after_setraw(payload: bytes):
+            time.sleep(0.03)
+            os.write(master_fd, payload)
+
+        with os.fdopen(slave_fd, "r", encoding="utf-8", closefd=False) as slave_file:
+            with patch.object(sys, "stdin", slave_file):
+                for payload, expected in [(b"\x1b[A", "\x1b[A"), (b"\x1b[B", "\x1b[B"), (b"\x1b", "\x1b")]:
+                    t = threading.Thread(target=send_after_setraw, args=(payload,), daemon=True)
+                    t.start()
+                    assert swap_out_loop.read_single_keypress() == expected
+                    t.join(timeout=1.0)
+    finally:
+        os.close(master_fd)
+        os.close(slave_fd)
+
+
+def test_main_fails_closed_non_tty_live_with_warning():
+    """Non-TTY live execution must fail closed when fee cap or MPP headroom warnings trigger."""
+    mock_candidates = [
+        {
+            "chan_id": "1048065478812368897",
+            "alias": "Authenticity",
+            "remote_pubkey": "02aaa",
+            "proposed_amt": 13_380_136,
+            "drainable_surplus": 13_380_136,
+            "local_ratio": 94.2,
+            "server_fee": 13_423,
+            "onchain_fee": 153,
+            "routing_fee": 46_054,
+            "routing_ppm": 3_442,
+            "prepay_amt": 30_000,
+            "opportunity_cost": 401,
+            "total_cost": 60_031,
+            "effective_ppm": 4_487,
+            "exceeds_fee_cap": False,
+        },
+        {
+            "chan_id": "896468114071224320",
+            "alias": "block-iad-1",
+            "remote_pubkey": "02bbb",
+            "proposed_amt": 9_385_344,
+            "drainable_surplus": 9_385_344,
+            "local_ratio": 98.9,
+            "server_fee": 9_428,
+            "onchain_fee": 153,
+            "routing_fee": 45_612,
+            "routing_ppm": 4_860,
+            "prepay_amt": 30_000,
+            "opportunity_cost": 0,
+            "total_cost": 55_193,
+            "effective_ppm": 5_881,
+            "exceeds_fee_cap": True,
+        },
+    ]
+    mock_args = MagicMock()
+    mock_args.history = False
+    mock_args.capacity = None
+    mock_args.fee_limit = None
+    mock_args.min_ratio = None
+    mock_args.amt = 22_000_000
+    mock_args.conf_target = 6
+    mock_args.max_routing_fee = 4000
+    mock_args.fee_leeway_pct = None
+    mock_args.dest_addr = None
+    mock_args.dry_run = False
+    mock_args.auto_approve = False
+    mock_args.max_channels = 3
+    mock_args.channel = None
+    mock_args.workers = 1
+    mock_args.probe_timeout = 15
+    mock_args.skip_prepay_probe = False
+    mock_args.payment_timeout = None
+    mock_args.pubkey = False
+
+    with patch.object(swap_out_loop, "parse_arguments", return_value=mock_args), \
+         patch.object(swap_out_loop, "load_config", return_value=(configparser.ConfigParser(), "/tmp")), \
+         patch.object(swap_out_loop, "setup_logger", return_value=MagicMock()), \
+         patch.object(swap_out_loop, "fetch_channels_lndg", return_value=[{"is_active": True, "is_open": True, "capacity": 15_000_000, "local_balance": 14_000_000, "local_fee_rate": 10, "chan_id": "1", "alias": "a"}]), \
+         patch.object(swap_out_loop, "filter_and_size_candidates", return_value=mock_candidates), \
+         patch.object(swap_out_loop, "evaluate_single_candidate", side_effect=lambda c, **kwargs: c), \
+         patch("sys.stdin.isatty", return_value=False), \
+         patch.object(swap_out_loop, "execute_loop_out") as mock_exec:
+        with pytest.raises(SystemExit) as exc_info:
+            swap_out_loop.main()
+        assert exc_info.value.code == 1
+        mock_exec.assert_not_called()
+
+
+def test_main_unbounded_fee_uses_probed_routing_fee_for_liquidity_check():
+    """When --max-routing-fee 0 (unbounded) is set, liquidity check must still include probed_routing_fee."""
+    mock_candidates = [
+        {
+            "chan_id": "111",
+            "alias": "Peer-A",
+            "remote_pubkey": "02aaa",
+            "proposed_amt": 5_000_000,
+            "drainable_surplus": 8_000_000,
+            "local_ratio": 90.0,
+            "server_fee": 5000,
+            "onchain_fee": 153,
+            "routing_fee": 18_500,
+            "routing_ppm": 3_700,
+            "prepay_amt": 30_000,
+            "opportunity_cost": 50,
+            "total_cost": 23_703,
+            "effective_ppm": 4_741,
+            "exceeds_fee_cap": False,
+        }
+    ]
+    mock_args = MagicMock()
+    mock_args.history = False
+    mock_args.capacity = None
+    mock_args.fee_limit = None
+    mock_args.min_ratio = None
+    mock_args.amt = 5_000_000
+    mock_args.conf_target = 6
+    mock_args.max_routing_fee = 0  # unbounded -> max_rf == 0
+    mock_args.fee_leeway_pct = None
+    mock_args.dest_addr = None
+    mock_args.dry_run = True
+    mock_args.auto_approve = True
+    mock_args.max_channels = 3
+    mock_args.channel = None
+    mock_args.workers = 1
+    mock_args.probe_timeout = 15
+    mock_args.skip_prepay_probe = False
+    mock_args.payment_timeout = None
+    mock_args.pubkey = False
+
+    with patch.object(swap_out_loop, "parse_arguments", return_value=mock_args), \
+         patch.object(swap_out_loop, "load_config", return_value=(configparser.ConfigParser(), "/tmp")), \
+         patch.object(swap_out_loop, "setup_logger", return_value=MagicMock()), \
+         patch.object(swap_out_loop, "fetch_channels_lndg", return_value=[{"is_active": True, "is_open": True, "capacity": 10_000_000, "local_balance": 9_000_000, "local_fee_rate": 10, "chan_id": "111", "alias": "Peer-A"}]), \
+         patch.object(swap_out_loop, "filter_and_size_candidates", return_value=mock_candidates), \
+         patch.object(swap_out_loop, "evaluate_single_candidate", side_effect=lambda c, **kwargs: c), \
+         patch.object(swap_out_loop, "validate_multi_channel_liquidity", wraps=swap_out_loop.validate_multi_channel_liquidity) as mock_val, \
+         patch.object(swap_out_loop, "execute_loop_out", return_value={"success": True, "swap_id": "dry", "dry_run": True}):
+        swap_out_loop.main()
+        assert mock_val.call_args[1]["max_routing_fee_sats"] == 18_500
+
+
+def test_scale_cost_to_swap_amt_forced_mpp(capsys):
+    """Multi-channel Est Cost and logged total_cost must scale proportionally to total_swap_amt."""
+    c1 = {"proposed_amt": 13_380_136, "total_cost": 60_031}
+    c2 = {"proposed_amt": 9_385_344, "total_cost": 55_193}
+    assert swap_out_loop.scale_cost_to_swap_amt(c1, 22_000_000) == 98_705
+    assert swap_out_loop.scale_cost_to_swap_amt(c2, 22_000_000) == 129_377
+    assert swap_out_loop.scale_cost_to_swap_amt(c1, 13_380_136) == 60_031

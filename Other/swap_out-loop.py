@@ -42,7 +42,7 @@ MAX_LOOP_OUT_SATS = 240_000_000
 DEFAULT_CONF_TARGET = 9
 MIN_CONF_TARGET = 6
 DEFAULT_PREPAY_SATS = 30_000
-PAYMENT_TIMEOUT_RE = re.compile(r"^\d+[smh]$")
+PAYMENT_TIMEOUT_RE = re.compile(r"^[1-9]\d*[smh]$")
 
 # ANSI Color Codes
 class Colors:
@@ -874,7 +874,7 @@ def export_history_to_csv(swaps: List[Dict[str, Any]], csv_path: str) -> None:
 
 
 def read_single_keypress() -> str:
-    """Reads a single keypress from standard input in raw mode."""
+    """Reads a single keypress from standard input in raw mode using unbuffered os.read."""
     import select
     import termios
     import tty
@@ -883,17 +883,26 @@ def read_single_keypress() -> str:
     old_settings = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
-        ch = sys.stdin.read(1)
+        raw_ch = os.read(fd, 1)
+        if not raw_ch:
+            return ""
+        ch = raw_ch.decode("utf-8", errors="ignore")
         if ch == "\x1b":  # Escape sequence or bare Esc
             ready, _, _ = select.select([fd], [], [], 0.05)
             if not ready:
                 return "\x1b"
-            ch2 = sys.stdin.read(1)
+            raw_ch2 = os.read(fd, 1)
+            if not raw_ch2:
+                return "\x1b"
+            ch2 = raw_ch2.decode("utf-8", errors="ignore")
             if ch2 == "[":
                 ready2, _, _ = select.select([fd], [], [], 0.05)
                 if not ready2:
                     return "\x1b"
-                ch3 = sys.stdin.read(1)
+                raw_ch3 = os.read(fd, 1)
+                if not raw_ch3:
+                    return "\x1b"
+                ch3 = raw_ch3.decode("utf-8", errors="ignore")
                 return f"\x1b[{ch3}"
             return "\x1b"
         return ch
@@ -1090,7 +1099,7 @@ def interactive_menu_select(
             est_rf, est_rppm = estimate_multi_channel_routing_fee(sel_list, swap_size)
             combined_surplus = sum(int(c.get("drainable_surplus", c["proposed_amt"])) for c in sel_list)
             ppms = [c["effective_ppm"] for c in sel_list]
-            costs = [c["total_cost"] for c in sel_list]
+            costs = [scale_cost_to_swap_amt(c, swap_size) for c in sel_list]
             min_ppm, max_ppm = min(ppms), max(ppms)
             min_cost, max_cost = min(costs), max(costs)
             ppm_str = f"{min_ppm:,} ppm" if min_ppm == max_ppm else f"{min_ppm:,} – {max_ppm:,} ppm"
@@ -1149,6 +1158,19 @@ def ppm_to_sats(amt: int, ppm: int) -> int:
     if amt <= 0 or ppm <= 0:
         return 0
     return max(1, round((amt * ppm) / 1_000_000))
+
+
+def scale_cost_to_swap_amt(channel: Dict[str, Any], total_swap_amt: int) -> int:
+    """
+    Scales a candidate channel's evaluated total_cost from its probed proposed_amt
+    to total_swap_amt so multi-channel cost ranges and logged totals match the
+    actual swap volume on forced MPP splits.
+    """
+    total_cost = int(channel.get("total_cost", 0))
+    proposed_amt = int(channel.get("proposed_amt", 0))
+    if proposed_amt > 0 and total_swap_amt > 0 and proposed_amt != total_swap_amt:
+        return round((total_cost / proposed_amt) * total_swap_amt)
+    return total_cost
 
 
 def estimate_multi_channel_routing_fee(
@@ -1985,10 +2007,10 @@ def main():
         probed_routing_fee, est_routing_ppm = estimate_multi_channel_routing_fee(
             selected_channels, total_swap_amt
         )
-        total_cost = max(c["total_cost"] for c in selected_channels)
 
         ppms = [c["effective_ppm"] for c in selected_channels]
-        costs = [c["total_cost"] for c in selected_channels]
+        costs = [scale_cost_to_swap_amt(c, total_swap_amt) for c in selected_channels]
+        total_cost = max(costs)
         min_ppm, max_ppm = min(ppms), max(ppms)
         min_cost, max_cost = min(costs), max(costs)
         ppm_str = f"{min_ppm:,} ppm" if min_ppm == max_ppm else f"{min_ppm:,} – {max_ppm:,} ppm"
@@ -2051,10 +2073,11 @@ def main():
         (int(c.get("prepay_amt", DEFAULT_PREPAY_SATS)) for c in selected_channels),
         default=DEFAULT_PREPAY_SATS,
     )
+    effective_fee_for_liquidity = max_rf if max_rf > 0 else probed_routing_fee
     liq_check = validate_multi_channel_liquidity(
         selected_channels=selected_channels,
         total_swap_amt=total_swap_amt,
-        max_routing_fee_sats=max_rf,
+        max_routing_fee_sats=effective_fee_for_liquidity,
         prepay_amt=prepay_amt,
     )
     if not liq_check["ok"]:
@@ -2063,16 +2086,26 @@ def main():
     elif liq_check["severity"] == "warning":
         print_color(f"Warning: {liq_check['message']}", Colors.WARNING, bold=True)
 
-    # In interactive TTY live execution, require explicit confirmation when fee cap or MPP headroom warns
+    # Require explicit confirmation on interactive TTY live runs when routing/headroom warns,
+    # and fail closed on non-TTY live runs (e.g. auto-batched without --auto-approve).
     has_exec_warning = (max_rf > 0 and max_rf < probed_routing_fee) or liq_check["severity"] == "warning"
-    if has_exec_warning and not args.auto_approve and not args.dry_run and sys.stdin.isatty():
-        try:
-            confirm = input("Proceed despite routing/headroom warning(s)? [y/N]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            confirm = "n"
-        if confirm not in ("y", "yes"):
-            print_color("Operation cancelled by user. No swap initiated.", Colors.WARNING)
-            sys.exit(0)
+    if has_exec_warning and not args.auto_approve and not args.dry_run:
+        if sys.stdin.isatty():
+            try:
+                confirm = input("Proceed despite routing/headroom warning(s)? [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                confirm = "n"
+            if confirm not in ("y", "yes"):
+                print_color("Operation cancelled by user. No swap initiated.", Colors.WARNING)
+                sys.exit(0)
+        else:
+            print_color(
+                "Aborting non-interactive live swap due to routing fee or MPP liquidity headroom warning(s). "
+                "Adjust --amt / --max-routing-fee, add channels, or run interactively.",
+                Colors.FAIL,
+                bold=True,
+            )
+            sys.exit(1)
 
     # Execute
     res = execute_loop_out(
