@@ -1,11 +1,12 @@
-import json
-import configparser
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
 Unit tests for Other/swap_out-loop.py
 """
+
+import configparser
+import json
 
 import os
 import sys
@@ -499,32 +500,61 @@ def test_evaluate_single_candidate_success():
         assert res["total_cost"] == 2195
 
 
+def test_ppm_to_sats():
+    """Verify PPM-to-satoshi conversion for routing fee ceilings."""
+    assert swap_out_loop.ppm_to_sats(22_000_000, 4000) == 88_000
+    assert swap_out_loop.ppm_to_sats(5_000_000, 4000) == 20_000
+    assert swap_out_loop.ppm_to_sats(3_000_000, 3500) == 10_500
+    assert swap_out_loop.ppm_to_sats(22_000_000, 0) == 0
+    assert swap_out_loop.ppm_to_sats(0, 4000) == 0
+    assert swap_out_loop.ppm_to_sats(250_000, 1) == 1  # minimum 1 sat for positive ppm
+
+
 def test_calculate_max_routing_fee_budget_default():
     """Verify default fee leeway calculation (100% leeway / 2.0x + 500 sats buffer)."""
     budget = swap_out_loop.calculate_max_routing_fee_budget(
         probed_routing_fee=20_000,
         config={},
+        swap_amt=5_000_000,
     )
     # 20,000 * 2.0 + 500 = 40,500
     assert budget == 40_500
 
 
 def test_calculate_max_routing_fee_budget_explicit_zero_unbounded():
-    """Verify that explicit 0 returns 0 (unbounded / loop daemon default)."""
+    """Verify that explicit 0 returns 0 (unbounded / loop daemon default) even if config sets a PPM cap."""
+    config = configparser.ConfigParser()
+    config.add_section("loop")
+    config.set("loop", "max_routing_fee_ppm", "4000")
     budget = swap_out_loop.calculate_max_routing_fee_budget(
         probed_routing_fee=20_000,
-        config={},
-        explicit_max_routing_fee=0,
+        config=config,
+        swap_amt=5_000_000,
+        explicit_max_routing_fee_ppm=0,
     )
     assert budget == 0
 
 
-def test_calculate_max_routing_fee_budget_explicit_positive():
-    """Verify that explicit positive fee overrides all leeway calculations."""
+def test_calculate_max_routing_fee_budget_explicit_ppm():
+    """Verify that explicit positive PPM ceiling converts cleanly to satoshis for swap_amt."""
     budget = swap_out_loop.calculate_max_routing_fee_budget(
-        probed_routing_fee=20_000,
+        probed_routing_fee=46_054,
         config={},
-        explicit_max_routing_fee=35_000,
+        swap_amt=22_000_000,
+        explicit_max_routing_fee_ppm=4000,
+    )
+    assert budget == 88_000
+
+
+def test_calculate_max_routing_fee_budget_config_ppm_fallback():
+    """Verify [loop] max_routing_fee_ppm in config.ini applies when CLI flag is omitted."""
+    config = configparser.ConfigParser()
+    config.add_section("loop")
+    config.set("loop", "max_routing_fee_ppm", "3500")
+    budget = swap_out_loop.calculate_max_routing_fee_budget(
+        probed_routing_fee=10_000,
+        config=config,
+        swap_amt=10_000_000,
     )
     assert budget == 35_000
 
@@ -534,6 +564,7 @@ def test_calculate_max_routing_fee_budget_cli_leeway_override():
     budget = swap_out_loop.calculate_max_routing_fee_budget(
         probed_routing_fee=20_000,
         config={},
+        swap_amt=5_000_000,
         explicit_leeway_pct=200.0,
     )
     # 20,000 * 3.0 + 500 = 60,500
@@ -717,6 +748,8 @@ def test_multi_channel_fixed_amount_and_max_fee_budget():
     mock_args.workers = 1
     mock_args.probe_timeout = 15
     mock_args.skip_prepay_probe = False
+    mock_args.payment_timeout = None
+    mock_args.pubkey = False
 
     config = configparser.ConfigParser()
     config.add_section("loop")
@@ -885,3 +918,431 @@ def test_display_history_deduplication_and_formatting(capsys):
     assert "block-iad-1 + 1 more (2 chans)" in captured
     assert "(2 chans) (2 chans)" not in captured
     assert "PREIMAGE_REVEALED" in captured
+
+
+def test_estimate_multi_channel_routing_fee_route_diversity():
+    """When any single channel covers total_swap_amt, worst-case fee equals max single-channel fee."""
+    channels = [
+        {"proposed_amt": 3_000_000, "drainable_surplus": 5_000_000, "routing_fee": 7_494},
+        {"proposed_amt": 3_000_000, "drainable_surplus": 5_000_000, "routing_fee": 10_497},
+    ]
+    fee, ppm = swap_out_loop.estimate_multi_channel_routing_fee(channels, total_swap_amt=3_000_000)
+    assert fee == 10_497
+    assert ppm == 3_499
+
+
+def test_estimate_multi_channel_routing_fee_forced_mpp_split():
+    """When total_swap_amt forces MPP across channels, estimate sums weighted shard fees (worst-case order)."""
+    # Reproduces real debian-nuc 22M swap across Authenticity (3,442 ppm) + block-iad-1 (4,860 ppm)
+    channels = [
+        {"proposed_amt": 13_380_136, "drainable_surplus": 13_380_136, "routing_fee": 46_054},
+        {"proposed_amt": 9_385_344, "drainable_surplus": 9_385_344, "routing_fee": 45_612},
+    ]
+    fee, ppm = swap_out_loop.estimate_multi_channel_routing_fee(channels, total_swap_amt=22_000_000)
+    # Worst-case: 9,385,344 on block-iad-1 (45,612) + 12,614,656 on Authenticity (~43,419) = ~89,031 sats (~4,047 ppm)
+    assert 88_900 <= fee <= 89_200
+    assert 4_040 <= ppm <= 4_055
+
+
+def test_validate_multi_channel_liquidity_insufficient_error():
+    """Hard-blocks when combined drainable surplus cannot cover swap_amt + routing fee."""
+    channels = [
+        {"drainable_surplus": 10_000_000, "proposed_amt": 10_000_000},
+        {"drainable_surplus": 5_000_000, "proposed_amt": 5_000_000},
+    ]
+    res = swap_out_loop.validate_multi_channel_liquidity(
+        selected_channels=channels,
+        total_swap_amt=20_000_000,
+        max_routing_fee_sats=80_000,
+        prepay_amt=30_000,
+    )
+    assert res["ok"] is False
+    assert res["severity"] == "error"
+
+
+def test_validate_multi_channel_liquidity_tight_mpp_headroom_warning():
+    """Warns when multi-channel combined surplus has <10% MPP split headroom."""
+    channels = [
+        {"drainable_surplus": 13_380_136, "proposed_amt": 13_380_136},
+        {"drainable_surplus": 9_385_344, "proposed_amt": 9_385_344},
+    ]
+    res = swap_out_loop.validate_multi_channel_liquidity(
+        selected_channels=channels,
+        total_swap_amt=22_000_000,
+        max_routing_fee_sats=88_000,
+        prepay_amt=30_000,
+    )
+    assert res["ok"] is True
+    assert res["severity"] == "warning"
+
+
+def test_validate_multi_channel_liquidity_healthy_ok():
+    """Passes cleanly when combined drainable surplus has ample MPP headroom."""
+    channels = [
+        {"drainable_surplus": 15_000_000, "proposed_amt": 15_000_000},
+        {"drainable_surplus": 15_000_000, "proposed_amt": 15_000_000},
+    ]
+    res = swap_out_loop.validate_multi_channel_liquidity(
+        selected_channels=channels,
+        total_swap_amt=20_000_000,
+        max_routing_fee_sats=80_000,
+        prepay_amt=30_000,
+    )
+    assert res["ok"] is True
+    assert res["severity"] == "ok"
+
+
+def test_parse_last_json_object_streaming_ndjson():
+    """run_command/parse_last_json_object handles multi-object JSON streams from lncli sendpayment --json."""
+    stream = (
+        '{"status": "IN_FLIGHT", "htlcs": []}\n'
+        '{"status": "FAILED", "failure_reason": "FAILURE_REASON_INCORRECT_PAYMENT_DETAILS", '
+        '"htlcs": [{"failure": {"code": "INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS"}, "route": {"total_fees": "420", "hops": [{}, {}]}}]}'
+    )
+    parsed = swap_out_loop.parse_last_json_object(stream)
+    assert isinstance(parsed, dict)
+    assert parsed["status"] == "FAILED"
+    assert parsed["failure_reason"] == "FAILURE_REASON_INCORRECT_PAYMENT_DETAILS"
+
+
+def test_prepay_probe_passes_fee_limit_force_and_outgoing_chan_id():
+    """Verify send_prepay_probe forwards --fee_limit and --force, and direct fallback forwards --outgoing_chan_id."""
+    fail_out = {"failure_reason": "FAILURE_REASON_TIMEOUT"}
+    build_out = {"route": {"total_fees": "12000", "hops": [{"pub_key": "03peer"}, {"pub_key": "02loop"}]}}
+    probe_out = {"failure": {"code": "INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS"}}
+
+    with patch.object(swap_out_loop, "run_command", side_effect=[(False, fail_out, "timeout"), (True, build_out, None)]) as mock_run, \
+         patch("subprocess.run") as mock_subproc:
+        mock_subproc.return_value.stdout = json.dumps(probe_out)
+        ok, fee, hops, err = swap_out_loop.send_prepay_probe(
+            config={},
+            dest_pubkey="02loop",
+            amt=5_000_000,
+            outgoing_chan_id="999888777",
+            remote_pubkey="03peer",
+            timeout=15,
+            max_fee_sats=20_000,
+        )
+        assert ok is True
+        assert fee == 12_000
+        assert hops == 2
+        assert err is None
+
+        sendpay_cmd = mock_run.call_args_list[0][0][0]
+        assert "--force" in sendpay_cmd
+        assert "--fee_limit" in sendpay_cmd
+        assert sendpay_cmd[sendpay_cmd.index("--fee_limit") + 1] == "20000"
+
+        buildroute_cmd = mock_run.call_args_list[1][0][0]
+        assert "--outgoing_chan_id" in buildroute_cmd
+        assert buildroute_cmd[buildroute_cmd.index("--outgoing_chan_id") + 1] == "999888777"
+
+
+def test_evaluate_single_candidate_skip_prepay_probe_preserves_route_fee():
+    """Regression: --skip-prepay-probe must keep queryroutes fee & hops instead of zeroing them."""
+    candidate = {
+        "chan_id": "111",
+        "proposed_amt": 5_000_000,
+        "alias": "Peer-Skip",
+        "local_fee_rate": 10,
+        "remote_pubkey": "03peer",
+    }
+    mock_quote = {"service_fee": 5000, "estimated_onchain_fee": 150, "prepay_amt": 30_000}
+    with patch.object(swap_out_loop, "get_loop_quote", return_value=mock_quote), \
+         patch.object(swap_out_loop, "query_route_to_loop", return_value=(True, 12_500, 3)), \
+         patch.object(swap_out_loop, "send_prepay_probe", return_value=(True, 0, 0, None)):
+        res = swap_out_loop.evaluate_single_candidate(
+            c=candidate,
+            config={},
+            loop_cmd=["litloop"],
+            loop_pubkey="02loop",
+            conf_target=9,
+            probe_timeout=15,
+            skip_prepay_probe=True,
+        )
+        assert res is not None
+        assert res["routing_fee"] == 12_500
+        assert res["routing_ppm"] == 2_500
+
+
+def test_evaluate_single_candidate_flags_over_max_routing_fee_ppm():
+    """Verify evaluate_single_candidate computes routing_ppm and marks exceeds_fee_cap when over PPM ceiling."""
+    candidate = {
+        "chan_id": "896468114071224320",
+        "proposed_amt": 9_385_344,
+        "alias": "block-iad-1",
+        "local_fee_rate": 0,
+        "remote_pubkey": "02peer",
+    }
+    mock_quote = {"service_fee": 9428, "estimated_onchain_fee": 153, "prepay_amt": 30_000}
+    with patch.object(swap_out_loop, "get_loop_quote", return_value=mock_quote), \
+         patch.object(swap_out_loop, "query_route_to_loop", return_value=(True, 7260, 10)), \
+         patch.object(swap_out_loop, "send_prepay_probe", return_value=(True, 45_612, 2, None)):
+        res = swap_out_loop.evaluate_single_candidate(
+            c=candidate,
+            config={},
+            loop_cmd=["litloop"],
+            loop_pubkey="02loop",
+            conf_target=6,
+            probe_timeout=15,
+            skip_prepay_probe=False,
+            max_routing_fee_ppm=4000,
+        )
+        assert res is not None
+        assert res["routing_ppm"] == 4_860
+        assert res["exceeds_fee_cap"] is True
+
+
+def test_parse_loop_quote_output_prepay_and_commas():
+    """Verify parse_loop_quote_output extracts prepay_amt and handles commas/'sats'."""
+    sample = """
+Send off-chain:                          22,000,000 sats
+Receive on-chain:                        21,977,793 sats
+Estimated on-chain fee:                         153 sats
+Loop service fee:                            22,054 sats
+Estimated total fee:                         22,207 sats
+No show penalty (prepay):                    30,000 sats
+"""
+    q = swap_out_loop.parse_loop_quote_output(sample, 22_000_000)
+    assert q["send_offchain"] == 22_000_000
+    assert q["service_fee"] == 22_054
+    assert q["estimated_onchain_fee"] == 153
+    assert q["total_loop_fee"] == 22_207
+    assert q["prepay_amt"] == 30_000
+
+
+def test_filter_and_size_candidates_dynamic_respects_drainable_surplus(sample_channels):
+    """Dynamic sizing with very low target_local_ratio must never exceed drainable_surplus."""
+    candidates = swap_out_loop.filter_and_size_candidates(
+        channels=[sample_channels[0]],  # 10M cap, 8.5M local -> reserve 500k -> drainable 8.0M
+        target_amt=None,
+        min_capacity=3_000_000,
+        max_fee_rate=100,
+        min_local_ratio=60.0,
+        target_local_ratio=1.0,  # would request 8.4M without clamp
+    )
+    assert len(candidates) == 1
+    assert candidates[0]["proposed_amt"] == 8_000_000
+    assert candidates[0]["proposed_amt"] <= candidates[0]["drainable_surplus"]
+
+
+def test_execute_loop_out_payment_timeout_and_dry_run_parity(capsys):
+    """Verify --payment_timeout validation/forwarding and dry_run output includes --addr & --payment_timeout."""
+    with patch.object(swap_out_loop, "resolve_loop_command", return_value=["litloop"]):
+        res = swap_out_loop.execute_loop_out(
+            config={},
+            channel_id=["111", "222"],
+            amt=5_000_000,
+            conf_target=6,
+            max_routing_fee=20_000,
+            dest_addr="bc1qexample",
+            alias="Test",
+            payment_timeout="15m",
+            dry_run=True,
+        )
+        assert res["success"] is True
+        out = capsys.readouterr().out
+        assert "--addr bc1qexample" in out
+        assert "--payment_timeout 15m" in out
+        assert "--max_swap_routing_fee 20000" in out
+
+    with pytest.raises(ValueError, match="payment_timeout"):
+        swap_out_loop.execute_loop_out(
+            config={},
+            channel_id="111",
+            amt=5_000_000,
+            payment_timeout="badvalue",
+            dry_run=True,
+        )
+
+
+def test_parse_arguments_probe_timeout_defaults_none_and_ppm_flags():
+    """Verify --probe-timeout defaults to None (honoring config.ini) and --payment-timeout parses."""
+    with patch("sys.argv", ["swap_out-loop.py", "--max-routing-fee", "4000", "--payment-timeout", "10m"]):
+        args = swap_out_loop.parse_arguments()
+        assert args.probe_timeout is None
+        assert args.max_routing_fee == 4000
+        assert args.payment_timeout == "10m"
+
+
+def test_main_max_routing_fee_ppm_converts_to_sats():
+    """Verify main() converts --max-routing-fee 4000 (PPM) to 20,000 sats on a 5M swap."""
+    mock_candidates = [
+        {
+            "chan_id": "111",
+            "alias": "Peer-A",
+            "remote_pubkey": "02aaa",
+            "proposed_amt": 5_000_000,
+            "drainable_surplus": 8_000_000,
+            "local_ratio": 90.0,
+            "server_fee": 5000,
+            "onchain_fee": 153,
+            "routing_fee": 12_500,
+            "routing_ppm": 2_500,
+            "prepay_amt": 30_000,
+            "opportunity_cost": 50,
+            "total_cost": 17_703,
+            "effective_ppm": 3_541,
+            "exceeds_fee_cap": False,
+        }
+    ]
+    mock_args = MagicMock()
+    mock_args.history = False
+    mock_args.capacity = None
+    mock_args.fee_limit = None
+    mock_args.min_ratio = None
+    mock_args.amt = 5_000_000
+    mock_args.conf_target = 6
+    mock_args.max_routing_fee = 4000  # 4,000 ppm -> 20,000 sats
+    mock_args.fee_leeway_pct = None
+    mock_args.dest_addr = None
+    mock_args.dry_run = True
+    mock_args.auto_approve = True
+    mock_args.max_channels = 3
+    mock_args.channel = None
+    mock_args.workers = 1
+    mock_args.probe_timeout = None
+    mock_args.skip_prepay_probe = False
+    mock_args.payment_timeout = "10m"
+    mock_args.pubkey = False
+
+    config = configparser.ConfigParser()
+    config.add_section("loop")
+    config.set("loop", "probe_timeout", "25")
+
+    with patch.object(swap_out_loop, "parse_arguments", return_value=mock_args), \
+         patch.object(swap_out_loop, "load_config", return_value=(config, "/tmp")), \
+         patch.object(swap_out_loop, "setup_logger", return_value=MagicMock()), \
+         patch.object(swap_out_loop, "fetch_channels_lndg", return_value=[{"is_active": True, "is_open": True, "capacity": 10_000_000, "local_balance": 9_000_000, "local_fee_rate": 10, "chan_id": "111", "alias": "Peer-A"}]), \
+         patch.object(swap_out_loop, "filter_and_size_candidates", return_value=mock_candidates), \
+         patch.object(swap_out_loop, "evaluate_single_candidate", side_effect=lambda c, **kwargs: c) as mock_eval, \
+         patch.object(swap_out_loop, "execute_loop_out", return_value={"success": True, "swap_id": "dry", "dry_run": True}) as mock_exec:
+        swap_out_loop.main()
+        # probe_timeout read from config (25), max_routing_fee_ppm passed (4000)
+        assert mock_eval.call_args[1]["probe_timeout"] == 25
+        assert mock_eval.call_args[1]["max_routing_fee_ppm"] == 4000
+        # 5,000,000 * 4000 / 1,000,000 = 20,000 sats
+        assert mock_exec.call_args[1]["max_routing_fee"] == 20_000
+        assert mock_exec.call_args[1]["payment_timeout"] == "10m"
+
+
+def test_validate_single_channel_at_drainable_surplus_no_false_positive():
+    """Single channel sized exactly to drainable_surplus (5% reserve already excluded) must pass."""
+    channels = [
+        {
+            "capacity": 10_000_000,
+            "local_balance": 9_850_000,
+            "drainable_surplus": 9_350_000,
+            "proposed_amt": 9_350_000,
+        }
+    ]
+    res = swap_out_loop.validate_multi_channel_liquidity(
+        selected_channels=channels,
+        total_swap_amt=9_350_000,
+        max_routing_fee_sats=37_400,
+        prepay_amt=30_000,
+    )
+    assert res["ok"] is True
+    assert res["severity"] == "ok"
+
+
+def test_main_aborts_auto_approve_when_probed_fee_exceeds_ppm_cap():
+    """Headless --auto-approve must abort cleanly when probed fee exceeds --max-routing-fee PPM ceiling."""
+    mock_candidates = [
+        {
+            "chan_id": "896468114071224320",
+            "alias": "block-iad-1",
+            "remote_pubkey": "02peer",
+            "proposed_amt": 9_385_344,
+            "drainable_surplus": 9_385_344,
+            "local_ratio": 98.9,
+            "server_fee": 9428,
+            "onchain_fee": 153,
+            "routing_fee": 45_612,  # 4,860 ppm
+            "routing_ppm": 4_860,
+            "prepay_amt": 30_000,
+            "opportunity_cost": 0,
+            "total_cost": 55_193,
+            "effective_ppm": 5_881,
+            "exceeds_fee_cap": True,
+        }
+    ]
+    mock_args = MagicMock()
+    mock_args.history = False
+    mock_args.capacity = None
+    mock_args.fee_limit = None
+    mock_args.min_ratio = None
+    mock_args.amt = 9_385_344
+    mock_args.conf_target = 6
+    mock_args.max_routing_fee = 4000  # 4,000 ppm < 4,860 ppm
+    mock_args.fee_leeway_pct = None
+    mock_args.dest_addr = None
+    mock_args.dry_run = False
+    mock_args.auto_approve = True
+    mock_args.max_channels = 3
+    mock_args.channel = None
+    mock_args.workers = 1
+    mock_args.probe_timeout = 15
+    mock_args.skip_prepay_probe = False
+    mock_args.payment_timeout = None
+    mock_args.pubkey = False
+
+    with patch.object(swap_out_loop, "parse_arguments", return_value=mock_args), \
+         patch.object(swap_out_loop, "load_config", return_value=(configparser.ConfigParser(), "/tmp")), \
+         patch.object(swap_out_loop, "setup_logger", return_value=MagicMock()), \
+         patch.object(swap_out_loop, "fetch_channels_lndg", return_value=[{"is_active": True, "is_open": True, "capacity": 10_000_000, "local_balance": 9_885_344, "local_fee_rate": 0, "chan_id": "896468114071224320", "alias": "block-iad-1"}]), \
+         patch.object(swap_out_loop, "filter_and_size_candidates", return_value=mock_candidates), \
+         patch.object(swap_out_loop, "evaluate_single_candidate", side_effect=lambda c, **kwargs: c), \
+         patch.object(swap_out_loop, "execute_loop_out") as mock_exec:
+        with pytest.raises(SystemExit) as exc_info:
+            swap_out_loop.main()
+        assert exc_info.value.code == 1
+        mock_exec.assert_not_called()
+
+
+def test_main_fails_fast_on_negative_max_routing_fee_or_bad_timeout():
+    """main() rejects negative --max-routing-fee or malformed --payment-timeout before probing."""
+    for bad_fee, bad_pt in [(-100, None), (None, "invalid")]:
+        mock_args = MagicMock()
+        mock_args.history = False
+        mock_args.capacity = None
+        mock_args.fee_limit = None
+        mock_args.min_ratio = None
+        mock_args.amt = 5_000_000
+        mock_args.conf_target = 6
+        mock_args.max_routing_fee = bad_fee
+        mock_args.fee_leeway_pct = None
+        mock_args.dest_addr = None
+        mock_args.dry_run = True
+        mock_args.auto_approve = False
+        mock_args.max_channels = 3
+        mock_args.channel = None
+        mock_args.workers = 1
+        mock_args.probe_timeout = 15
+        mock_args.skip_prepay_probe = False
+        mock_args.payment_timeout = bad_pt
+        mock_args.pubkey = False
+
+        with patch.object(swap_out_loop, "parse_arguments", return_value=mock_args), \
+             patch.object(swap_out_loop, "load_config", return_value=(configparser.ConfigParser(), "/tmp")), \
+             patch.object(swap_out_loop, "setup_logger", return_value=MagicMock()), \
+             patch.object(swap_out_loop, "fetch_channels_lndg") as mock_fetch:
+            with pytest.raises(SystemExit) as exc_info:
+                swap_out_loop.main()
+            assert exc_info.value.code == 1
+            mock_fetch.assert_not_called()
+
+
+def test_run_command_parses_streaming_json_objects():
+    """run_command(expect_json=True) decodes the last JSON object from streaming lncli output."""
+    stream_out = '{"status": "IN_FLIGHT"}\n{"status": "FAILED", "failure_reason": "FAILURE_REASON_INCORRECT_PAYMENT_DETAILS"}'
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    mock_proc.stdout = stream_out
+    mock_proc.stderr = ""
+    with patch("subprocess.run", return_value=mock_proc) as mock_sub:
+        ok, data, err = swap_out_loop.run_command(["lncli", "sendpayment", "--json"], expect_json=True)
+        assert ok is True
+        assert err is None
+        assert data["status"] == "FAILED"
+        assert mock_sub.call_args[1]["stdin"] is swap_out_loop.subprocess.DEVNULL

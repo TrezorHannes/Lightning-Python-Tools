@@ -41,6 +41,8 @@ MIN_LOOP_OUT_SATS = 250_000
 MAX_LOOP_OUT_SATS = 240_000_000
 DEFAULT_CONF_TARGET = 9
 MIN_CONF_TARGET = 6
+DEFAULT_PREPAY_SATS = 30_000
+PAYMENT_TIMEOUT_RE = re.compile(r"^\d+[smh]$")
 
 # ANSI Color Codes
 class Colors:
@@ -91,6 +93,36 @@ def load_config() -> Tuple[configparser.ConfigParser, str]:
     return config, project_root
 
 
+def parse_last_json_object(raw_text: str) -> Any:
+    """
+    Parses a single JSON payload or the final object from a stream of concatenated
+    JSON objects (e.g., `lncli sendpayment --json` streaming IN_FLIGHT -> FAILED).
+    Raises json.JSONDecodeError if no valid JSON object can be decoded.
+    """
+    text = raw_text.strip()
+    if not text:
+        raise json.JSONDecodeError("Empty JSON input", text, 0)
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        idx = 0
+        last_obj = None
+        length = len(text)
+        while idx < length:
+            while idx < length and text[idx].isspace():
+                idx += 1
+            if idx >= length:
+                break
+            obj, end = decoder.raw_decode(text, idx)
+            last_obj = obj
+            idx = end
+        if last_obj is None:
+            raise
+        return last_obj
+
+
 def run_command(
     command_args: List[str],
     timeout: int = 60,
@@ -107,6 +139,7 @@ def run_command(
     try:
         process = subprocess.run(
             command_args,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -120,7 +153,7 @@ def run_command(
             err_msg = stderr or stdout or f"Command failed with code {process.returncode}"
             if expect_json and stdout:
                 try:
-                    data = json.loads(stdout)
+                    data = parse_last_json_object(stdout)
                     return False, data, err_msg
                 except json.JSONDecodeError:
                     pass
@@ -128,7 +161,7 @@ def run_command(
 
         if expect_json:
             try:
-                data = json.loads(stdout)
+                data = parse_last_json_object(stdout)
                 return True, data, None
             except json.JSONDecodeError as jde:
                 return False, stdout, f"JSON parse error: {jde}"
@@ -257,9 +290,10 @@ def filter_and_size_candidates(
                 continue
             proposed_amt = min(target_amt, drainable_surplus)
         else:
-            # Rebalance channel down to target equilibrium ratio (e.g. 50%)
+            # Rebalance channel down to target equilibrium ratio (e.g. 50%),
+            # never exceeding drainable_surplus so channel reserve is preserved.
             target_local_balance = int(capacity * (target_local_ratio / 100.0))
-            proposed_amt = local_balance - target_local_balance
+            proposed_amt = min(local_balance - target_local_balance, drainable_surplus)
 
         # Clamp proposed amount to Loop limits
         if proposed_amt < MIN_LOOP_OUT_SATS:
@@ -293,30 +327,35 @@ def parse_loop_quote_output(output_text: str, amt: int) -> Dict[str, int]:
         "estimated_onchain_fee": 0,
         "service_fee": 0,
         "total_loop_fee": 0,
+        "prepay_amt": DEFAULT_PREPAY_SATS,
     }
+
+    def _extract_int(line_val: str) -> Optional[int]:
+        match = re.search(r"(\d[\d,]*)", line_val)
+        if match:
+            return int(match.group(1).replace(",", ""))
+        return None
 
     for line in output_text.splitlines():
         line_clean = line.strip()
-        if "Send off-chain:" in line_clean:
-            val = line_clean.split(":")[1].replace("sat", "").strip()
-            if val.isdigit():
-                quote["send_offchain"] = int(val)
-        elif "Receive on-chain:" in line_clean:
-            val = line_clean.split(":")[1].replace("sat", "").strip()
-            if val.isdigit():
-                quote["receive_onchain"] = int(val)
-        elif "Estimated on-chain fee:" in line_clean:
-            val = line_clean.split(":")[1].replace("sat", "").strip()
-            if val.isdigit():
-                quote["estimated_onchain_fee"] = int(val)
-        elif "Loop service fee:" in line_clean:
-            val = line_clean.split(":")[1].replace("sat", "").strip()
-            if val.isdigit():
-                quote["service_fee"] = int(val)
-        elif "Estimated total fee:" in line_clean:
-            val = line_clean.split(":")[1].replace("sat", "").strip()
-            if val.isdigit():
-                quote["total_loop_fee"] = int(val)
+        if ":" not in line_clean:
+            continue
+        label, raw_val = line_clean.split(":", 1)
+        val = _extract_int(raw_val)
+        if val is None:
+            continue
+        if "Send off-chain" in label:
+            quote["send_offchain"] = val
+        elif "Receive on-chain" in label:
+            quote["receive_onchain"] = val
+        elif "Estimated on-chain fee" in label:
+            quote["estimated_onchain_fee"] = val
+        elif "Loop service fee" in label:
+            quote["service_fee"] = val
+        elif "Estimated total fee" in label:
+            quote["total_loop_fee"] = val
+        elif "No show penalty (prepay)" in label or "Prepay" in label:
+            quote["prepay_amt"] = val
 
     # If total_loop_fee was parsed but components were not (standard vs verbose output)
     if quote["total_loop_fee"] > 0 and quote["service_fee"] == 0 and quote["estimated_onchain_fee"] == 0:
@@ -345,6 +384,7 @@ def get_loop_quote(
             "estimated_onchain_fee": onchain_fee,
             "service_fee": service_fee,
             "total_loop_fee": service_fee + onchain_fee,
+            "prepay_amt": DEFAULT_PREPAY_SATS,
         }
 
     cmd = list(loop_cmd_parts) + ["quote", "out", "-v", "--conf_target", str(conf_target), str(amt)]
@@ -366,6 +406,7 @@ def get_loop_quote(
         "estimated_onchain_fee": 200,
         "service_fee": service_fee,
         "total_loop_fee": service_fee + 200,
+        "prepay_amt": DEFAULT_PREPAY_SATS,
     }
 
 
@@ -375,6 +416,7 @@ def query_route_to_loop(
     amt: int,
     outgoing_chan_id: str,
     dry_run: bool = False,
+    max_fee_sats: Optional[int] = None,
 ) -> Tuple[bool, int, int]:
     """
     Stage 1: Checks route viability and off-chain routing fees via lncli queryroutes.
@@ -394,6 +436,8 @@ def query_route_to_loop(
         "--outgoing_chan_id",
         str(outgoing_chan_id),
     ]
+    if max_fee_sats is not None and max_fee_sats > 0:
+        cmd.extend(["--fee_limit", str(max_fee_sats)])
 
     success, output, _ = run_command(
         cmd,
@@ -418,10 +462,12 @@ def probe_direct_route_to_loop(
     dest_pubkey: str,
     amt: int,
     timeout: int = 15,
+    outgoing_chan_id: Optional[str] = None,
 ) -> Tuple[bool, int, int, Optional[str]]:
     """
     Attempts to probe direct 2-hop route: Local -> Peer -> Loop.
-    Uses lncli buildroute and lncli sendtoroute with a fake payment hash.
+    Uses lncli buildroute (scoped to outgoing_chan_id when provided) and
+    lncli sendtoroute with a fake payment hash.
     Returns (success, verified_fee, hops_count, error_msg).
     """
     if not remote_pubkey:
@@ -440,6 +486,9 @@ def probe_direct_route_to_loop(
         "--hops",
         f"{remote_pubkey},{dest_pubkey}",
     ]
+    if outgoing_chan_id:
+        build_cmd.extend(["--outgoing_chan_id", str(outgoing_chan_id)])
+
     succ_build, out_build, err_build = run_command(build_cmd, timeout=timeout, expect_json=True)
     if not succ_build or not isinstance(out_build, dict) or "route" not in out_build:
         return False, 0, 0, err_build or "Direct channel to Loop not available or buildroute failed"
@@ -467,7 +516,7 @@ def probe_direct_route_to_loop(
             timeout=timeout,
         )
         if process.stdout:
-            out_probe = json.loads(process.stdout)
+            out_probe = parse_last_json_object(process.stdout)
             failure_code = out_probe.get("failure", {}).get("code", "")
             if failure_code in ["INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS", "INCORRECT_PAYMENT_DETAILS"]:
                 return True, direct_fees, hops_count, None
@@ -491,6 +540,7 @@ def send_prepay_probe(
     remote_pubkey: str = "",
     timeout: int = 20,
     skip_probe: bool = False,
+    max_fee_sats: Optional[int] = None,
 ) -> Tuple[bool, int, int, Optional[str]]:
     """
     Stage 2: Live route probe using a random 32-byte fake hash.
@@ -518,8 +568,11 @@ def send_prepay_probe(
         str(outgoing_chan_id),
         "--timeout",
         f"{timeout}s",
+        "--force",
         "--json",
     ]
+    if max_fee_sats is not None and max_fee_sats > 0:
+        cmd.extend(["--fee_limit", str(max_fee_sats)])
 
     _, output, _ = run_command(cmd, timeout=timeout + 10, expect_json=True)
 
@@ -556,7 +609,12 @@ def send_prepay_probe(
     # 2. Multi-hop probe failed. If peer has a direct channel to Loop, probe the direct channel!
     if remote_pubkey:
         succ_dir, fee_dir, hops_dir, err_dir = probe_direct_route_to_loop(
-            config, remote_pubkey, dest_pubkey, amt, timeout=timeout
+            config,
+            remote_pubkey,
+            dest_pubkey,
+            amt,
+            timeout=timeout,
+            outgoing_chan_id=outgoing_chan_id,
         )
         if succ_dir:
             return True, fee_dir, hops_dir, None
@@ -604,10 +662,7 @@ def get_loop_db_path(config: Any) -> Optional[str]:
             db_path = config.get("paths", "loop_db_path", fallback="")
 
     if db_path:
-        expanded = os.path.expanduser(db_path.strip())
-        if os.path.exists(expanded):
-            return expanded
-        return expanded
+        return os.path.expanduser(db_path.strip())
 
     default_path = os.path.expanduser("~/.loop/mainnet/loop_sqlite.db")
     if os.path.exists(default_path):
@@ -636,109 +691,111 @@ def fetch_loop_history_from_db(db_path: str, limit: int = 50) -> List[Dict[str, 
         return []
 
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sweeps';")
-    has_sweeps = cur.fetchone() is not None
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sweeps';")
+        has_sweeps = cur.fetchone() is not None
 
-    if has_sweeps:
-        query = """
-        SELECT 
-            hex(s.swap_hash) AS swap_id,
-            s.initiation_time,
-            s.amount_requested AS amount,
-            s.label,
-            lo.outgoing_chan_set,
-            lo.dest_address,
-            su.update_state,
-            COALESCE(su.server_cost, 0) AS server_cost,
-            COALESCE(su.onchain_cost, 0) AS onchain_cost,
-            COALESCE(su.offchain_cost, 0) AS offchain_cost,
-            sw.completed AS sweep_completed,
-            sw.amt AS sweep_amt,
-            sb.batch_tx_id
-        FROM loopout_swaps lo
-        JOIN swaps s ON lo.swap_hash = s.swap_hash
-        LEFT JOIN (
-            SELECT swap_hash, update_state, server_cost, onchain_cost, offchain_cost,
-                   ROW_NUMBER() OVER (PARTITION BY swap_hash ORDER BY update_timestamp DESC) as rn
-            FROM swap_updates
-        ) su ON lo.swap_hash = su.swap_hash AND su.rn = 1
-        LEFT JOIN sweeps sw ON lo.swap_hash = sw.swap_hash
-        LEFT JOIN sweep_batches sb ON sw.batch_id = sb.id
-        ORDER BY s.initiation_time DESC
-        LIMIT ?;
-        """
-    else:
-        query = """
-        SELECT 
-            hex(s.swap_hash) AS swap_id,
-            s.initiation_time,
-            s.amount_requested AS amount,
-            s.label,
-            lo.outgoing_chan_set,
-            lo.dest_address,
-            su.update_state,
-            COALESCE(su.server_cost, 0) AS server_cost,
-            COALESCE(su.onchain_cost, 0) AS onchain_cost,
-            COALESCE(su.offchain_cost, 0) AS offchain_cost,
-            NULL AS sweep_completed,
-            NULL AS sweep_amt,
-            NULL AS batch_tx_id
-        FROM loopout_swaps lo
-        JOIN swaps s ON lo.swap_hash = s.swap_hash
-        LEFT JOIN (
-            SELECT swap_hash, update_state, server_cost, onchain_cost, offchain_cost,
-                   ROW_NUMBER() OVER (PARTITION BY swap_hash ORDER BY update_timestamp DESC) as rn
-            FROM swap_updates
-        ) su ON lo.swap_hash = su.swap_hash AND su.rn = 1
-        ORDER BY s.initiation_time DESC
-        LIMIT ?;
-        """
-    cur.execute(query, (limit,))
-    rows = []
-    for r in cur.fetchall():
-        server_fee = int(r["server_cost"])
-        onchain_fee = int(r["onchain_cost"])
-        routing_fee = int(r["offchain_cost"])
-        amt = int(r["amount"])
-
-        sweep_completed = r["sweep_completed"]
-        batch_tx_id = r["batch_tx_id"]
-        sweep_amt = int(r["sweep_amt"]) if r["sweep_amt"] is not None else 0
-
-        # If onchain fee is 0 in swap_updates but a sweep batch tx exists,
-        # estimate/calculate the pending onchain fee from the sweep output
-        if onchain_fee == 0 and batch_tx_id and sweep_amt > 0 and amt >= sweep_amt:
-            onchain_fee = amt - sweep_amt
-
-        total_cost = server_fee + onchain_fee + routing_fee
-        ppm = int((total_cost * 1_000_000) / amt) if amt > 0 else 0
-
-        state_code = r["update_state"]
-        if state_code == 1 and batch_tx_id and (sweep_completed == 0 or sweep_completed is False):
-            state_str = "PREIMAGE_REVEALED"
+        if has_sweeps:
+            query = """
+            SELECT 
+                hex(s.swap_hash) AS swap_id,
+                s.initiation_time,
+                s.amount_requested AS amount,
+                s.label,
+                lo.outgoing_chan_set,
+                lo.dest_address,
+                su.update_state,
+                COALESCE(su.server_cost, 0) AS server_cost,
+                COALESCE(su.onchain_cost, 0) AS onchain_cost,
+                COALESCE(su.offchain_cost, 0) AS offchain_cost,
+                sw.completed AS sweep_completed,
+                sw.amt AS sweep_amt,
+                sb.batch_tx_id
+            FROM loopout_swaps lo
+            JOIN swaps s ON lo.swap_hash = s.swap_hash
+            LEFT JOIN (
+                SELECT swap_hash, update_state, server_cost, onchain_cost, offchain_cost,
+                       ROW_NUMBER() OVER (PARTITION BY swap_hash ORDER BY update_timestamp DESC) as rn
+                FROM swap_updates
+            ) su ON lo.swap_hash = su.swap_hash AND su.rn = 1
+            LEFT JOIN sweeps sw ON lo.swap_hash = sw.swap_hash
+            LEFT JOIN sweep_batches sb ON sw.batch_id = sb.id
+            ORDER BY s.initiation_time DESC
+            LIMIT ?;
+            """
         else:
-            state_str = LOOP_STATE_MAP.get(state_code, f"STATE_{state_code}" if state_code is not None else "INITIATED")
+            query = """
+            SELECT 
+                hex(s.swap_hash) AS swap_id,
+                s.initiation_time,
+                s.amount_requested AS amount,
+                s.label,
+                lo.outgoing_chan_set,
+                lo.dest_address,
+                su.update_state,
+                COALESCE(su.server_cost, 0) AS server_cost,
+                COALESCE(su.onchain_cost, 0) AS onchain_cost,
+                COALESCE(su.offchain_cost, 0) AS offchain_cost,
+                NULL AS sweep_completed,
+                NULL AS sweep_amt,
+                NULL AS batch_tx_id
+            FROM loopout_swaps lo
+            JOIN swaps s ON lo.swap_hash = s.swap_hash
+            LEFT JOIN (
+                SELECT swap_hash, update_state, server_cost, onchain_cost, offchain_cost,
+                       ROW_NUMBER() OVER (PARTITION BY swap_hash ORDER BY update_timestamp DESC) as rn
+                FROM swap_updates
+            ) su ON lo.swap_hash = su.swap_hash AND su.rn = 1
+            ORDER BY s.initiation_time DESC
+            LIMIT ?;
+            """
+        cur.execute(query, (limit,))
+        rows = []
+        for r in cur.fetchall():
+            server_fee = int(r["server_cost"])
+            onchain_fee = int(r["onchain_cost"])
+            routing_fee = int(r["offchain_cost"])
+            amt = int(r["amount"])
 
-        raw_time = str(r["initiation_time"])
-        formatted_time = raw_time.split(".")[0].replace(" +0000 UTC", "")
+            sweep_completed = r["sweep_completed"]
+            batch_tx_id = r["batch_tx_id"]
+            sweep_amt = int(r["sweep_amt"]) if r["sweep_amt"] is not None else 0
 
-        rows.append({
-            "swap_id": r["swap_id"].lower(),
-            "initiation_time": formatted_time,
-            "amount": amt,
-            "label": r["label"] or "",
-            "outgoing_chan_set": r["outgoing_chan_set"] or "",
-            "server_fee": server_fee,
-            "onchain_fee": onchain_fee,
-            "routing_fee": routing_fee,
-            "total_cost": total_cost,
-            "effective_ppm": ppm,
-            "status": state_str,
-        })
-    conn.close()
-    return rows
+            # If onchain fee is 0 in swap_updates but a sweep batch tx exists,
+            # estimate/calculate the pending onchain fee from the sweep output
+            if onchain_fee == 0 and batch_tx_id and sweep_amt > 0 and amt >= sweep_amt:
+                onchain_fee = amt - sweep_amt
+
+            total_cost = server_fee + onchain_fee + routing_fee
+            ppm = int((total_cost * 1_000_000) / amt) if amt > 0 else 0
+
+            state_code = r["update_state"]
+            if state_code == 1 and batch_tx_id and (sweep_completed == 0 or sweep_completed is False):
+                state_str = "PREIMAGE_REVEALED"
+            else:
+                state_str = LOOP_STATE_MAP.get(state_code, f"STATE_{state_code}" if state_code is not None else "INITIATED")
+
+            raw_time = str(r["initiation_time"])
+            formatted_time = raw_time.split(".")[0].replace(" +0000 UTC", "")
+
+            rows.append({
+                "swap_id": r["swap_id"].lower(),
+                "initiation_time": formatted_time,
+                "amount": amt,
+                "label": r["label"] or "",
+                "outgoing_chan_set": r["outgoing_chan_set"] or "",
+                "server_fee": server_fee,
+                "onchain_fee": onchain_fee,
+                "routing_fee": routing_fee,
+                "total_cost": total_cost,
+                "effective_ppm": ppm,
+                "status": state_str,
+            })
+        return rows
+    finally:
+        conn.close()
 
 
 def fetch_loop_history_from_cli(config: Any, limit: int = 50) -> List[Dict[str, Any]]:
@@ -818,6 +875,7 @@ def export_history_to_csv(swaps: List[Dict[str, Any]], csv_path: str) -> None:
 
 def read_single_keypress() -> str:
     """Reads a single keypress from standard input in raw mode."""
+    import select
     import termios
     import tty
 
@@ -826,9 +884,15 @@ def read_single_keypress() -> str:
     try:
         tty.setraw(fd)
         ch = sys.stdin.read(1)
-        if ch == "\x1b":  # Escape sequence
+        if ch == "\x1b":  # Escape sequence or bare Esc
+            ready, _, _ = select.select([fd], [], [], 0.05)
+            if not ready:
+                return "\x1b"
             ch2 = sys.stdin.read(1)
             if ch2 == "[":
+                ready2, _, _ = select.select([fd], [], [], 0.05)
+                if not ready2:
+                    return "\x1b"
                 ch3 = sys.stdin.read(1)
                 return f"\x1b[{ch3}"
             return "\x1b"
@@ -837,10 +901,23 @@ def read_single_keypress() -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
-def print_candidates_table(candidates: List[Dict[str, Any]]) -> None:
+def _format_route_ppm_cell(c: Dict[str, Any]) -> str:
+    """Formats candidate routing PPM cell with '!' indicator if over ceiling."""
+    amt = c.get("proposed_amt", 0)
+    routing_ppm = c.get("routing_ppm")
+    if routing_ppm is None:
+        routing_ppm = round((c.get("routing_fee", 0) / amt) * 1_000_000) if amt > 0 else 0
+    suffix = "!" if c.get("exceeds_fee_cap") else ""
+    return f"{routing_ppm:,}{suffix}"
+
+
+def print_candidates_table(
+    candidates: List[Dict[str, Any]],
+    show_pubkey: bool = False,
+) -> None:
     """Prints a formatted summary table of candidates with fee and cost breakdown."""
     table = PrettyTable()
-    table.field_names = [
+    fields = [
         "#",
         "Alias",
         "Channel ID",
@@ -849,15 +926,21 @@ def print_candidates_table(candidates: List[Dict[str, Any]]) -> None:
         "Loop Fee",
         "Sweep Fee",
         "Route Fee",
+        "Route PPM",
         "Opp Cost",
         "Total Cost",
         "Net PPM",
     ]
+    if show_pubkey:
+        fields.insert(2, "Pubkey")
+    table.field_names = fields
     table.align = "r"
     table.align["Alias"] = "l"
     table.align["#"] = "c"
+    if show_pubkey:
+        table.align["Pubkey"] = "l"
     for idx, c in enumerate(candidates, 1):
-        table.add_row([
+        row = [
             f"[{idx}]",
             c["alias"][:20],
             c["chan_id"],
@@ -866,10 +949,15 @@ def print_candidates_table(candidates: List[Dict[str, Any]]) -> None:
             f"{c['server_fee']:,}",
             f"{c['onchain_fee']:,}",
             f"{c['routing_fee']:,}",
+            _format_route_ppm_cell(c),
             f"{c['opportunity_cost']:,}",
             f"{c['total_cost']:,}",
             f"{c['effective_ppm']:,}",
-        ])
+        ]
+        if show_pubkey:
+            pk = c.get("remote_pubkey", "")
+            row.insert(2, (pk[:16] + "...") if len(pk) > 16 else pk)
+        table.add_row(row)
     print(table)
 
 
@@ -877,6 +965,7 @@ def interactive_menu_select(
     candidates: List[Dict[str, Any]],
     target_amt: Optional[int] = None,
     max_channels: int = 3,
+    show_pubkey: bool = False,
 ) -> Optional[Union[Dict[str, Any], List[Dict[str, Any]]]]:
     """
     Renders an interactive CLI terminal menu with arrow-key navigation,
@@ -902,7 +991,7 @@ def interactive_menu_select(
 
         # Non-interactive fallback
         print("\nAvailable Candidates:")
-        print_candidates_table(candidates)
+        print_candidates_table(candidates, show_pubkey=show_pubkey)
         try:
             prompt_msg = f"\nSelect candidate [1-{len(candidates)}] (comma-separated for multi) or [q] to cancel: "
             choice = input(prompt_msg).strip().lower()
@@ -924,7 +1013,7 @@ def interactive_menu_select(
 
     while True:
         # Clear screen segment and render
-        print("[2J[H", end="")  # Clear screen and move to top-left
+        print("\x1b[2J\x1b[H", end="")  # Clear screen and move to top-left
         print_color("=== Lightning Loop Out - Economic Channel Selection ===", Colors.HEADER, bold=True)
         print_color(
             "Use [↑/k] & [↓/j] to navigate, [Space] to toggle multi-channel, [a] toggle all, [Enter] to select, [q] to cancel.\n",
@@ -932,7 +1021,7 @@ def interactive_menu_select(
         )
 
         table = PrettyTable()
-        table.field_names = [
+        fields = [
             "Sel",
             "Alias",
             "Channel ID",
@@ -941,13 +1030,19 @@ def interactive_menu_select(
             "Loop Fee",
             "Sweep Fee",
             "Route Fee",
+            "Route PPM",
             "Opp Cost",
             "Total Cost",
             "Net PPM",
         ]
+        if show_pubkey:
+            fields.insert(2, "Pubkey")
+        table.field_names = fields
         table.align = "r"
         table.align["Alias"] = "l"
         table.align["Sel"] = "c"
+        if show_pubkey:
+            table.align["Pubkey"] = "l"
 
         for idx, c in enumerate(candidates):
             is_active_cursor = idx == current_idx
@@ -966,10 +1061,14 @@ def interactive_menu_select(
                 f"{c['server_fee']:,}",
                 f"{c['onchain_fee']:,}",
                 f"{c['routing_fee']:,}",
+                _format_route_ppm_cell(c),
                 f"{c['opportunity_cost']:,}",
                 f"{c['total_cost']:,}",
                 f"{c['effective_ppm']:,}",
             ]
+            if show_pubkey:
+                pk = c.get("remote_pubkey", "")
+                row.insert(2, (pk[:16] + "...") if len(pk) > 16 else pk)
 
             if is_active_cursor:
                 # Highlight active row in color
@@ -988,6 +1087,8 @@ def interactive_menu_select(
             else:
                 swap_size = min(c["proposed_amt"] for c in sel_list)
 
+            est_rf, est_rppm = estimate_multi_channel_routing_fee(sel_list, swap_size)
+            combined_surplus = sum(int(c.get("drainable_surplus", c["proposed_amt"])) for c in sel_list)
             ppms = [c["effective_ppm"] for c in sel_list]
             costs = [c["total_cost"] for c in sel_list]
             min_ppm, max_ppm = min(ppms), max(ppms)
@@ -996,8 +1097,10 @@ def interactive_menu_select(
             cost_str = f"{min_cost:,} sats" if min_cost == max_cost else f"{min_cost:,} – {max_cost:,} sats"
 
             print_color(
-                f"Multi-Select Active ({len(selected_indices)} chans): Fixed Swap Size {swap_size:,} sats | Net PPM: {ppm_str} (Est Cost: {cost_str})",
-                Colors.OKGREEN,
+                f"Multi-Select Active ({len(selected_indices)} chans): Fixed Swap Size {swap_size:,} sats "
+                f"| Drainable: {combined_surplus:,} sats | Est Route Fee: {est_rf:,} sats ({est_rppm:,} ppm) "
+                f"| Net PPM: {ppm_str} (Est Cost: {cost_str})",
+                Colors.OKGREEN if combined_surplus >= swap_size + est_rf else Colors.WARNING,
                 bold=True,
             )
             print_color("Press [Enter] to execute multi-channel swap with selected channels.", Colors.OKBLUE)
@@ -1010,9 +1113,9 @@ def interactive_menu_select(
             )
 
         key = read_single_keypress()
-        if key in ("[A", "k", "K"):  # Up
+        if key in ("\x1b[A", "k", "K"):  # Up
             current_idx = (current_idx - 1) % total
-        elif key in ("[B", "j", "J"):  # Down
+        elif key in ("\x1b[B", "j", "J"):  # Down
             current_idx = (current_idx + 1) % total
         elif key == " ":  # Space toggles selection
             if current_idx in selected_indices:
@@ -1038,37 +1141,229 @@ def interactive_menu_select(
 
 
 
+def ppm_to_sats(amt: int, ppm: int) -> int:
+    """
+    Converts a parts-per-million (PPM) fee rate ceiling into satoshis for a given swap amount.
+    Returns 0 if amt <= 0 or ppm <= 0; otherwise at least 1 sat.
+    """
+    if amt <= 0 or ppm <= 0:
+        return 0
+    return max(1, round((amt * ppm) / 1_000_000))
+
+
+def estimate_multi_channel_routing_fee(
+    selected_channels: List[Dict[str, Any]],
+    total_swap_amt: int,
+) -> Tuple[int, int]:
+    """
+    Estimates conservative (worst-case feasible) off-chain routing fee in satoshis and PPM
+    for single- or multi-channel Loop Out swaps.
+
+    - For single-channel swaps, returns the probed fee (proportionally scaled if total_swap_amt differs).
+    - For multi-channel swaps, allocates total_swap_amt across channels starting from the most expensive
+      verified routing rate up to each channel's drainable_surplus. When any single channel can carry
+      total_swap_amt (pure route diversity), this equals routing 100% through the costliest channel;
+      when MPP splitting is required, it sums the weighted shard costs across required channels.
+    """
+    if not selected_channels or total_swap_amt <= 0:
+        return 0, 0
+
+    if len(selected_channels) == 1:
+        c = selected_channels[0]
+        proposed = c.get("proposed_amt", 0)
+        fee = int(c.get("routing_fee", 0))
+        if proposed > 0 and proposed != total_swap_amt:
+            est_fee = round((fee / proposed) * total_swap_amt)
+        else:
+            est_fee = fee
+        est_ppm = round((est_fee / total_swap_amt) * 1_000_000) if total_swap_amt > 0 else 0
+        return est_fee, est_ppm
+
+    rated = []
+    for c in selected_channels:
+        proposed = c.get("proposed_amt", 0)
+        fee = int(c.get("routing_fee", 0))
+        surplus = int(c.get("drainable_surplus", proposed))
+        rate = (fee / proposed) if proposed > 0 else 0.0
+        rated.append((rate, surplus, proposed, fee))
+
+    # Worst-case feasible allocation: fill highest-rate channels first up to drainable_surplus.
+    rated.sort(key=lambda item: item[0], reverse=True)
+    remaining = total_swap_amt
+    total_fee = 0.0
+    for rate, surplus, proposed, fee in rated:
+        if remaining <= 0:
+            break
+        alloc = min(remaining, max(0, surplus))
+        if alloc == proposed and proposed > 0:
+            total_fee += fee
+        else:
+            total_fee += alloc * rate
+        remaining -= alloc
+
+    # If selected channels combined cannot cover total_swap_amt, price remaining at max rate.
+    if remaining > 0 and rated:
+        total_fee += remaining * rated[0][0]
+
+    est_fee = round(total_fee)
+    est_ppm = round((est_fee / total_swap_amt) * 1_000_000) if total_swap_amt > 0 else 0
+    return est_fee, est_ppm
+
+
+def validate_payment_timeout(payment_timeout: Optional[str]) -> Optional[str]:
+    """Validates an optional Go duration string (e.g. '10m', '600s', '1h')."""
+    if payment_timeout is None:
+        return None
+    cleaned = payment_timeout.strip()
+    if not cleaned:
+        return None
+    if not PAYMENT_TIMEOUT_RE.match(cleaned):
+        raise ValueError(
+            f"Invalid payment_timeout '{cleaned}'. Expected duration like '10m', '600s', or '1h'."
+        )
+    return cleaned
+
+
+def validate_multi_channel_liquidity(
+    selected_channels: List[Dict[str, Any]],
+    total_swap_amt: int,
+    max_routing_fee_sats: int,
+    prepay_amt: int = DEFAULT_PREPAY_SATS,
+) -> Dict[str, Any]:
+    """
+    Validates that selected outbound channel(s) have enough combined drainable liquidity
+    for the swap amount, routing fee budget, and Loop prepay invoice (with MPP headroom).
+    Note: drainable_surplus already excludes a conservative 5% (min 100k sat) per-channel reserve.
+    """
+    total_drainable = sum(
+        int(c.get("drainable_surplus", c.get("proposed_amt", 0)))
+        for c in selected_channels
+    )
+    fee_sats = max(0, max_routing_fee_sats)
+    prepay_sats = max(0, prepay_amt)
+    recommended_required = total_swap_amt + fee_sats + prepay_sats
+    headroom_sats = total_drainable - recommended_required
+    utilization_pct = (recommended_required / total_drainable * 100.0) if total_drainable > 0 else 100.0
+
+    # Check raw LND 1% reserve spendable capacity when local_balance & capacity are present
+    raw_spendable = None
+    if selected_channels and all("local_balance" in c and "capacity" in c for c in selected_channels):
+        raw_spendable = sum(
+            max(0, int(c["local_balance"]) - max(100_000, int(int(c["capacity"]) * 0.01)))
+            for c in selected_channels
+        )
+
+    if total_drainable < total_swap_amt:
+        shortfall = total_swap_amt - total_drainable
+        return {
+            "ok": False,
+            "severity": "error",
+            "total_drainable": total_drainable,
+            "required_sats": recommended_required,
+            "headroom_sats": headroom_sats,
+            "utilization_pct": utilization_pct,
+            "message": (
+                f"Insufficient combined drainable liquidity ({total_drainable:,} sats) for swap amount "
+                f"({total_swap_amt:,} sats; shortfall {shortfall:,} sats). Reduce --amt or select additional channels."
+            ),
+        }
+
+    if raw_spendable is not None and raw_spendable < recommended_required:
+        shortfall = recommended_required - raw_spendable
+        return {
+            "ok": False,
+            "severity": "error",
+            "total_drainable": total_drainable,
+            "required_sats": recommended_required,
+            "headroom_sats": raw_spendable - recommended_required,
+            "utilization_pct": (recommended_required / raw_spendable * 100.0) if raw_spendable > 0 else 100.0,
+            "message": (
+                f"Insufficient spendable balance above LND channel reserves ({raw_spendable:,} sats) for "
+                f"swap + fee budget + prepay ({recommended_required:,} sats; shortfall {shortfall:,} sats). "
+                "Reduce --amt or select additional channels."
+            ),
+        }
+
+    # For multi-channel MPP swaps, LND splits in power-of-2 shards and holds concurrent retries
+    # in-flight; < 10% aggregate headroom frequently triggers channel reserve failures.
+    if len(selected_channels) > 1 and total_drainable < int(recommended_required * 1.10):
+        return {
+            "ok": True,
+            "severity": "warning",
+            "total_drainable": total_drainable,
+            "required_sats": recommended_required,
+            "headroom_sats": headroom_sats,
+            "utilization_pct": utilization_pct,
+            "message": (
+                f"Tight MPP liquidity headroom: {total_drainable:,} sats drainable vs {recommended_required:,} sats "
+                f"needed (swap + fee budget + {prepay_sats:,} sat prepay; {utilization_pct:.1f}% utilized). "
+                "LND MPP retries may hit channel reserve limits; consider lowering --amt or adding another channel."
+            ),
+        }
+
+    return {
+        "ok": True,
+        "severity": "ok",
+        "total_drainable": total_drainable,
+        "required_sats": recommended_required,
+        "headroom_sats": headroom_sats,
+        "utilization_pct": utilization_pct,
+        "message": "",
+    }
+
+
+def _get_config_optional_int(config: Any, section: str, option: str) -> Optional[int]:
+    """Reads an optional integer config value, returning None if unset or blank."""
+    raw = get_config_val(config, section, option, "")
+    if raw is None:
+        return None
+    if isinstance(raw, int):
+        return raw
+    raw_str = str(raw).strip()
+    if not raw_str:
+        return None
+    return int(raw_str)
+
+
 def calculate_max_routing_fee_budget(
     probed_routing_fee: int,
     config: Any,
-    explicit_max_routing_fee: Optional[int] = None,
+    swap_amt: int = 0,
+    explicit_max_routing_fee_ppm: Optional[int] = None,
     explicit_leeway_pct: Optional[float] = None,
 ) -> int:
     """
-    Calculates the max off-chain routing fee budget to pass to loop out.
-    - If explicit_max_routing_fee is 0, returns 0 (unbounded / loop daemon default).
-    - If explicit_max_routing_fee > 0, returns that exact satoshi cap.
-    - Otherwise applies percentage leeway (default 100% / 2.0x) plus base satoshi buffer (default 500).
+    Calculates the max off-chain routing fee budget (in satoshis) to pass to `litloop out`.
+    - If explicit_max_routing_fee_ppm == 0, returns 0 (unbounded / loop daemon default).
+    - If explicit_max_routing_fee_ppm > 0, converts that PPM ceiling to satoshis for swap_amt.
+    - Else if [loop] max_routing_fee_ppm is configured (> 0), converts that PPM ceiling to satoshis.
+    - Otherwise applies percentage leeway (default 100% / 2.0x) plus base satoshi buffer (default 500)
+      on top of probed_routing_fee.
     """
-    if explicit_max_routing_fee is not None and explicit_max_routing_fee == 0:
-        return 0
-    if explicit_max_routing_fee is not None and explicit_max_routing_fee > 0:
-        return explicit_max_routing_fee
+    if explicit_max_routing_fee_ppm is not None:
+        if explicit_max_routing_fee_ppm < 0:
+            raise ValueError("explicit_max_routing_fee_ppm must be >= 0")
+        if explicit_max_routing_fee_ppm == 0:
+            return 0
+        if swap_amt <= 0:
+            raise ValueError("swap_amt must be > 0 when converting max routing fee PPM to satoshis")
+        return ppm_to_sats(swap_amt, explicit_max_routing_fee_ppm)
 
-    leeway_pct = (
-        explicit_leeway_pct
-        if explicit_leeway_pct is not None
-        else (
-            config.getfloat("loop", "fee_leeway_pct", fallback=100.0)
-            if hasattr(config, "getfloat")
-            else 100.0
-        )
-    )
-    base_buffer = (
-        config.getint("loop", "fee_leeway_base_sats", fallback=500)
-        if hasattr(config, "getint")
-        else 500
-    )
+    cfg_max_ppm = _get_config_optional_int(config, "loop", "max_routing_fee_ppm")
+    if cfg_max_ppm is not None and cfg_max_ppm > 0:
+        if swap_amt <= 0:
+            raise ValueError("swap_amt must be > 0 when converting max_routing_fee_ppm to satoshis")
+        return ppm_to_sats(swap_amt, cfg_max_ppm)
+
+    if explicit_leeway_pct is not None:
+        leeway_pct = float(explicit_leeway_pct)
+    else:
+        raw_leeway = get_config_val(config, "loop", "fee_leeway_pct", 100.0)
+        leeway_pct = float(raw_leeway) if str(raw_leeway).strip() != "" else 100.0
+
+    raw_base = get_config_val(config, "loop", "fee_leeway_base_sats", 500)
+    base_buffer = int(raw_base) if str(raw_base).strip() != "" else 500
+
     multiplier = 1.0 + (max(0.0, leeway_pct) / 100.0)
     return int(probed_routing_fee * multiplier) + base_buffer
 
@@ -1081,12 +1376,17 @@ def execute_loop_out(
     max_routing_fee: int = 0,
     dest_addr: Optional[str] = None,
     alias: str = "",
+    payment_timeout: Optional[str] = None,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """
     Executes litloop out / loop out with specified channel(s), amount, conf_target, and fees.
     channel_id can be a single short channel ID string or a list of channel IDs.
+    max_routing_fee is in satoshis (passed to --max_swap_routing_fee).
+    payment_timeout is an optional Go duration string (e.g., '10m', '600s').
     """
+    payment_timeout = validate_payment_timeout(payment_timeout)
+
     if isinstance(channel_id, list):
         chan_arg = ",".join(str(c) for c in channel_id)
         chan_label = f"{len(channel_id)} chans"
@@ -1101,14 +1401,6 @@ def execute_loop_out(
             label = f"Loop-Out: {alias} ({chan_label})"
     else:
         label = f"Loop-Out: {chan_label}"
-    if dry_run:
-        fake_swap_id = "dry-run-swap-" + binascii.hexlify(os.urandom(16)).decode()
-        fee_arg = f" --max_swap_routing_fee {max_routing_fee}" if max_routing_fee > 0 else ""
-        print_color(
-            f'  Command: litloop out --amt {amt} --channel {chan_arg} --conf_target {conf_target} --label "{label}" --force{fee_arg}',
-            Colors.WARNING,
-        )
-        return {"success": True, "swap_id": fake_swap_id, "dry_run": True}
 
     loop_cmd = resolve_loop_command(config)
     cmd = list(loop_cmd) + [
@@ -1128,6 +1420,19 @@ def execute_loop_out(
         cmd.extend(["--max_swap_routing_fee", str(max_routing_fee)])
     if dest_addr:
         cmd.extend(["--addr", dest_addr])
+    if payment_timeout:
+        cmd.extend(["--payment_timeout", payment_timeout])
+
+    if dry_run:
+        fake_swap_id = "dry-run-swap-" + binascii.hexlify(os.urandom(16)).decode()
+        display_cmd = []
+        for idx, token in enumerate(cmd):
+            if idx > 0 and cmd[idx - 1] == "--label":
+                display_cmd.append(f'"{token}"')
+            else:
+                display_cmd.append(token)
+        print_color(f"  Command: {' '.join(display_cmd)}", Colors.WARNING)
+        return {"success": True, "swap_id": fake_swap_id, "dry_run": True}
 
     print_color(f"\nInitiating Loop Out: {' '.join(cmd)}", Colors.OKBLUE, bold=True)
     success, output, err = run_command(cmd, timeout=120)
@@ -1158,6 +1463,7 @@ def evaluate_single_candidate(
     probe_timeout: int,
     skip_prepay_probe: bool,
     print_lock: Optional[Any] = None,
+    max_routing_fee_ppm: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """Evaluates a single candidate channel by querying quote, route, and prepay probe."""
     chan_id = c["chan_id"]
@@ -1173,11 +1479,24 @@ def evaluate_single_candidate(
 
     log(f"  → Checking {alias[:20]} ({chan_id}) for {amt:,} sats...")
 
+    probe_max_fee_sats = (
+        ppm_to_sats(amt, max_routing_fee_ppm)
+        if max_routing_fee_ppm is not None and max_routing_fee_ppm > 0
+        else None
+    )
+
     # 1. Fetch Loop Quote (read-only query)
     quote = get_loop_quote(loop_cmd, amt, conf_target=conf_target, dry_run=False)
 
     # 2. Stage 1: queryroutes (read-only query)
-    route_ok, route_fee, hops = query_route_to_loop(config, loop_pubkey, amt, chan_id, dry_run=False)
+    route_ok, route_fee, hops = query_route_to_loop(
+        config,
+        loop_pubkey,
+        amt,
+        chan_id,
+        dry_run=False,
+        max_fee_sats=probe_max_fee_sats,
+    )
     if not route_ok:
         log(f"    ✗ Queryroutes found no route to Loop node for {alias[:20]}.")
         return None
@@ -1191,14 +1510,35 @@ def evaluate_single_candidate(
         remote_pubkey=c.get("remote_pubkey", ""),
         timeout=probe_timeout,
         skip_probe=skip_prepay_probe,
+        max_fee_sats=probe_max_fee_sats,
     )
     if not probe_ok:
         log(f"    ✗ Prepay probe failed for {alias[:20]}: {probe_err}")
         return None
 
-    actual_fee = verified_fee if verified_fee > 0 or skip_prepay_probe else route_fee
-    actual_hops = verified_hops if verified_hops > 0 or skip_prepay_probe else hops
-    log(f"    ✓ Route verified with live liquidity for {alias[:20]} ({actual_hops} hops, {actual_fee:,} sat routing fee).")
+    if skip_prepay_probe:
+        actual_fee = route_fee
+        actual_hops = hops
+    else:
+        actual_fee = verified_fee if verified_hops > 0 else route_fee
+        actual_hops = verified_hops if verified_hops > 0 else hops
+
+    routing_ppm = round((actual_fee / amt) * 1_000_000) if amt > 0 else 0
+    exceeds_fee_cap = bool(
+        max_routing_fee_ppm is not None
+        and max_routing_fee_ppm > 0
+        and routing_ppm > max_routing_fee_ppm
+    )
+
+    cap_note = (
+        f" [⚠ exceeds {max_routing_fee_ppm:,} ppm cap]"
+        if exceeds_fee_cap
+        else ""
+    )
+    log(
+        f"    ✓ Route verified with live liquidity for {alias[:20]} "
+        f"({actual_hops} hops, {actual_fee:,} sat / {routing_ppm:,} ppm routing fee){cap_note}."
+    )
 
     # 4. Economic cost breakdown
     econ = calculate_economic_cost(
@@ -1212,6 +1552,8 @@ def evaluate_single_candidate(
     c_eval = dict(c)
     c_eval.update(quote)
     c_eval.update(econ)
+    c_eval["routing_ppm"] = routing_ppm
+    c_eval["exceeds_fee_cap"] = exceeds_fee_cap
     return c_eval
 
 
@@ -1274,13 +1616,19 @@ def parse_arguments() -> argparse.Namespace:
         "--max-routing-fee",
         type=int,
         default=None,
-        help="Maximum off-chain swap routing fee in satoshis. If 0, no fee limit is enforced (uses loop daemon default).",
+        help="Maximum off-chain swap routing fee ceiling in PPM (e.g., 4000 for 0.4%%). If 0, no fee limit is enforced (uses loop daemon default).",
     )
     parser.add_argument(
         "--fee-leeway-pct",
         type=float,
         default=None,
         help="Percentage leeway added on top of probed routing fee for max off-chain fee limit (default from config or 100%%).",
+    )
+    parser.add_argument(
+        "--payment-timeout",
+        type=str,
+        default=None,
+        help="Optional per-attempt off-chain payment timeout passed to litloop out (Go duration, e.g., 10m, 600s).",
     )
     parser.add_argument(
         "--dest-addr",
@@ -1311,8 +1659,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--probe-timeout",
         type=int,
-        default=15,
-        help="Timeout in seconds for individual route prepay probes (default: 15s).",
+        default=None,
+        help="Timeout in seconds for individual route prepay probes (default from config or 15s).",
     )
     parser.add_argument(
         "--skip-prepay-probe",
@@ -1443,11 +1791,32 @@ def main():
 
     # Configuration defaults
     loop_pubkey = config.get("loop", "loop_pubkey", fallback=LOOP_PUBKEY_DEFAULT)
-    min_capacity = args.capacity or config.getint("loop", "min_capacity", fallback=3_000_000)
+    min_capacity = args.capacity if args.capacity is not None else config.getint("loop", "min_capacity", fallback=3_000_000)
     max_fee_ppm = args.fee_limit if args.fee_limit is not None else config.getint("loop", "max_local_fee_ppm", fallback=100)
     min_local_ratio = args.min_ratio if args.min_ratio is not None else config.getfloat("loop", "min_local_balance_ratio", fallback=60.0)
     target_local_ratio = config.getfloat("loop", "target_local_ratio", fallback=50.0)
-    conf_target = args.conf_target or config.getint("loop", "conf_target", fallback=DEFAULT_CONF_TARGET)
+    conf_target = args.conf_target if args.conf_target is not None else config.getint("loop", "conf_target", fallback=DEFAULT_CONF_TARGET)
+    probe_timeout = args.probe_timeout if args.probe_timeout is not None else config.getint("loop", "probe_timeout", fallback=15)
+    effective_max_routing_fee_ppm = (
+        args.max_routing_fee
+        if args.max_routing_fee is not None
+        else _get_config_optional_int(config, "loop", "max_routing_fee_ppm")
+    )
+    payment_timeout = getattr(args, "payment_timeout", None)
+    if payment_timeout is None:
+        cfg_pt = get_config_val(config, "loop", "payment_timeout", "").strip()
+        payment_timeout = cfg_pt or None
+    show_pubkey = bool(getattr(args, "pubkey", False))
+
+    if effective_max_routing_fee_ppm is not None and effective_max_routing_fee_ppm < 0:
+        print_color("Error: --max-routing-fee (PPM) must be >= 0.", Colors.FAIL, bold=True)
+        sys.exit(1)
+
+    try:
+        payment_timeout = validate_payment_timeout(payment_timeout)
+    except ValueError as exc:
+        print_color(f"Error: {exc}", Colors.FAIL, bold=True)
+        sys.exit(1)
 
     if conf_target < MIN_CONF_TARGET:
         print_color(f"Warning: Minimum conf-target is {MIN_CONF_TARGET} for economical sweeping. Adjusting to {MIN_CONF_TARGET}.", Colors.WARNING)
@@ -1481,6 +1850,13 @@ def main():
     if getattr(args, "channel", None):
         target_channel_ids = [c.strip() for c in args.channel.split(",") if c.strip()]
         candidates = [c for c in candidates if c["chan_id"] in target_channel_ids]
+        matched_ids = {c["chan_id"] for c in candidates}
+        missing_ids = [cid for cid in target_channel_ids if cid not in matched_ids]
+        if missing_ids:
+            print_color(
+                f"Warning: Requested channel(s) excluded by filters or inactive: {', '.join(missing_ids)}",
+                Colors.WARNING,
+            )
 
     if not candidates:
         print_color("No suitable candidate channels found matching criteria.", Colors.WARNING)
@@ -1492,7 +1868,7 @@ def main():
     loop_cmd = resolve_loop_command(config)
     evaluated_candidates = []
     top_candidates = candidates[:8]
-    workers = args.workers or config.getint("loop", "workers", fallback=1)
+    workers = args.workers if args.workers is not None else config.getint("loop", "workers", fallback=1)
     workers = max(1, workers)
 
     if workers > 1:
@@ -1509,9 +1885,10 @@ def main():
                     loop_cmd=loop_cmd,
                     loop_pubkey=loop_pubkey,
                     conf_target=conf_target,
-                    probe_timeout=args.probe_timeout,
+                    probe_timeout=probe_timeout,
                     skip_prepay_probe=args.skip_prepay_probe,
                     print_lock=print_lock,
+                    max_routing_fee_ppm=effective_max_routing_fee_ppm,
                 )
                 for c in top_candidates
             ]
@@ -1527,9 +1904,10 @@ def main():
                 loop_cmd=loop_cmd,
                 loop_pubkey=loop_pubkey,
                 conf_target=conf_target,
-                probe_timeout=args.probe_timeout,
+                probe_timeout=probe_timeout,
                 skip_prepay_probe=args.skip_prepay_probe,
                 print_lock=None,
+                max_routing_fee_ppm=effective_max_routing_fee_ppm,
             )
             if res:
                 evaluated_candidates.append(res)
@@ -1542,11 +1920,12 @@ def main():
     evaluated_candidates.sort(key=lambda x: x["effective_ppm"])
 
     # Selection
-    max_channels = args.max_channels or config.getint("loop", "max_channels", fallback=3)
+    max_channels = args.max_channels if args.max_channels is not None else config.getint("loop", "max_channels", fallback=3)
+    max_channels = max(1, max_channels)
     selected = None
     if args.auto_approve:
         print("\nEvaluated Candidates:")
-        print_candidates_table(evaluated_candidates)
+        print_candidates_table(evaluated_candidates, show_pubkey=show_pubkey)
         top_cap = evaluated_candidates[0].get("drainable_surplus", evaluated_candidates[0]["proposed_amt"])
         if args.amt and args.amt > top_cap:
             batch = []
@@ -1566,7 +1945,12 @@ def main():
         else:
             print_color(f"\nAuto-approved top candidate: {selected['alias']} ({selected['chan_id']})", Colors.OKGREEN, bold=True)
     else:
-        selected = interactive_menu_select(evaluated_candidates, target_amt=args.amt, max_channels=max_channels)
+        selected = interactive_menu_select(
+            evaluated_candidates,
+            target_amt=args.amt,
+            max_channels=max_channels,
+            show_pubkey=show_pubkey,
+        )
 
     if not selected:
         print_color("Operation cancelled. No swap initiated.", Colors.WARNING)
@@ -1579,7 +1963,9 @@ def main():
         chan_ids = sel["chan_id"]
         alias_str = sel["alias"]
         total_swap_amt = sel["proposed_amt"]
-        probed_routing_fee = sel["routing_fee"]
+        probed_routing_fee, est_routing_ppm = estimate_multi_channel_routing_fee(
+            selected_channels, total_swap_amt
+        )
         total_cost = sel["total_cost"]
     else:
         chan_ids = [c["chan_id"] for c in selected_channels]
@@ -1596,7 +1982,9 @@ def main():
             total_swap_amt = min(c["proposed_amt"] for c in selected_channels)
         total_swap_amt = min(total_swap_amt, MAX_LOOP_OUT_SATS)
 
-        probed_routing_fee = max(c["routing_fee"] for c in selected_channels)
+        probed_routing_fee, est_routing_ppm = estimate_multi_channel_routing_fee(
+            selected_channels, total_swap_amt
+        )
         total_cost = max(c["total_cost"] for c in selected_channels)
 
         ppms = [c["effective_ppm"] for c in selected_channels]
@@ -1608,29 +1996,83 @@ def main():
 
         print_color(f"\nMulti-Channel Loop Out Outbound Set ({len(selected_channels)} channels):", Colors.OKGREEN, bold=True)
         for idx, sc in enumerate(selected_channels, 1):
-            print(f"  [{idx}] {sc['alias']} ({sc['chan_id']}): Probed Route Fee: {sc['routing_fee']:,} sat, Net PPM: {sc['effective_ppm']}")
+            sc_rppm = sc.get("routing_ppm")
+            if sc_rppm is None:
+                sc_rppm = round((sc["routing_fee"] / sc["proposed_amt"]) * 1_000_000) if sc.get("proposed_amt") else 0
+            print(
+                f"  [{idx}] {sc['alias']} ({sc['chan_id']}): "
+                f"Probed Route Fee: {sc['routing_fee']:,} sat ({sc_rppm:,} ppm), Net PPM: {sc['effective_ppm']:,}"
+            )
         print(f"  Fixed Swap Size: {total_swap_amt:,} sats")
+        print(f"  Estimated MPP Route Fee: {probed_routing_fee:,} sats ({est_routing_ppm:,} ppm)")
         print(f"  Effective PPM Range: {ppm_str} (Est Cost: {cost_str})")
 
-    # Max routing fee budget with configurable leeway
+    # Max routing fee budget (PPM ceiling or configurable leeway)
     max_rf = calculate_max_routing_fee_budget(
         probed_routing_fee=probed_routing_fee,
         config=config,
-        explicit_max_routing_fee=args.max_routing_fee,
+        swap_amt=total_swap_amt,
+        explicit_max_routing_fee_ppm=args.max_routing_fee,
         explicit_leeway_pct=args.fee_leeway_pct,
     )
+    max_rf_ppm = round((max_rf / total_swap_amt) * 1_000_000) if (max_rf > 0 and total_swap_amt > 0) else 0
 
     if max_rf > 0:
-        buffer_sats = max_rf - probed_routing_fee
-        print_color(
-            f"Routing Fee Budget: {max_rf:,} sats (Max Probed: {probed_routing_fee:,} sats + {buffer_sats:,} sat leeway)",
-            Colors.OKCYAN,
-        )
+        if max_rf < probed_routing_fee:
+            shortfall = probed_routing_fee - max_rf
+            print_color(
+                f"Routing Fee Budget: {max_rf:,} sats ({max_rf_ppm:,} ppm) "
+                f"[WARNING: {shortfall:,} sats below estimated probed cost of {probed_routing_fee:,} sats ({est_routing_ppm:,} ppm)]",
+                Colors.WARNING,
+                bold=True,
+            )
+            if args.auto_approve:
+                print_color(
+                    "Aborting auto-approved swap because estimated routing fee exceeds configured PPM ceiling.",
+                    Colors.FAIL,
+                    bold=True,
+                )
+                sys.exit(1)
+        else:
+            buffer_sats = max_rf - probed_routing_fee
+            print_color(
+                f"Routing Fee Budget: {max_rf:,} sats ({max_rf_ppm:,} ppm) "
+                f"(Est Probed: {probed_routing_fee:,} sats + {buffer_sats:,} sat headroom)",
+                Colors.OKCYAN,
+            )
     else:
         print_color(
             "Routing Fee Budget: Unbounded (using Loop daemon default limit)",
             Colors.OKCYAN,
         )
+
+    # Validate aggregate outbound liquidity & MPP headroom before launching swap
+    prepay_amt = max(
+        (int(c.get("prepay_amt", DEFAULT_PREPAY_SATS)) for c in selected_channels),
+        default=DEFAULT_PREPAY_SATS,
+    )
+    liq_check = validate_multi_channel_liquidity(
+        selected_channels=selected_channels,
+        total_swap_amt=total_swap_amt,
+        max_routing_fee_sats=max_rf,
+        prepay_amt=prepay_amt,
+    )
+    if not liq_check["ok"]:
+        print_color(f"Error: {liq_check['message']}", Colors.FAIL, bold=True)
+        sys.exit(1)
+    elif liq_check["severity"] == "warning":
+        print_color(f"Warning: {liq_check['message']}", Colors.WARNING, bold=True)
+
+    # In interactive TTY live execution, require explicit confirmation when fee cap or MPP headroom warns
+    has_exec_warning = (max_rf > 0 and max_rf < probed_routing_fee) or liq_check["severity"] == "warning"
+    if has_exec_warning and not args.auto_approve and not args.dry_run and sys.stdin.isatty():
+        try:
+            confirm = input("Proceed despite routing/headroom warning(s)? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            confirm = "n"
+        if confirm not in ("y", "yes"):
+            print_color("Operation cancelled by user. No swap initiated.", Colors.WARNING)
+            sys.exit(0)
 
     # Execute
     res = execute_loop_out(
@@ -1641,6 +2083,7 @@ def main():
         max_routing_fee=max_rf,
         dest_addr=args.dest_addr,
         alias=alias_str,
+        payment_timeout=payment_timeout,
         dry_run=args.dry_run,
     )
 
