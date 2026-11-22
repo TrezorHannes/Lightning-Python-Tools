@@ -750,6 +750,7 @@ def test_multi_channel_fixed_amount_and_max_fee_budget():
     mock_args.skip_prepay_probe = False
     mock_args.payment_timeout = None
     mock_args.pubkey = False
+    mock_args.probe_steps = None
 
     config = configparser.ConfigParser()
     config.add_section("loop")
@@ -1206,6 +1207,7 @@ def test_main_max_routing_fee_ppm_converts_to_sats():
     mock_args.skip_prepay_probe = False
     mock_args.payment_timeout = "10m"
     mock_args.pubkey = False
+    mock_args.probe_steps = None
 
     config = configparser.ConfigParser()
     config.add_section("loop")
@@ -1287,6 +1289,7 @@ def test_main_aborts_auto_approve_when_probed_fee_exceeds_ppm_cap():
     mock_args.skip_prepay_probe = False
     mock_args.payment_timeout = None
     mock_args.pubkey = False
+    mock_args.probe_steps = None
 
     with patch.object(swap_out_loop, "parse_arguments", return_value=mock_args), \
          patch.object(swap_out_loop, "load_config", return_value=(configparser.ConfigParser(), "/tmp")), \
@@ -1323,6 +1326,7 @@ def test_main_fails_fast_on_negative_max_routing_fee_or_bad_timeout():
         mock_args.skip_prepay_probe = False
         mock_args.payment_timeout = bad_pt
         mock_args.pubkey = False
+        mock_args.probe_steps = None
 
         with patch.object(swap_out_loop, "parse_arguments", return_value=mock_args), \
              patch.object(swap_out_loop, "load_config", return_value=(configparser.ConfigParser(), "/tmp")), \
@@ -1430,6 +1434,7 @@ def test_main_fails_closed_non_tty_live_with_warning():
     mock_args.skip_prepay_probe = False
     mock_args.payment_timeout = None
     mock_args.pubkey = False
+    mock_args.probe_steps = None
 
     with patch.object(swap_out_loop, "parse_arguments", return_value=mock_args), \
          patch.object(swap_out_loop, "load_config", return_value=(configparser.ConfigParser(), "/tmp")), \
@@ -1485,6 +1490,7 @@ def test_main_unbounded_fee_uses_probed_routing_fee_for_liquidity_check():
     mock_args.skip_prepay_probe = False
     mock_args.payment_timeout = None
     mock_args.pubkey = False
+    mock_args.probe_steps = None
 
     with patch.object(swap_out_loop, "parse_arguments", return_value=mock_args), \
          patch.object(swap_out_loop, "load_config", return_value=(configparser.ConfigParser(), "/tmp")), \
@@ -1505,3 +1511,352 @@ def test_scale_cost_to_swap_amt_forced_mpp(capsys):
     assert swap_out_loop.scale_cost_to_swap_amt(c1, 22_000_000) == 98_705
     assert swap_out_loop.scale_cost_to_swap_amt(c2, 22_000_000) == 129_377
     assert swap_out_loop.scale_cost_to_swap_amt(c1, 13_380_136) == 60_031
+
+
+def test_compute_probe_amounts():
+    """Verify bounded iterative halving sequence respects probe_steps and min_amt floor."""
+    assert swap_out_loop.compute_probe_amounts(18_000_000, probe_steps=2) == [18_000_000, 9_000_000, 4_500_000]
+    assert swap_out_loop.compute_probe_amounts(18_000_000, probe_steps=0) == [18_000_000]
+    assert swap_out_loop.compute_probe_amounts(400_000, probe_steps=2, min_amt=250_000) == [400_000]
+    assert swap_out_loop.compute_probe_amounts(600_000, probe_steps=2, min_amt=250_000) == [600_000, 300_000]
+    assert swap_out_loop.compute_probe_amounts(100_000, probe_steps=2, min_amt=250_000) == [100_000]
+
+
+def test_fetch_loop_peer_channels_parses_active_inbound_policies():
+    """Verify fetch_loop_peer_channels extracts active peer->LOOP policies and ignores disabled/missing ones."""
+    loop_pk = "02loop"
+    mock_nodeinfo = {
+        "channels": [
+            {
+                "channel_id": "1",
+                "capacity": "75000000",
+                "node1_pub": "03hub1",
+                "node2_pub": loop_pk,
+                "node1_policy": {
+                    "disabled": False,
+                    "fee_rate_milli_msat": "2977",
+                    "fee_base_msat": "0",
+                    "max_htlc_msat": "74250000000",
+                },
+                "node2_policy": {"disabled": False, "fee_rate_milli_msat": "0"},
+            },
+            {
+                "channel_id": "2",
+                "capacity": "50000000",
+                "node1_pub": loop_pk,
+                "node2_pub": "03hub_disabled",
+                "node1_policy": {"disabled": False, "fee_rate_milli_msat": "0"},
+                "node2_policy": {
+                    "disabled": True,
+                    "fee_rate_milli_msat": "1000",
+                    "fee_base_msat": "0",
+                    "max_htlc_msat": "49500000000",
+                },
+            },
+            {
+                "channel_id": "3",
+                "capacity": "15000000",
+                "node1_pub": loop_pk,
+                "node2_pub": "03hub2",
+                "node1_policy": {"disabled": False, "fee_rate_milli_msat": "0"},
+                "node2_policy": {
+                    "disabled": False,
+                    "fee_rate_milli_msat": "3755",
+                    "fee_base_msat": "1000",
+                    "max_htlc_msat": "14850000000",
+                },
+            },
+        ]
+    }
+    with patch.object(swap_out_loop, "run_command", return_value=(True, mock_nodeinfo, None)):
+        peers = swap_out_loop.fetch_loop_peer_channels({}, loop_pk)
+        assert "03hub1" in peers
+        assert "03hub2" in peers
+        assert "03hub_disabled" not in peers
+        assert peers["03hub1"][0]["capacity"] == 75_000_000
+        assert peers["03hub1"][0]["fee_rate_ppm"] == 2977
+        assert peers["03hub1"][0]["max_htlc_sats"] == 74_250_000
+        assert peers["03hub2"][0]["fee_rate_ppm"] == 3755
+
+    with patch.object(swap_out_loop, "run_command", return_value=(False, "", "rpc error")):
+        assert swap_out_loop.fetch_loop_peer_channels({}, loop_pk) == {}
+
+
+def test_find_three_hop_bridges_to_loop_ranking_and_caps():
+    """Verify 3-hop bridge discovery ranks by total PPM, respects capacity/max_htlc, and enforces fee cap."""
+    peer_pk = "03lndnode08"
+    loop_pk = "02loop"
+    loop_peers = {
+        "03hub_cheap": [{"capacity": 75_000_000, "fee_rate_ppm": 2977, "fee_base_msat": 0, "max_htlc_sats": 74_000_000}],
+        "03hub_mid": [{"capacity": 15_000_000, "fee_rate_ppm": 3755, "fee_base_msat": 0, "max_htlc_sats": 14_850_000}],
+        "03hub_expensive": [{"capacity": 100_000_000, "fee_rate_ppm": 5500, "fee_base_msat": 0, "max_htlc_sats": 99_000_000}],
+    }
+    peer_channels = [
+        {
+            "capacity": "75000000",
+            "node1_pub": peer_pk,
+            "node2_pub": "03hub_cheap",
+            "node1_policy": {"disabled": False, "fee_rate_milli_msat": "51", "fee_base_msat": "0", "max_htlc_msat": "74000000000"},
+        },
+        {
+            "capacity": "15000000",
+            "node1_pub": peer_pk,
+            "node2_pub": "03hub_mid",
+            "node1_policy": {"disabled": False, "fee_rate_milli_msat": "680", "fee_base_msat": "0", "max_htlc_msat": "14850000000"},
+        },
+        {
+            "capacity": "100000000",
+            "node1_pub": peer_pk,
+            "node2_pub": "03hub_expensive",
+            "node1_policy": {"disabled": False, "fee_rate_milli_msat": "500", "fee_base_msat": "0", "max_htlc_msat": "99000000000"},
+        },
+    ]
+
+    # At 18M with 4500 ppm cap: hub_mid excluded (cap 15M < 18M), hub_expensive excluded (6000 > 4500)
+    bridges_18m = swap_out_loop.find_three_hop_bridges_to_loop(
+        peer_channels=peer_channels,
+        remote_pubkey=peer_pk,
+        dest_pubkey=loop_pk,
+        loop_peers=loop_peers,
+        amt=18_000_000,
+        max_routing_fee_ppm=4500,
+        max_bridges=2,
+    )
+    assert bridges_18m == ["03hub_cheap"]
+
+    # At 9M with 4500 ppm cap: both hub_cheap (3028 ppm) and hub_mid (4435 ppm) qualify, sorted cheapest first
+    bridges_9m = swap_out_loop.find_three_hop_bridges_to_loop(
+        peer_channels=peer_channels,
+        remote_pubkey=peer_pk,
+        dest_pubkey=loop_pk,
+        loop_peers=loop_peers,
+        amt=9_000_000,
+        max_routing_fee_ppm=4500,
+        max_bridges=2,
+    )
+    assert bridges_9m == ["03hub_cheap", "03hub_mid"]
+
+
+def test_probe_three_hop_bridges_to_loop_succeeds_on_second_bridge():
+    """Verify 3-hop bridge fallback probes bridges sequentially and returns first live liquidity hit."""
+    build_ok_1 = {"route": {"total_fees": "27000", "hops": [{"pub_key": "03peer"}, {"pub_key": "03hub1"}, {"pub_key": "02loop"}]}}
+    build_ok_2 = {"route": {"total_fees": "39915", "hops": [{"pub_key": "03peer"}, {"pub_key": "03hub2"}, {"pub_key": "02loop"}]}}
+    probe_fail = MagicMock(stdout=json.dumps({"failure": {"code": "TEMPORARY_CHANNEL_FAILURE"}}))
+    probe_ok = MagicMock(stdout=json.dumps({"failure": {"code": "INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS"}}))
+
+    with patch.object(swap_out_loop, "run_command", side_effect=[(True, build_ok_1, None), (True, build_ok_2, None)]) as mock_run, \
+         patch("subprocess.run", side_effect=[probe_fail, probe_ok]):
+        ok, fee, hops, err = swap_out_loop.probe_three_hop_bridges_to_loop(
+            config={},
+            remote_pubkey="03peer",
+            dest_pubkey="02loop",
+            amt=9_000_000,
+            bridge_hubs=["03hub1", "03hub2"],
+            timeout=15,
+            outgoing_chan_id="1015381396218314752",
+        )
+        assert ok is True
+        assert fee == 39_915
+        assert hops == 3
+        assert err is None
+        cmd2 = mock_run.call_args_list[1][0][0]
+        assert cmd2[cmd2.index("--hops") + 1] == "03peer,03hub2,02loop"
+        assert cmd2[cmd2.index("--outgoing_chan_id") + 1] == "1015381396218314752"
+
+
+def test_send_prepay_probe_uses_3hop_bridge_fallback():
+    """Verify send_prepay_probe falls back to 3-hop bridge probing when sendpayment and 2-hop fail."""
+    fail_out = {"failure_reason": "FAILURE_REASON_TIMEOUT"}
+    with patch.object(swap_out_loop, "run_command", return_value=(False, fail_out, "timeout")), \
+         patch.object(swap_out_loop, "probe_direct_route_to_loop", return_value=(False, 0, 0, "no direct chan")), \
+         patch.object(swap_out_loop, "probe_three_hop_bridges_to_loop", return_value=(True, 13_626, 3, None)) as mock_3hop:
+        ok, fee, hops, err = swap_out_loop.send_prepay_probe(
+            config={},
+            dest_pubkey="02loop",
+            amt=4_500_000,
+            outgoing_chan_id="1015381396218314752",
+            remote_pubkey="03lndnode08",
+            timeout=10,
+            max_fee_sats=20_250,
+            bridge_hubs=["03hub_cheap"],
+        )
+        assert ok is True
+        assert fee == 13_626
+        assert hops == 3
+        assert err is None
+        mock_3hop.assert_called_once()
+
+
+def test_evaluate_single_candidate_iterative_halving_step_down():
+    """Verify iterative halving (18M -> 9M -> 4.5M) caps drainable_surplus and fetches quote at verified amount."""
+    candidate = {
+        "chan_id": "1015381396218314752",
+        "proposed_amt": 18_000_000,
+        "drainable_surplus": 20_870_000,
+        "alias": "lndnode08",
+        "local_fee_rate": 10,
+        "local_ratio": 74.6,
+        "remote_pubkey": "03lndnode08",
+    }
+    mock_quote_4_5m = {"service_fee": 4550, "estimated_onchain_fee": 153, "prepay_amt": 30_000}
+
+    probe_calls = []
+
+    def fake_probe(**kwargs):
+        probe_calls.append((kwargs["amt"], kwargs["timeout"]))
+        if kwargs["amt"] == 4_500_000:
+            return True, 13_626, 3, None
+        return False, 0, 0, "FAILURE_REASON_TIMEOUT"
+
+    with patch.object(swap_out_loop, "get_loop_quote", return_value=mock_quote_4_5m) as mock_quote, \
+         patch.object(swap_out_loop, "query_route_to_loop", return_value=(True, 256, 8)), \
+         patch.object(swap_out_loop, "send_prepay_probe", side_effect=fake_probe):
+        res = swap_out_loop.evaluate_single_candidate(
+            c=candidate,
+            config={},
+            loop_cmd=["litloop"],
+            loop_pubkey="02loop",
+            conf_target=6,
+            probe_timeout=15,
+            skip_prepay_probe=False,
+            max_routing_fee_ppm=4500,
+            probe_steps=2,
+        )
+        assert res is not None
+        assert probe_calls == [(18_000_000, 15), (9_000_000, 10), (4_500_000, 8)]
+        mock_quote.assert_called_once_with(["litloop"], 4_500_000, conf_target=6, dry_run=False)
+        assert res["proposed_amt"] == 4_500_000
+        assert res["verified_amt"] == 4_500_000
+        assert res["initial_proposed_amt"] == 18_000_000
+        assert res["probe_step_down"] is True
+        assert res["drainable_surplus"] == 4_500_000
+        assert res["routing_fee"] == 13_626
+        assert res["routing_ppm"] == 3_028
+
+
+def test_evaluate_single_candidate_probe_steps_zero_disables_halving():
+    """With probe_steps=0, candidate fails after a single attempt at full proposed_amt."""
+    candidate = {
+        "chan_id": "1015381396218314752",
+        "proposed_amt": 18_000_000,
+        "drainable_surplus": 20_870_000,
+        "alias": "lndnode08",
+        "local_fee_rate": 10,
+        "remote_pubkey": "03lndnode08",
+    }
+    with patch.object(swap_out_loop, "query_route_to_loop", return_value=(True, 1000, 5)), \
+         patch.object(swap_out_loop, "send_prepay_probe", return_value=(False, 0, 0, "FAILURE_REASON_TIMEOUT")) as mock_probe:
+        res = swap_out_loop.evaluate_single_candidate(
+            c=candidate,
+            config={},
+            loop_cmd=["litloop"],
+            loop_pubkey="02loop",
+            conf_target=6,
+            probe_timeout=15,
+            skip_prepay_probe=False,
+            probe_steps=0,
+        )
+        assert res is None
+        assert mock_probe.call_count == 1
+
+
+def test_evaluate_single_candidate_halves_when_queryroutes_fails_at_full_amount():
+    """If queryroutes fails at 18M (exceeds graph channel cap), halving to 9M still discovers the route."""
+    candidate = {
+        "chan_id": "1015381396218314752",
+        "proposed_amt": 18_000_000,
+        "drainable_surplus": 20_870_000,
+        "alias": "lndnode08",
+        "local_fee_rate": 10,
+        "remote_pubkey": "03lndnode08",
+    }
+    mock_quote = {"service_fee": 9050, "estimated_onchain_fee": 153, "prepay_amt": 30_000}
+
+    def fake_qr(_cfg, _dest, amt, _cid, **_kw):
+        if amt == 18_000_000:
+            return False, 0, 0
+        return True, 2000, 4
+
+    with patch.object(swap_out_loop, "get_loop_quote", return_value=mock_quote), \
+         patch.object(swap_out_loop, "query_route_to_loop", side_effect=fake_qr), \
+         patch.object(swap_out_loop, "send_prepay_probe", return_value=(True, 27_252, 3, None)):
+        res = swap_out_loop.evaluate_single_candidate(
+            c=candidate,
+            config={},
+            loop_cmd=["litloop"],
+            loop_pubkey="02loop",
+            conf_target=6,
+            probe_timeout=15,
+            skip_prepay_probe=False,
+            probe_steps=2,
+        )
+        assert res is not None
+        assert res["proposed_amt"] == 9_000_000
+        assert res["drainable_surplus"] == 9_000_000
+        assert res["probe_step_down"] is True
+
+
+def test_print_candidates_table_marks_stepped_down_swap_size(capsys):
+    """Candidate table annotates stepped-down verified amounts with '*'."""
+    candidates = [
+        {
+            "alias": "lndnode08",
+            "chan_id": "1015381396218314752",
+            "local_ratio": 74.6,
+            "proposed_amt": 4_500_000,
+            "probe_step_down": True,
+            "server_fee": 4550,
+            "onchain_fee": 153,
+            "routing_fee": 13_626,
+            "routing_ppm": 3_028,
+            "opportunity_cost": 45,
+            "total_cost": 18_374,
+            "effective_ppm": 4_083,
+            "exceeds_fee_cap": False,
+        }
+    ]
+    swap_out_loop.print_candidates_table(candidates)
+    out = capsys.readouterr().out
+    assert "4,500,000*" in out
+
+
+def test_parse_arguments_and_main_probe_steps_validation():
+    """Verify --probe-steps parsing and fail-fast bounds validation in main()."""
+    with patch("sys.argv", ["swap_out-loop.py", "--probe-steps", "2"]):
+        args = swap_out_loop.parse_arguments()
+        assert args.probe_steps == 2
+
+    with patch("sys.argv", ["swap_out-loop.py"]):
+        args_default = swap_out_loop.parse_arguments()
+        assert args_default.probe_steps is None
+
+    for bad_steps in (-1, 5):
+        mock_args = MagicMock()
+        mock_args.history = False
+        mock_args.capacity = None
+        mock_args.fee_limit = None
+        mock_args.min_ratio = None
+        mock_args.amt = 5_000_000
+        mock_args.conf_target = 6
+        mock_args.max_routing_fee = None
+        mock_args.fee_leeway_pct = None
+        mock_args.dest_addr = None
+        mock_args.dry_run = True
+        mock_args.auto_approve = False
+        mock_args.max_channels = 3
+        mock_args.channel = None
+        mock_args.workers = 1
+        mock_args.probe_timeout = 15
+        mock_args.skip_prepay_probe = False
+        mock_args.payment_timeout = None
+        mock_args.pubkey = False
+        mock_args.probe_steps = bad_steps
+
+        with patch.object(swap_out_loop, "parse_arguments", return_value=mock_args), \
+             patch.object(swap_out_loop, "load_config", return_value=(configparser.ConfigParser(), "/tmp")), \
+             patch.object(swap_out_loop, "setup_logger", return_value=MagicMock()), \
+             patch.object(swap_out_loop, "fetch_channels_lndg") as mock_fetch:
+            with pytest.raises(SystemExit) as exc_info:
+                swap_out_loop.main()
+            assert exc_info.value.code == 1
+            mock_fetch.assert_not_called()

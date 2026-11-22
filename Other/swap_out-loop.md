@@ -20,7 +20,8 @@ Rather than simply finding channels with high local balances, `swap_out-loop.py`
 - **Two-Stage Route Validation & Real Liquidity Probing**:
   - **Stage 1 (`lncli queryroutes`)**: Fast graph traversal to verify route existence and compute theoretical off-chain hop fees to the Loop server node.
   - **Stage 2 (Mandatory Live Prepay Probe)**: Probes the route with a random 32-byte fake hash via `lncli sendpayment`. Proves actual downstream liquidity without risking funds. Ghost liquidity paths from gossip graphs that fail live probing are automatically filtered out.
-  - **Direct 2-Hop Route Fallback**: If multi-hop routes fail due to intermediate bottlenecks or dead gossip nodes, the tool automatically checks if the candidate peer maintains a direct channel to the Loop node (`021c97a9...`), constructing the route via `lncli buildroute --outgoing_chan_id <chan_id>` and probing it with `lncli sendtoroute` to accurately capture the exact verified route fee.
+  - **Direct 2-Hop & Fast 3-Hop Bridge Fallback**: If multi-hop routes fail due to intermediate bottlenecks or dead gossip nodes, the tool checks if the candidate peer maintains a direct channel to the Loop node (`021c97a9...`) via `lncli buildroute --outgoing_chan_id <chan_id>` + `lncli sendtoroute`, and otherwise probes up to 2 lowest-fee 3-hop bridges (`Local → Peer → Hub → Loop`) within the configured routing fee cap.
+  - **Bounded Iterative Halving Probing (`--probe-steps <N>`)**: Because single-HTLC probes cannot split via MPP, if a full-size probe fails (e.g., `18M` sats), the tool automatically steps down by half up to `--probe-steps` times (default `2`: `100% → 50% → 25%`, e.g. `18M → 9M → 4.5M`) with decayed timeouts and honest capacity accounting — stepped-down channels are marked with `*` in the table and their usable MPP contribution is capped to the verified probed amount.
   - **PPM Ceiling Awareness**: When `--max-routing-fee <ppm>` (or `[loop] max_routing_fee_ppm`) is set, the converted satoshi cap is forwarded to `lncli queryroutes` and `lncli sendpayment` via `--fee_limit`, and candidates whose verified `Route PPM` exceeds the cap are flagged with `!` in the selection table.
 - **Concurrent Worker Probing (`--workers <N>`)**:
   - Probes candidates sequentially by default for zero downstream HTLC collision, or in parallel via `--workers 2` using `ThreadPoolExecutor` with thread-safe output formatting, cutting scanning time in half.
@@ -100,6 +101,8 @@ target_local_ratio = 50
 workers = 1
 # Timeout in seconds for individual route prepay probes (default: 15)
 probe_timeout = 15
+# Maximum iterative halving step-downs when a full-size probe fails (0 to disable, default: 2 for 100% -> 50% -> 25%)
+probe_steps = 2
 # Optional default max off-chain routing fee ceiling in PPM (e.g., 4000 for 0.4%). Leave unset to use fee_leeway_pct.
 # max_routing_fee_ppm = 4000
 # Percentage leeway added on top of probed routing fee for max off-chain fee limit (default: 100 for +100% / 2x headroom)
@@ -162,7 +165,8 @@ python3 Other/swap_out-loop.py --history --csv
 | `-r`, `--min-ratio` | `float` | Config / `60%` | Minimum local balance ratio percentage. |
 | `--conf-target` | `int` | Config / `9` | Confirmation target for on-chain sweep (minimum `6`). |
 | `-w`, `--workers` | `int` | Config / `1` | Number of concurrent worker threads for route probing (recommended: `1` or `2`). |
-| `--probe-timeout` | `int` | Config / `15` | Timeout in seconds for individual route prepay probes. |
+| `--probe-timeout` | `int` | Config / `15` | Timeout in seconds for individual route prepay probes (decays on step-down retries). |
+| `--probe-steps` | `int` | Config / `2` | Maximum iterative halving step-downs (`100% → 50% → 25%`) when a full-size probe fails (`0` to disable, max `4`). |
 | `--skip-prepay-probe` | `flag` | `False` | Skip active prepay probing and rely on queryroutes theoretical fees (not recommended). |
 | `--max-routing-fee`| `int` | Leeway buffer | Upper limit on off-chain routing fees in **PPM** (e.g., `4000` for `0.4%`, automatically converted to satoshis for `litloop out --max_swap_routing_fee`). Set to `0` to omit fee limit (uses Loop daemon default). |
 | `--fee-leeway-pct` | `float`| Config / `100%` | Percentage leeway added on top of estimated routing fee for max off-chain fee budget when no PPM cap is set (e.g. `100` = 2x headroom). |

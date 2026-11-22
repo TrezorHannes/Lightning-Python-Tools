@@ -42,6 +42,9 @@ MAX_LOOP_OUT_SATS = 240_000_000
 DEFAULT_CONF_TARGET = 9
 MIN_CONF_TARGET = 6
 DEFAULT_PREPAY_SATS = 30_000
+DEFAULT_PROBE_STEPS = 2
+MAX_PROBE_STEPS = 4
+DEFAULT_MAX_THREE_HOP_BRIDGES = 2
 PAYMENT_TIMEOUT_RE = re.compile(r"^[1-9]\d*[smh]$")
 
 # ANSI Color Codes
@@ -456,27 +459,194 @@ def query_route_to_loop(
     return False, 0, 0
 
 
-def probe_direct_route_to_loop(
+def compute_probe_amounts(
+    initial_amt: int,
+    probe_steps: int = DEFAULT_PROBE_STEPS,
+    min_amt: int = MIN_LOOP_OUT_SATS,
+) -> List[int]:
+    """
+    Generates bounded iterative halving probe amounts (e.g. 100% -> 50% -> 25%)
+    stopping when probe_steps is exhausted or the next halved amount drops below min_amt.
+    """
+    if initial_amt <= 0 or probe_steps <= 0:
+        return [initial_amt]
+
+    amounts = [initial_amt]
+    cur = initial_amt
+    for _ in range(probe_steps):
+        nxt = cur // 2
+        if nxt < min_amt or nxt == cur:
+            break
+        amounts.append(nxt)
+        cur = nxt
+    return amounts
+
+
+def compute_step_probe_timeout(base_timeout: int, step_idx: int) -> int:
+    """Decays per-step probe timeout on step-down retries to keep scan wall-clock time bounded."""
+    factors = (1.0, 0.7, 0.5, 0.4, 0.35)
+    factor = factors[min(max(0, step_idx), len(factors) - 1)]
+    if base_timeout <= 5:
+        return max(1, base_timeout)
+    return min(base_timeout, max(5, round(base_timeout * factor)))
+
+
+def fetch_node_channels(
     config: Any,
+    pubkey: str,
+    timeout: int = 15,
+) -> List[Dict[str, Any]]:
+    """Fetches gossip channels for a node via `lncli getnodeinfo --include_channels`."""
+    if not pubkey:
+        return []
+    lncli_path = get_config_val(config, "paths", "lncli_path", "lncli")
+    lnd_params = get_lnd_connection_params(config)
+    cmd = [lncli_path, *lnd_params, "getnodeinfo", "--include_channels", pubkey]
+    success, output, _ = run_command(cmd, timeout=timeout, expect_json=True)
+    if success and isinstance(output, dict):
+        channels = output.get("channels", [])
+        if isinstance(channels, list):
+            return channels
+    return []
+
+
+def fetch_loop_peer_channels(
+    config: Any,
+    loop_pubkey: str,
+    timeout: int = 15,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Fetches active direct channels into the Loop server node once per run,
+    keyed by peer pubkey with inbound routing policy details toward Loop.
+    """
+    channels = fetch_node_channels(config, loop_pubkey, timeout=timeout)
+    peers: Dict[str, List[Dict[str, Any]]] = {}
+    for ch in channels:
+        if not isinstance(ch, dict):
+            continue
+        n1 = ch.get("node1_pub", "")
+        n2 = ch.get("node2_pub", "")
+        if n1 == loop_pubkey and n2 and n2 != loop_pubkey:
+            peer_pub = n2
+            pol = ch.get("node2_policy")
+        elif n2 == loop_pubkey and n1 and n1 != loop_pubkey:
+            peer_pub = n1
+            pol = ch.get("node1_policy")
+        else:
+            continue
+
+        if not isinstance(pol, dict) or pol.get("disabled"):
+            continue
+
+        try:
+            cap = int(ch.get("capacity", 0))
+            fee_ppm = int(pol.get("fee_rate_milli_msat", 0))
+            fee_base_msat = int(pol.get("fee_base_msat", 0))
+            max_htlc_msat = int(pol.get("max_htlc_msat", 0))
+        except (TypeError, ValueError):
+            continue
+
+        if cap <= 0:
+            continue
+        max_htlc_sats = (max_htlc_msat // 1000) if max_htlc_msat > 0 else cap
+        peers.setdefault(peer_pub, []).append(
+            {
+                "capacity": cap,
+                "fee_rate_ppm": fee_ppm,
+                "fee_base_msat": fee_base_msat,
+                "max_htlc_sats": max_htlc_sats,
+            }
+        )
+    return peers
+
+
+def find_three_hop_bridges_to_loop(
+    peer_channels: List[Dict[str, Any]],
     remote_pubkey: str,
     dest_pubkey: str,
+    loop_peers: Dict[str, List[Dict[str, Any]]],
+    amt: int,
+    max_routing_fee_ppm: Optional[int] = None,
+    max_bridges: int = DEFAULT_MAX_THREE_HOP_BRIDGES,
+    local_pubkey: str = "",
+) -> List[str]:
+    """
+    Identifies up to `max_bridges` lowest-fee 3-hop bridge hubs (`Peer -> Hub -> Loop`)
+    whose advertised capacity and max_htlc_msat can carry `amt` within `max_routing_fee_ppm`.
+    """
+    if not peer_channels or not loop_peers or amt <= 0 or max_bridges <= 0:
+        return []
+
+    best_by_hub: Dict[str, Tuple[int, int]] = {}
+    for ch in peer_channels:
+        if not isinstance(ch, dict):
+            continue
+        n1 = ch.get("node1_pub", "")
+        n2 = ch.get("node2_pub", "")
+        if n1 == remote_pubkey:
+            hub = n2
+            pol = ch.get("node1_policy")
+        elif n2 == remote_pubkey:
+            hub = n1
+            pol = ch.get("node2_policy")
+        else:
+            continue
+
+        if not hub or hub in (remote_pubkey, dest_pubkey) or (local_pubkey and hub == local_pubkey):
+            continue
+        if hub not in loop_peers:
+            continue
+        if not isinstance(pol, dict) or pol.get("disabled"):
+            continue
+
+        try:
+            hop1_cap = int(ch.get("capacity", 0))
+            hop1_ppm = int(pol.get("fee_rate_milli_msat", 0))
+            hop1_base_msat = int(pol.get("fee_base_msat", 0))
+            hop1_max_htlc_msat = int(pol.get("max_htlc_msat", 0))
+        except (TypeError, ValueError):
+            continue
+
+        hop1_max_htlc = (hop1_max_htlc_msat // 1000) if hop1_max_htlc_msat > 0 else hop1_cap
+        if hop1_cap < amt or hop1_max_htlc < amt:
+            continue
+
+        for h2 in loop_peers[hub]:
+            if h2["capacity"] < amt or h2["max_htlc_sats"] < amt:
+                continue
+            total_base_msat = hop1_base_msat + int(h2.get("fee_base_msat", 0))
+            base_ppm = round((total_base_msat / (amt * 1000)) * 1_000_000) if total_base_msat > 0 else 0
+            total_ppm = hop1_ppm + int(h2["fee_rate_ppm"]) + base_ppm
+            if max_routing_fee_ppm is not None and max_routing_fee_ppm > 0 and total_ppm > max_routing_fee_ppm:
+                continue
+            bottleneck_cap = min(hop1_cap, int(h2["capacity"]))
+            score = (total_ppm, -bottleneck_cap)
+            prev = best_by_hub.get(hub)
+            if prev is None or score < prev:
+                best_by_hub[hub] = score
+
+    ranked = sorted(best_by_hub.items(), key=lambda item: item[1])
+    return [hub for hub, _ in ranked[:max_bridges]]
+
+
+def probe_explicit_route_to_loop(
+    config: Any,
+    hops: List[str],
     amt: int,
     timeout: int = 15,
     outgoing_chan_id: Optional[str] = None,
 ) -> Tuple[bool, int, int, Optional[str]]:
     """
-    Attempts to probe direct 2-hop route: Local -> Peer -> Loop.
-    Uses lncli buildroute (scoped to outgoing_chan_id when provided) and
-    lncli sendtoroute with a fake payment hash.
+    Builds and probes an explicit hop sequence via `lncli buildroute` + `lncli sendtoroute`
+    with a random 32-byte fake payment hash.
     Returns (success, verified_fee, hops_count, error_msg).
     """
-    if not remote_pubkey:
-        return False, 0, 0, "No remote pubkey provided"
+    if not hops or len(hops) < 2:
+        return False, 0, 0, "Invalid hop list provided"
 
     lncli_path = get_config_val(config, "paths", "lncli_path", "lncli")
     lnd_params = get_lnd_connection_params(config)
 
-    # 1. Build direct route
     build_cmd = [
         lncli_path,
         *lnd_params,
@@ -484,20 +654,19 @@ def probe_direct_route_to_loop(
         "--amt",
         str(amt),
         "--hops",
-        f"{remote_pubkey},{dest_pubkey}",
+        ",".join(hops),
     ]
     if outgoing_chan_id:
         build_cmd.extend(["--outgoing_chan_id", str(outgoing_chan_id)])
 
     succ_build, out_build, err_build = run_command(build_cmd, timeout=timeout, expect_json=True)
     if not succ_build or not isinstance(out_build, dict) or "route" not in out_build:
-        return False, 0, 0, err_build or "Direct channel to Loop not available or buildroute failed"
+        return False, 0, 0, err_build or "Explicit route unavailable or buildroute failed"
 
     route = out_build["route"]
-    direct_fees = int(route.get("total_fees", 0))
+    route_fees = int(route.get("total_fees", 0))
     hops_count = len(route.get("hops", []))
 
-    # 2. Probe direct route using sendtoroute with fake payment hash
     fake_payment_hash = binascii.hexlify(os.urandom(32)).decode()
     probe_cmd = [
         lncli_path,
@@ -519,17 +688,76 @@ def probe_direct_route_to_loop(
             out_probe = parse_last_json_object(process.stdout)
             failure_code = out_probe.get("failure", {}).get("code", "")
             if failure_code in ["INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS", "INCORRECT_PAYMENT_DETAILS"]:
-                return True, direct_fees, hops_count, None
+                return True, route_fees, hops_count, None
             for htlc in out_probe.get("htlcs", []):
                 code = htlc.get("failure", {}).get("code", "")
                 if code in ["INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS", "INCORRECT_PAYMENT_DETAILS"]:
-                    return True, direct_fees, hops_count, None
-            err = out_probe.get("failure", {}).get("code") or "Direct route lacked liquidity"
+                    return True, route_fees, hops_count, None
+            err = out_probe.get("failure", {}).get("code") or "Explicit route lacked liquidity"
             return False, 0, 0, err
     except Exception as e:
         return False, 0, 0, str(e)
 
-    return False, 0, 0, "Failed to verify direct route"
+    return False, 0, 0, "Failed to verify explicit route"
+
+
+def probe_direct_route_to_loop(
+    config: Any,
+    remote_pubkey: str,
+    dest_pubkey: str,
+    amt: int,
+    timeout: int = 15,
+    outgoing_chan_id: Optional[str] = None,
+) -> Tuple[bool, int, int, Optional[str]]:
+    """
+    Attempts to probe direct 2-hop route: Local -> Peer -> Loop.
+    Uses lncli buildroute (scoped to outgoing_chan_id when provided) and
+    lncli sendtoroute with a fake payment hash.
+    Returns (success, verified_fee, hops_count, error_msg).
+    """
+    if not remote_pubkey:
+        return False, 0, 0, "No remote pubkey provided"
+
+    return probe_explicit_route_to_loop(
+        config=config,
+        hops=[remote_pubkey, dest_pubkey],
+        amt=amt,
+        timeout=timeout,
+        outgoing_chan_id=outgoing_chan_id,
+    )
+
+
+def probe_three_hop_bridges_to_loop(
+    config: Any,
+    remote_pubkey: str,
+    dest_pubkey: str,
+    amt: int,
+    bridge_hubs: List[str],
+    timeout: int = 15,
+    outgoing_chan_id: Optional[str] = None,
+) -> Tuple[bool, int, int, Optional[str]]:
+    """
+    Probes candidate 3-hop bridges (`Local -> Peer -> Hub -> Loop`) sequentially
+    and returns on the first bridge that proves live downstream liquidity.
+    """
+    if not remote_pubkey or not bridge_hubs:
+        return False, 0, 0, "No 3-hop bridge hubs available"
+
+    last_err: Optional[str] = "3-hop bridges lacked liquidity"
+    per_bridge_timeout = min(timeout, 10)
+    for hub in bridge_hubs:
+        ok, fee, hops_count, err = probe_explicit_route_to_loop(
+            config=config,
+            hops=[remote_pubkey, hub, dest_pubkey],
+            amt=amt,
+            timeout=per_bridge_timeout,
+            outgoing_chan_id=outgoing_chan_id,
+        )
+        if ok:
+            return True, fee, hops_count, None
+        if err:
+            last_err = err
+    return False, 0, 0, last_err
 
 
 def send_prepay_probe(
@@ -541,10 +769,14 @@ def send_prepay_probe(
     timeout: int = 20,
     skip_probe: bool = False,
     max_fee_sats: Optional[int] = None,
+    bridge_hubs: Optional[List[str]] = None,
+    skip_direct_probe: bool = False,
 ) -> Tuple[bool, int, int, Optional[str]]:
     """
     Stage 2: Live route probe using a random 32-byte fake hash.
     Proves downstream liquidity without risking funds.
+    Falls back to direct 2-hop (`Local -> Peer -> Loop`) and fast 3-hop bridge
+    (`Local -> Peer -> Hub -> Loop`) explicit probes when multi-hop sendpayment fails.
     Returns (success, verified_routing_fee, hops_count, error_detail).
     """
     if skip_probe:
@@ -606,9 +838,9 @@ def send_prepay_probe(
                 return True, verified_fee, hops_count, None
             return True, 0, 0, None
 
-    # 2. Multi-hop probe failed. If peer has a direct channel to Loop, probe the direct channel!
-    if remote_pubkey:
-        succ_dir, fee_dir, hops_dir, err_dir = probe_direct_route_to_loop(
+    # 2. Multi-hop probe failed. If peer has a direct channel to Loop, probe the direct 2-hop channel!
+    if remote_pubkey and not skip_direct_probe:
+        succ_dir, fee_dir, hops_dir, _ = probe_direct_route_to_loop(
             config,
             remote_pubkey,
             dest_pubkey,
@@ -618,6 +850,20 @@ def send_prepay_probe(
         )
         if succ_dir:
             return True, fee_dir, hops_dir, None
+
+    # 3. Fast 3-hop bridge fallback (Local -> Peer -> Hub -> Loop)
+    if remote_pubkey and bridge_hubs:
+        succ_3h, fee_3h, hops_3h, _ = probe_three_hop_bridges_to_loop(
+            config=config,
+            remote_pubkey=remote_pubkey,
+            dest_pubkey=dest_pubkey,
+            amt=amt,
+            bridge_hubs=bridge_hubs,
+            timeout=timeout,
+            outgoing_chan_id=outgoing_chan_id,
+        )
+        if succ_3h:
+            return True, fee_3h, hops_3h, None
 
     err_detail = "Insufficient liquidity on route to Loop"
     if isinstance(output, dict):
@@ -910,6 +1156,12 @@ def read_single_keypress() -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
+def _format_swap_size_cell(c: Dict[str, Any]) -> str:
+    """Formats candidate swap size cell with '*' if verified via iterative step-down."""
+    suffix = "*" if c.get("probe_step_down") else ""
+    return f"{c['proposed_amt']:,}{suffix}"
+
+
 def _format_route_ppm_cell(c: Dict[str, Any]) -> str:
     """Formats candidate routing PPM cell with '!' indicator if over ceiling."""
     amt = c.get("proposed_amt", 0)
@@ -954,7 +1206,7 @@ def print_candidates_table(
             c["alias"][:20],
             c["chan_id"],
             f"{c['local_ratio']:.1f}%",
-            f"{c['proposed_amt']:,}",
+            _format_swap_size_cell(c),
             f"{c['server_fee']:,}",
             f"{c['onchain_fee']:,}",
             f"{c['routing_fee']:,}",
@@ -968,6 +1220,11 @@ def print_candidates_table(
             row.insert(2, (pk[:16] + "...") if len(pk) > 16 else pk)
         table.add_row(row)
     print(table)
+    if any(c.get("probe_step_down") for c in candidates):
+        print_color(
+            "  * Stepped-down verified probe liquidity (usable MPP contribution capped to this amount).",
+            Colors.WARNING,
+        )
 
 
 def interactive_menu_select(
@@ -1066,7 +1323,7 @@ def interactive_menu_select(
                 c["alias"][:20],
                 c["chan_id"],
                 f"{c['local_ratio']:.1f}%",
-                f"{c['proposed_amt']:,}",
+                _format_swap_size_cell(c),
                 f"{c['server_fee']:,}",
                 f"{c['onchain_fee']:,}",
                 f"{c['routing_fee']:,}",
@@ -1087,6 +1344,11 @@ def interactive_menu_select(
             table.add_row(row)
 
         print(table)
+        if any(c.get("probe_step_down") for c in candidates):
+            print_color(
+                "  * Stepped-down verified probe liquidity (usable MPP contribution capped to this amount).",
+                Colors.WARNING,
+            )
         print()
 
         if selected_indices:
@@ -1486,11 +1748,18 @@ def evaluate_single_candidate(
     skip_prepay_probe: bool,
     print_lock: Optional[Any] = None,
     max_routing_fee_ppm: Optional[int] = None,
+    probe_steps: int = DEFAULT_PROBE_STEPS,
+    loop_peers: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    local_pubkey: str = "",
 ) -> Optional[Dict[str, Any]]:
-    """Evaluates a single candidate channel by querying quote, route, and prepay probe."""
+    """
+    Evaluates a single candidate channel via queryroutes and live prepay probing,
+    with bounded iterative halving (e.g. 100% -> 50% -> 25%) and fast 3-hop bridge fallback.
+    """
     chan_id = c["chan_id"]
-    amt = c["proposed_amt"]
+    initial_amt = int(c["proposed_amt"])
     alias = c["alias"]
+    remote_pubkey = c.get("remote_pubkey", "")
 
     def log(msg: str):
         if print_lock:
@@ -1499,72 +1768,126 @@ def evaluate_single_candidate(
         else:
             print(msg)
 
-    log(f"  → Checking {alias[:20]} ({chan_id}) for {amt:,} sats...")
+    log(f"  → Checking {alias[:20]} ({chan_id}) for {initial_amt:,} sats...")
 
-    probe_max_fee_sats = (
-        ppm_to_sats(amt, max_routing_fee_ppm)
-        if max_routing_fee_ppm is not None and max_routing_fee_ppm > 0
-        else None
+    probe_amounts = (
+        [initial_amt]
+        if skip_prepay_probe
+        else compute_probe_amounts(initial_amt, probe_steps=probe_steps, min_amt=MIN_LOOP_OUT_SATS)
     )
 
-    # 1. Fetch Loop Quote (read-only query)
-    quote = get_loop_quote(loop_cmd, amt, conf_target=conf_target, dry_run=False)
+    peer_channels: Optional[List[Dict[str, Any]]] = None
+    skip_direct = bool(loop_peers) and bool(remote_pubkey) and (remote_pubkey not in loop_peers)
 
-    # 2. Stage 1: queryroutes (read-only query)
-    route_ok, route_fee, hops = query_route_to_loop(
-        config,
-        loop_pubkey,
-        amt,
-        chan_id,
-        dry_run=False,
-        max_fee_sats=probe_max_fee_sats,
-    )
-    if not route_ok:
-        log(f"    ✗ Queryroutes found no route to Loop node for {alias[:20]}.")
+    verified_amt: Optional[int] = None
+    actual_fee = 0
+    actual_hops = 0
+    last_err: Optional[str] = None
+
+    for step_idx, step_amt in enumerate(probe_amounts):
+        if step_idx > 0:
+            log(f"    ↳ Stepping down probe for {alias[:20]} to {step_amt:,} sats (step {step_idx}/{len(probe_amounts) - 1})...")
+
+        step_max_fee_sats = (
+            ppm_to_sats(step_amt, max_routing_fee_ppm)
+            if max_routing_fee_ppm is not None and max_routing_fee_ppm > 0
+            else None
+        )
+        step_timeout = compute_step_probe_timeout(probe_timeout, step_idx)
+
+        # Stage 1: queryroutes (read-only graph check)
+        route_ok, route_fee, hops = query_route_to_loop(
+            config,
+            loop_pubkey,
+            step_amt,
+            chan_id,
+            dry_run=False,
+            max_fee_sats=step_max_fee_sats,
+        )
+        if not route_ok:
+            last_err = "Queryroutes found no route to Loop node"
+            continue
+
+        # Prepare 3-hop bridge hubs once per candidate when Loop peer graph is available
+        bridge_hubs: Optional[List[str]] = None
+        if not skip_prepay_probe and loop_peers and remote_pubkey:
+            if peer_channels is None:
+                peer_channels = fetch_node_channels(config, remote_pubkey, timeout=min(probe_timeout, 15))
+            if peer_channels:
+                bridge_hubs = find_three_hop_bridges_to_loop(
+                    peer_channels=peer_channels,
+                    remote_pubkey=remote_pubkey,
+                    dest_pubkey=loop_pubkey,
+                    loop_peers=loop_peers,
+                    amt=step_amt,
+                    max_routing_fee_ppm=max_routing_fee_ppm,
+                    max_bridges=DEFAULT_MAX_THREE_HOP_BRIDGES,
+                    local_pubkey=local_pubkey,
+                )
+
+        # Stage 2: Prepay probe with fake hash (proves live liquidity without spending funds)
+        probe_kwargs: Dict[str, Any] = {
+            "config": config,
+            "dest_pubkey": loop_pubkey,
+            "amt": step_amt,
+            "outgoing_chan_id": chan_id,
+            "remote_pubkey": remote_pubkey,
+            "timeout": step_timeout,
+            "skip_probe": skip_prepay_probe,
+            "max_fee_sats": step_max_fee_sats,
+        }
+        if bridge_hubs:
+            probe_kwargs["bridge_hubs"] = bridge_hubs
+        if skip_direct:
+            probe_kwargs["skip_direct_probe"] = True
+
+        probe_ok, verified_fee, verified_hops, probe_err = send_prepay_probe(**probe_kwargs)
+        if not probe_ok:
+            last_err = probe_err or "Insufficient liquidity on route to Loop"
+            continue
+
+        verified_amt = step_amt
+        if skip_prepay_probe:
+            actual_fee = route_fee
+            actual_hops = hops
+        else:
+            actual_fee = verified_fee if verified_hops > 0 else route_fee
+            actual_hops = verified_hops if verified_hops > 0 else hops
+        break
+
+    if verified_amt is None:
+        log(f"    ✗ Prepay probe failed for {alias[:20]}: {last_err}")
         return None
 
-    # 3. Stage 2: Prepay probe with fake hash (proves actual live liquidity without spending funds)
-    probe_ok, verified_fee, verified_hops, probe_err = send_prepay_probe(
-        config=config,
-        dest_pubkey=loop_pubkey,
-        amt=amt,
-        outgoing_chan_id=chan_id,
-        remote_pubkey=c.get("remote_pubkey", ""),
-        timeout=probe_timeout,
-        skip_probe=skip_prepay_probe,
-        max_fee_sats=probe_max_fee_sats,
-    )
-    if not probe_ok:
-        log(f"    ✗ Prepay probe failed for {alias[:20]}: {probe_err}")
-        return None
+    # Fetch Loop quote sized accurately to verified_amt (avoids wasted RPCs on failed candidates)
+    quote = get_loop_quote(loop_cmd, verified_amt, conf_target=conf_target, dry_run=False)
 
-    if skip_prepay_probe:
-        actual_fee = route_fee
-        actual_hops = hops
-    else:
-        actual_fee = verified_fee if verified_hops > 0 else route_fee
-        actual_hops = verified_hops if verified_hops > 0 else hops
-
-    routing_ppm = round((actual_fee / amt) * 1_000_000) if amt > 0 else 0
+    routing_ppm = round((actual_fee / verified_amt) * 1_000_000) if verified_amt > 0 else 0
     exceeds_fee_cap = bool(
         max_routing_fee_ppm is not None
         and max_routing_fee_ppm > 0
         and routing_ppm > max_routing_fee_ppm
     )
+    stepped_down = verified_amt < initial_amt
 
     cap_note = (
         f" [⚠ exceeds {max_routing_fee_ppm:,} ppm cap]"
         if exceeds_fee_cap
         else ""
     )
+    step_note = (
+        f" [stepped down from {initial_amt:,} → {verified_amt:,} sats]"
+        if stepped_down
+        else ""
+    )
     log(
         f"    ✓ Route verified with live liquidity for {alias[:20]} "
-        f"({actual_hops} hops, {actual_fee:,} sat / {routing_ppm:,} ppm routing fee){cap_note}."
+        f"({actual_hops} hops, {actual_fee:,} sat / {routing_ppm:,} ppm routing fee){step_note}{cap_note}."
     )
 
-    # 4. Economic cost breakdown
+    # Economic cost breakdown at verified_amt
     econ = calculate_economic_cost(
-        amt=amt,
+        amt=verified_amt,
         service_fee=quote["service_fee"],
         onchain_fee=quote["estimated_onchain_fee"],
         routing_fee=actual_fee,
@@ -1574,6 +1897,13 @@ def evaluate_single_candidate(
     c_eval = dict(c)
     c_eval.update(quote)
     c_eval.update(econ)
+    c_eval["proposed_amt"] = verified_amt
+    c_eval["verified_amt"] = verified_amt
+    c_eval["initial_proposed_amt"] = initial_amt
+    c_eval["probe_step_down"] = stepped_down
+    if stepped_down:
+        orig_surplus = int(c_eval.get("drainable_surplus", verified_amt))
+        c_eval["drainable_surplus"] = min(orig_surplus, verified_amt)
     c_eval["routing_ppm"] = routing_ppm
     c_eval["exceeds_fee_cap"] = exceeds_fee_cap
     return c_eval
@@ -1683,6 +2013,12 @@ def parse_arguments() -> argparse.Namespace:
         type=int,
         default=None,
         help="Timeout in seconds for individual route prepay probes (default from config or 15s).",
+    )
+    parser.add_argument(
+        "--probe-steps",
+        type=int,
+        default=None,
+        help=f"Maximum iterative halving step-downs when a full-size probe fails (0 to disable, max {MAX_PROBE_STEPS}, default from config or {DEFAULT_PROBE_STEPS}).",
     )
     parser.add_argument(
         "--skip-prepay-probe",
@@ -1818,7 +2154,16 @@ def main():
     min_local_ratio = args.min_ratio if args.min_ratio is not None else config.getfloat("loop", "min_local_balance_ratio", fallback=60.0)
     target_local_ratio = config.getfloat("loop", "target_local_ratio", fallback=50.0)
     conf_target = args.conf_target if args.conf_target is not None else config.getint("loop", "conf_target", fallback=DEFAULT_CONF_TARGET)
-    probe_timeout = args.probe_timeout if args.probe_timeout is not None else config.getint("loop", "probe_timeout", fallback=15)
+    probe_timeout = max(
+        1,
+        args.probe_timeout if args.probe_timeout is not None else config.getint("loop", "probe_timeout", fallback=15),
+    )
+    probe_steps = (
+        args.probe_steps
+        if getattr(args, "probe_steps", None) is not None
+        else config.getint("loop", "probe_steps", fallback=DEFAULT_PROBE_STEPS)
+    )
+    local_pubkey = get_config_val(config, "info", "node", "").strip()
     effective_max_routing_fee_ppm = (
         args.max_routing_fee
         if args.max_routing_fee is not None
@@ -1829,6 +2174,10 @@ def main():
         cfg_pt = get_config_val(config, "loop", "payment_timeout", "").strip()
         payment_timeout = cfg_pt or None
     show_pubkey = bool(getattr(args, "pubkey", False))
+
+    if probe_steps < 0 or probe_steps > MAX_PROBE_STEPS:
+        print_color(f"Error: --probe-steps must be between 0 and {MAX_PROBE_STEPS}.", Colors.FAIL, bold=True)
+        sys.exit(1)
 
     if effective_max_routing_fee_ppm is not None and effective_max_routing_fee_ppm < 0:
         print_color("Error: --max-routing-fee (PPM) must be >= 0.", Colors.FAIL, bold=True)
@@ -1888,6 +2237,11 @@ def main():
 
     # Route probing & quote evaluation on top candidates
     loop_cmd = resolve_loop_command(config)
+    loop_peers = (
+        fetch_loop_peer_channels(config, loop_pubkey, timeout=min(probe_timeout, 15))
+        if not args.skip_prepay_probe
+        else {}
+    )
     evaluated_candidates = []
     top_candidates = candidates[:8]
     workers = args.workers if args.workers is not None else config.getint("loop", "workers", fallback=1)
@@ -1911,6 +2265,9 @@ def main():
                     skip_prepay_probe=args.skip_prepay_probe,
                     print_lock=print_lock,
                     max_routing_fee_ppm=effective_max_routing_fee_ppm,
+                    probe_steps=probe_steps,
+                    loop_peers=loop_peers,
+                    local_pubkey=local_pubkey,
                 )
                 for c in top_candidates
             ]
@@ -1930,6 +2287,9 @@ def main():
                 skip_prepay_probe=args.skip_prepay_probe,
                 print_lock=None,
                 max_routing_fee_ppm=effective_max_routing_fee_ppm,
+                probe_steps=probe_steps,
+                loop_peers=loop_peers,
+                local_pubkey=local_pubkey,
             )
             if res:
                 evaluated_candidates.append(res)
