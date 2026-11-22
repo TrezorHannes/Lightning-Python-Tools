@@ -2035,3 +2035,404 @@ def test_main_auto_approve_fails_closed_when_single_stepped_down_channel_below_a
             swap_out_loop.main()
         assert exc_info.value.code == 1
         mock_exec.assert_not_called()
+
+
+def _sample_three_channel_debian_nuc_set():
+    """Real debian-nuc scenario: Garlic (9.39M) + Sunny Sarah (6.56M) + Volarte (1.41M*) = 17.36M."""
+    return [
+        {
+            "chan_id": "1026788829343318018",
+            "alias": "Garlic",
+            "remote_pubkey": "02garlic",
+            "capacity": 10_000_000,
+            "local_balance": 9_892_866,
+            "proposed_amt": 9_392_866,
+            "drainable_surplus": 9_392_866,
+            "local_ratio": 98.9,
+            "server_fee": 9_435,
+            "onchain_fee": 153,
+            "routing_fee": 32_856,
+            "routing_ppm": 3_498,
+            "prepay_amt": 30_000,
+            "opportunity_cost": 1_127,
+            "total_cost": 43_571,
+            "effective_ppm": 4_639,
+            "exceeds_fee_cap": False,
+        },
+        {
+            "chan_id": "1055691691402854401",
+            "alias": "Sunny Sarah",
+            "remote_pubkey": "03sunny",
+            "capacity": 10_000_000,
+            "local_balance": 7_062_238,
+            "proposed_amt": 6_562_238,
+            "drainable_surplus": 6_562_238,
+            "local_ratio": 70.6,
+            "server_fee": 6_605,
+            "onchain_fee": 153,
+            "routing_fee": 23_624,
+            "routing_ppm": 3_600,
+            "prepay_amt": 30_000,
+            "opportunity_cost": 197,
+            "total_cost": 30_579,
+            "effective_ppm": 4_660,
+            "exceeds_fee_cap": False,
+        },
+        {
+            "chan_id": "1046355738178945025",
+            "alias": "Volarte",
+            "remote_pubkey": "03volarte",
+            "capacity": 3_000_000,
+            "local_balance": 2_962_062,
+            "proposed_amt": 1_406_031,
+            "drainable_surplus": 1_406_031,
+            "probe_step_down": True,
+            "local_ratio": 98.7,
+            "server_fee": 1_449,
+            "onchain_fee": 153,
+            "routing_fee": 5_767,
+            "routing_ppm": 4_102,
+            "prepay_amt": 30_000,
+            "opportunity_cost": 0,
+            "total_cost": 7_369,
+            "effective_ppm": 5_241,
+            "exceeds_fee_cap": False,
+        },
+    ]
+
+
+def test_calculate_safe_max_swap_size_multi_channel_ppm_mode():
+    """Verify binary-search safe max swap size is the exact maximum passing severity=='ok' with 10% MPP buffer."""
+    channels = _sample_three_channel_debian_nuc_set()
+    cfg = configparser.ConfigParser()
+    safe_max = swap_out_loop.calculate_safe_max_swap_size(
+        selected_channels=channels,
+        config=cfg,
+        explicit_max_routing_fee_ppm=4500,
+        prepay_amt=30_000,
+    )
+    # 17,361,135 / 1.10 ~= 15,782,850 minus 30k prepay and ~4500 ppm fee ~= 15,682,xxx
+    assert 15_600_000 <= safe_max <= 15_750_000
+
+    # Verify safe_max passes with severity == "ok" and safe_max + 1 does not
+    rf_ok = swap_out_loop.calculate_max_routing_fee_budget(
+        swap_out_loop.estimate_multi_channel_routing_fee(channels, safe_max)[0],
+        cfg,
+        swap_amt=safe_max,
+        explicit_max_routing_fee_ppm=4500,
+    )
+    check_ok = swap_out_loop.validate_multi_channel_liquidity(channels, safe_max, rf_ok, prepay_amt=30_000)
+    assert check_ok["ok"] is True
+    assert check_ok["severity"] == "ok"
+
+    rf_over = swap_out_loop.calculate_max_routing_fee_budget(
+        swap_out_loop.estimate_multi_channel_routing_fee(channels, safe_max + 1)[0],
+        cfg,
+        swap_amt=safe_max + 1,
+        explicit_max_routing_fee_ppm=4500,
+    )
+    check_over = swap_out_loop.validate_multi_channel_liquidity(channels, safe_max + 1, rf_over, prepay_amt=30_000)
+    assert check_over["severity"] != "ok"
+
+
+def test_calculate_safe_max_swap_size_unbounded_and_leeway_modes():
+    """Verify safe max solver handles both unbounded (0) and default 100% leeway fee modes accurately."""
+    channels = _sample_three_channel_debian_nuc_set()
+    cfg = configparser.ConfigParser()
+
+    max_unbounded = swap_out_loop.calculate_safe_max_swap_size(
+        selected_channels=channels,
+        config=cfg,
+        explicit_max_routing_fee_ppm=0,
+        prepay_amt=30_000,
+    )
+    max_leeway = swap_out_loop.calculate_safe_max_swap_size(
+        selected_channels=channels,
+        config=cfg,
+        explicit_max_routing_fee_ppm=None,
+        prepay_amt=30_000,
+    )
+    assert max_unbounded > max_leeway > 15_000_000
+
+    # Both must pass validate_multi_channel_liquidity with severity == "ok"
+    est_u, _ = swap_out_loop.estimate_multi_channel_routing_fee(channels, max_unbounded)
+    assert swap_out_loop.validate_multi_channel_liquidity(channels, max_unbounded, est_u, 30_000)["severity"] == "ok"
+
+    est_l, _ = swap_out_loop.estimate_multi_channel_routing_fee(channels, max_leeway)
+    rf_l = swap_out_loop.calculate_max_routing_fee_budget(est_l, cfg, swap_amt=max_leeway)
+    assert swap_out_loop.validate_multi_channel_liquidity(channels, max_leeway, rf_l, 30_000)["severity"] == "ok"
+
+
+def test_calculate_safe_max_swap_size_single_channel_and_below_min():
+    """Single channel has no extra 10% MPP buffer; tiny channels unable to meet MIN_LOOP_OUT_SATS return 0."""
+    single = [
+        {
+            "capacity": 10_000_000,
+            "local_balance": 9_850_000,
+            "proposed_amt": 9_350_000,
+            "drainable_surplus": 9_350_000,
+            "routing_fee": 28_050,
+        }
+    ]
+    assert swap_out_loop.calculate_safe_max_swap_size(single, {}, explicit_max_routing_fee_ppm=4000) == 9_350_000
+
+    tiny = [
+        {
+            "capacity": 500_000,
+            "local_balance": 200_000,
+            "proposed_amt": 100_000,
+            "drainable_surplus": 100_000,
+            "routing_fee": 500,
+        }
+    ]
+    assert swap_out_loop.calculate_safe_max_swap_size(tiny, {}, explicit_max_routing_fee_ppm=4000) == 0
+
+
+def test_main_interactive_tty_overwrite_when_insufficient_liquidity():
+    """When --amt exceeds combined drainable in TTY mode, offer safe max overwrite and recompute fees."""
+    channels = _sample_three_channel_debian_nuc_set()
+    expected_safe_max = swap_out_loop.calculate_safe_max_swap_size(
+        selected_channels=channels,
+        config=configparser.ConfigParser(),
+        explicit_max_routing_fee_ppm=4500,
+        prepay_amt=30_000,
+    )
+
+    def _make_args():
+        a = MagicMock()
+        a.history = False
+        a.capacity = None
+        a.fee_limit = 120
+        a.min_ratio = None
+        a.amt = 18_000_000
+        a.conf_target = 6
+        a.max_routing_fee = 4500
+        a.fee_leeway_pct = None
+        a.dest_addr = None
+        a.dry_run = False
+        a.auto_approve = False
+        a.max_channels = 3
+        a.channel = None
+        a.workers = 1
+        a.probe_timeout = 15
+        a.skip_prepay_probe = False
+        a.payment_timeout = "10m"
+        a.pubkey = False
+        a.probe_steps = 2
+        return a
+
+    # Case 1: User accepts default [Y/n] -> overwrites amt to expected_safe_max and executes cleanly
+    with patch.object(swap_out_loop, "parse_arguments", return_value=_make_args()), \
+         patch.object(swap_out_loop, "load_config", return_value=(configparser.ConfigParser(), "/tmp")), \
+         patch.object(swap_out_loop, "setup_logger", return_value=MagicMock()), \
+         patch.object(swap_out_loop, "fetch_channels_lndg", return_value=[{"is_active": True, "is_open": True, "capacity": 10_000_000, "local_balance": 9_892_866, "local_fee_rate": 10, "chan_id": "1", "alias": "a"}]), \
+         patch.object(swap_out_loop, "filter_and_size_candidates", return_value=channels), \
+         patch.object(swap_out_loop, "fetch_loop_peer_channels", return_value={}), \
+         patch.object(swap_out_loop, "evaluate_single_candidate", side_effect=lambda c, **kwargs: c), \
+         patch.object(swap_out_loop, "interactive_menu_select", return_value=channels), \
+         patch("sys.stdin.isatty", return_value=True), \
+         patch("builtins.input", return_value=""), \
+         patch.object(swap_out_loop, "execute_loop_out", return_value={"success": True, "swap_id": "ok", "dry_run": False}) as mock_exec, \
+         patch.object(swap_out_loop, "monitor_loop"):
+        swap_out_loop.main()
+        mock_exec.assert_called_once()
+        assert mock_exec.call_args[1]["amt"] == expected_safe_max
+        assert mock_exec.call_args[1]["max_routing_fee"] == swap_out_loop.ppm_to_sats(expected_safe_max, 4500)
+
+    # Case 2: User declines ('n') -> cancels cleanly without executing
+    with patch.object(swap_out_loop, "parse_arguments", return_value=_make_args()), \
+         patch.object(swap_out_loop, "load_config", return_value=(configparser.ConfigParser(), "/tmp")), \
+         patch.object(swap_out_loop, "setup_logger", return_value=MagicMock()), \
+         patch.object(swap_out_loop, "fetch_channels_lndg", return_value=[{"is_active": True, "is_open": True, "capacity": 10_000_000, "local_balance": 9_892_866, "local_fee_rate": 10, "chan_id": "1", "alias": "a"}]), \
+         patch.object(swap_out_loop, "filter_and_size_candidates", return_value=channels), \
+         patch.object(swap_out_loop, "fetch_loop_peer_channels", return_value={}), \
+         patch.object(swap_out_loop, "evaluate_single_candidate", side_effect=lambda c, **kwargs: c), \
+         patch.object(swap_out_loop, "interactive_menu_select", return_value=channels), \
+         patch("sys.stdin.isatty", return_value=True), \
+         patch("builtins.input", return_value="n"), \
+         patch.object(swap_out_loop, "execute_loop_out") as mock_exec:
+        with pytest.raises(SystemExit) as exc_info:
+            swap_out_loop.main()
+        assert exc_info.value.code == 0
+        mock_exec.assert_not_called()
+
+
+def test_main_interactive_tty_tight_headroom_choice_overwrite_or_keep():
+    """On tight MPP headroom warning in TTY mode, user can choose [1] safe max, [2] keep original, or [q] cancel."""
+    channels = _sample_three_channel_debian_nuc_set()
+    expected_safe_max = swap_out_loop.calculate_safe_max_swap_size(
+        selected_channels=channels,
+        config=configparser.ConfigParser(),
+        explicit_max_routing_fee_ppm=4500,
+        prepay_amt=30_000,
+    )
+
+    def _make_args():
+        a = MagicMock()
+        a.history = False
+        a.capacity = None
+        a.fee_limit = 120
+        a.min_ratio = None
+        a.amt = 17_000_000  # <= 17.36M drainable, but <10% MPP headroom -> warning
+        a.conf_target = 6
+        a.max_routing_fee = 4500
+        a.fee_leeway_pct = None
+        a.dest_addr = None
+        a.dry_run = False
+        a.auto_approve = False
+        a.max_channels = 3
+        a.channel = None
+        a.workers = 1
+        a.probe_timeout = 15
+        a.skip_prepay_probe = False
+        a.payment_timeout = "10m"
+        a.pubkey = False
+        a.probe_steps = 2
+        return a
+
+    # Choice "1": overwrite to safe max
+    with patch.object(swap_out_loop, "parse_arguments", return_value=_make_args()), \
+         patch.object(swap_out_loop, "load_config", return_value=(configparser.ConfigParser(), "/tmp")), \
+         patch.object(swap_out_loop, "setup_logger", return_value=MagicMock()), \
+         patch.object(swap_out_loop, "fetch_channels_lndg", return_value=[{"is_active": True, "is_open": True, "capacity": 10_000_000, "local_balance": 9_892_866, "local_fee_rate": 10, "chan_id": "1", "alias": "a"}]), \
+         patch.object(swap_out_loop, "filter_and_size_candidates", return_value=channels), \
+         patch.object(swap_out_loop, "fetch_loop_peer_channels", return_value={}), \
+         patch.object(swap_out_loop, "evaluate_single_candidate", side_effect=lambda c, **kwargs: c), \
+         patch.object(swap_out_loop, "interactive_menu_select", return_value=channels), \
+         patch("sys.stdin.isatty", return_value=True), \
+         patch("builtins.input", return_value="1"), \
+         patch.object(swap_out_loop, "execute_loop_out", return_value={"success": True, "swap_id": "ok", "dry_run": False}) as mock_exec, \
+         patch.object(swap_out_loop, "monitor_loop"):
+        swap_out_loop.main()
+        assert mock_exec.call_args[1]["amt"] == expected_safe_max
+
+    # Choice "2": keep original 17M anyway
+    with patch.object(swap_out_loop, "parse_arguments", return_value=_make_args()), \
+         patch.object(swap_out_loop, "load_config", return_value=(configparser.ConfigParser(), "/tmp")), \
+         patch.object(swap_out_loop, "setup_logger", return_value=MagicMock()), \
+         patch.object(swap_out_loop, "fetch_channels_lndg", return_value=[{"is_active": True, "is_open": True, "capacity": 10_000_000, "local_balance": 9_892_866, "local_fee_rate": 10, "chan_id": "1", "alias": "a"}]), \
+         patch.object(swap_out_loop, "filter_and_size_candidates", return_value=channels), \
+         patch.object(swap_out_loop, "fetch_loop_peer_channels", return_value={}), \
+         patch.object(swap_out_loop, "evaluate_single_candidate", side_effect=lambda c, **kwargs: c), \
+         patch.object(swap_out_loop, "interactive_menu_select", return_value=channels), \
+         patch("sys.stdin.isatty", return_value=True), \
+         patch("builtins.input", return_value="2"), \
+         patch.object(swap_out_loop, "execute_loop_out", return_value={"success": True, "swap_id": "ok", "dry_run": False}) as mock_exec, \
+         patch.object(swap_out_loop, "monitor_loop"):
+        swap_out_loop.main()
+        assert mock_exec.call_args[1]["amt"] == 17_000_000
+
+
+def test_main_interactive_overwrite_still_enforces_fee_cap_warning():
+    """After overwriting amt to safe max, if probed routing fee still exceeds PPM cap, fee-cap confirmation still fires."""
+    channels = _sample_three_channel_debian_nuc_set()
+    # Set tight 3000 ppm cap (< 3498-4102 ppm channels)
+    a = MagicMock()
+    a.history = False
+    a.capacity = None
+    a.fee_limit = 120
+    a.min_ratio = None
+    a.amt = 18_000_000
+    a.conf_target = 6
+    a.max_routing_fee = 3000
+    a.fee_leeway_pct = None
+    a.dest_addr = None
+    a.dry_run = False
+    a.auto_approve = False
+    a.max_channels = 3
+    a.channel = None
+    a.workers = 1
+    a.probe_timeout = 15
+    a.skip_prepay_probe = False
+    a.payment_timeout = "10m"
+    a.pubkey = False
+    a.probe_steps = 2
+
+    # First prompt ("y") accepts safe max overwrite; second prompt ("n") declines proceeding over fee cap
+    with patch.object(swap_out_loop, "parse_arguments", return_value=a), \
+         patch.object(swap_out_loop, "load_config", return_value=(configparser.ConfigParser(), "/tmp")), \
+         patch.object(swap_out_loop, "setup_logger", return_value=MagicMock()), \
+         patch.object(swap_out_loop, "fetch_channels_lndg", return_value=[{"is_active": True, "is_open": True, "capacity": 10_000_000, "local_balance": 9_892_866, "local_fee_rate": 10, "chan_id": "1", "alias": "a"}]), \
+         patch.object(swap_out_loop, "filter_and_size_candidates", return_value=channels), \
+         patch.object(swap_out_loop, "fetch_loop_peer_channels", return_value={}), \
+         patch.object(swap_out_loop, "evaluate_single_candidate", side_effect=lambda c, **kwargs: c), \
+         patch.object(swap_out_loop, "interactive_menu_select", return_value=channels), \
+         patch("sys.stdin.isatty", return_value=True), \
+         patch("builtins.input", side_effect=["y", "n"]) as mock_in, \
+         patch.object(swap_out_loop, "execute_loop_out") as mock_exec:
+        with pytest.raises(SystemExit) as exc_info:
+            swap_out_loop.main()
+        assert exc_info.value.code == 0
+        assert mock_in.call_count == 2
+        mock_exec.assert_not_called()
+
+
+def test_main_headless_auto_approve_remains_fail_closed_with_safe_max_hint(capsys):
+    """Headless --auto-approve stays fail-closed on insufficient liquidity and prints computed safe max hint."""
+    channels = _sample_three_channel_debian_nuc_set()
+    expected_safe_max = swap_out_loop.calculate_safe_max_swap_size(
+        selected_channels=channels,
+        config=configparser.ConfigParser(),
+        explicit_max_routing_fee_ppm=4500,
+        prepay_amt=30_000,
+    )
+    a = MagicMock()
+    a.history = False
+    a.capacity = None
+    a.fee_limit = 120
+    a.min_ratio = None
+    a.amt = 18_000_000
+    a.conf_target = 6
+    a.max_routing_fee = 4500
+    a.fee_leeway_pct = None
+    a.dest_addr = None
+    a.dry_run = False
+    a.auto_approve = True
+    a.max_channels = 3
+    a.channel = None
+    a.workers = 1
+    a.probe_timeout = 15
+    a.skip_prepay_probe = False
+    a.payment_timeout = "10m"
+    a.pubkey = False
+    a.probe_steps = 2
+
+    with patch.object(swap_out_loop, "parse_arguments", return_value=a), \
+         patch.object(swap_out_loop, "load_config", return_value=(configparser.ConfigParser(), "/tmp")), \
+         patch.object(swap_out_loop, "setup_logger", return_value=MagicMock()), \
+         patch.object(swap_out_loop, "fetch_channels_lndg", return_value=[{"is_active": True, "is_open": True, "capacity": 10_000_000, "local_balance": 9_892_866, "local_fee_rate": 10, "chan_id": "1", "alias": "a"}]), \
+         patch.object(swap_out_loop, "filter_and_size_candidates", return_value=channels), \
+         patch.object(swap_out_loop, "fetch_loop_peer_channels", return_value={}), \
+         patch.object(swap_out_loop, "evaluate_single_candidate", side_effect=lambda c, **kwargs: c), \
+         patch.object(swap_out_loop, "execute_loop_out") as mock_exec:
+        with pytest.raises(SystemExit) as exc_info:
+            swap_out_loop.main()
+        assert exc_info.value.code == 1
+        mock_exec.assert_not_called()
+        out = capsys.readouterr().out
+        assert f"{expected_safe_max:,}" in out
+
+
+def test_interactive_menu_select_tty_displays_safe_max_footer(capsys):
+    """Multi-select TTY footer previews computed Safe Max when target_amt exceeds safe MPP headroom."""
+    channels = _sample_three_channel_debian_nuc_set()
+    expected_safe_max = swap_out_loop.calculate_safe_max_swap_size(
+        selected_channels=channels,
+        config={},
+        explicit_max_routing_fee_ppm=4500,
+        prepay_amt=30_000,
+    )
+    # Press 'a' to select all 3 channels, then Enter to confirm
+    with patch("sys.stdin.isatty", return_value=True), \
+         patch.object(swap_out_loop, "read_single_keypress", side_effect=["a", "\r"]):
+        selected = swap_out_loop.interactive_menu_select(
+            channels,
+            target_amt=18_000_000,
+            max_channels=3,
+            config={},
+            explicit_max_routing_fee_ppm=4500,
+        )
+    assert isinstance(selected, list)
+    assert len(selected) == 3
+    out = capsys.readouterr().out
+    assert f"Safe Max: {expected_safe_max:,} sats" in out
