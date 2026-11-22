@@ -1258,6 +1258,9 @@ def interactive_menu_select(
     target_amt: Optional[int] = None,
     max_channels: int = 3,
     show_pubkey: bool = False,
+    config: Optional[Any] = None,
+    explicit_max_routing_fee_ppm: Optional[int] = None,
+    explicit_leeway_pct: Optional[float] = None,
 ) -> Optional[Union[Dict[str, Any], List[Dict[str, Any]]]]:
     """
     Renders an interactive CLI terminal menu with arrow-key navigation,
@@ -1379,13 +1382,26 @@ def interactive_menu_select(
 
         if selected_indices:
             sel_list = [candidates[i] for i in sorted(selected_indices)]
-            if target_amt and target_amt > 0:
-                swap_size = target_amt
+            if len(sel_list) == 1:
+                swap_size = sel_list[0]["proposed_amt"]
+            elif target_amt and target_amt > 0:
+                swap_size = min(target_amt, MAX_LOOP_OUT_SATS)
             else:
                 swap_size = min(c["proposed_amt"] for c in sel_list)
 
             est_rf, est_rppm = estimate_multi_channel_routing_fee(sel_list, swap_size)
             combined_surplus = sum(int(c.get("drainable_surplus", c["proposed_amt"])) for c in sel_list)
+            sel_prepay = max(
+                (int(c.get("prepay_amt", DEFAULT_PREPAY_SATS)) for c in sel_list),
+                default=DEFAULT_PREPAY_SATS,
+            )
+            safe_max = calculate_safe_max_swap_size(
+                selected_channels=sel_list,
+                config=config if config is not None else {},
+                explicit_max_routing_fee_ppm=explicit_max_routing_fee_ppm,
+                explicit_leeway_pct=explicit_leeway_pct,
+                prepay_amt=sel_prepay,
+            )
             ppms = [c["effective_ppm"] for c in sel_list]
             costs = [scale_cost_to_swap_amt(c, swap_size) for c in sel_list]
             min_ppm, max_ppm = min(ppms), max(ppms)
@@ -1393,11 +1409,19 @@ def interactive_menu_select(
             ppm_str = f"{min_ppm:,} ppm" if min_ppm == max_ppm else f"{min_ppm:,} – {max_ppm:,} ppm"
             cost_str = f"{min_cost:,} sats" if min_cost == max_cost else f"{min_cost:,} – {max_cost:,} sats"
 
+            safe_max_note = ""
+            if safe_max < swap_size:
+                if safe_max >= MIN_LOOP_OUT_SATS:
+                    safe_max_note = f" | Safe Max: {safe_max:,} sats"
+                else:
+                    safe_max_note = f" | Safe Max: < {MIN_LOOP_OUT_SATS:,} sats"
+
             print_color(
                 f"Multi-Select Active ({len(selected_indices)} chans): Fixed Swap Size {swap_size:,} sats "
-                f"| Drainable: {combined_surplus:,} sats | Est Route Fee: {est_rf:,} sats ({est_rppm:,} ppm) "
+                f"| Drainable: {combined_surplus:,} sats{safe_max_note} "
+                f"| Est Route Fee: {est_rf:,} sats ({est_rppm:,} ppm) "
                 f"| Net PPM: {ppm_str} (Est Cost: {cost_str})",
-                Colors.OKGREEN if combined_surplus >= swap_size + est_rf else Colors.WARNING,
+                Colors.OKGREEN if safe_max >= swap_size else Colors.WARNING,
                 bold=True,
             )
             print_color("Press [Enter] to execute multi-channel swap with selected channels.", Colors.OKBLUE)
@@ -1620,6 +1644,68 @@ def validate_multi_channel_liquidity(
         "utilization_pct": utilization_pct,
         "message": "",
     }
+
+
+def calculate_safe_max_swap_size(
+    selected_channels: List[Dict[str, Any]],
+    config: Any,
+    explicit_max_routing_fee_ppm: Optional[int] = None,
+    explicit_leeway_pct: Optional[float] = None,
+    prepay_amt: int = DEFAULT_PREPAY_SATS,
+) -> int:
+    """
+    Computes the exact maximum swap size (in satoshis) for selected_channels that passes
+    validate_multi_channel_liquidity() with severity == "ok" — accounting for routing fee
+    budget (PPM ceiling, unbounded probed fee, or leeway), Loop prepay, raw LND channel
+    reserves, and the 10% multi-channel MPP headroom buffer.
+
+    Returns 0 if even MIN_LOOP_OUT_SATS cannot safely fit.
+    """
+    if not selected_channels:
+        return 0
+
+    total_drainable = sum(
+        int(c.get("drainable_surplus", c.get("proposed_amt", 0)))
+        for c in selected_channels
+    )
+    upper = min(total_drainable, MAX_LOOP_OUT_SATS)
+    if upper < MIN_LOOP_OUT_SATS:
+        return 0
+
+    def _is_safe(amt: int) -> bool:
+        est_fee, _ = estimate_multi_channel_routing_fee(selected_channels, amt)
+        rf_budget = calculate_max_routing_fee_budget(
+            probed_routing_fee=est_fee,
+            config=config,
+            swap_amt=amt,
+            explicit_max_routing_fee_ppm=explicit_max_routing_fee_ppm,
+            explicit_leeway_pct=explicit_leeway_pct,
+        )
+        eff_fee = rf_budget if rf_budget > 0 else est_fee
+        check = validate_multi_channel_liquidity(
+            selected_channels=selected_channels,
+            total_swap_amt=amt,
+            max_routing_fee_sats=eff_fee,
+            prepay_amt=prepay_amt,
+        )
+        return bool(check["ok"] and check["severity"] == "ok")
+
+    if not _is_safe(MIN_LOOP_OUT_SATS):
+        return 0
+    if _is_safe(upper):
+        return upper
+
+    lo = MIN_LOOP_OUT_SATS
+    hi = upper - 1
+    best = MIN_LOOP_OUT_SATS
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if _is_safe(mid):
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
 
 
 def _get_config_optional_int(config: Any, section: str, option: str) -> Optional[int]:
@@ -2367,6 +2453,9 @@ def main():
             target_amt=args.amt,
             max_channels=max_channels,
             show_pubkey=show_pubkey,
+            config=config,
+            explicit_max_routing_fee_ppm=args.max_routing_fee,
+            explicit_leeway_pct=args.fee_leeway_pct,
         )
 
     if not selected:
@@ -2435,8 +2524,117 @@ def main():
         explicit_max_routing_fee_ppm=args.max_routing_fee,
         explicit_leeway_pct=args.fee_leeway_pct,
     )
-    max_rf_ppm = round((max_rf / total_swap_amt) * 1_000_000) if (max_rf > 0 and total_swap_amt > 0) else 0
 
+    # Validate aggregate outbound liquidity & MPP headroom before launching swap
+    prepay_amt = max(
+        (int(c.get("prepay_amt", DEFAULT_PREPAY_SATS)) for c in selected_channels),
+        default=DEFAULT_PREPAY_SATS,
+    )
+    effective_fee_for_liquidity = max_rf if max_rf > 0 else probed_routing_fee
+    liq_check = validate_multi_channel_liquidity(
+        selected_channels=selected_channels,
+        total_swap_amt=total_swap_amt,
+        max_routing_fee_sats=effective_fee_for_liquidity,
+        prepay_amt=prepay_amt,
+    )
+
+    safe_max_amt = 0
+    tight_headroom_accepted = False
+    if not liq_check["ok"] or liq_check["severity"] == "warning":
+        safe_max_amt = calculate_safe_max_swap_size(
+            selected_channels=selected_channels,
+            config=config,
+            explicit_max_routing_fee_ppm=args.max_routing_fee,
+            explicit_leeway_pct=args.fee_leeway_pct,
+            prepay_amt=prepay_amt,
+        )
+
+        # In interactive TTY sessions, offer to overwrite total_swap_amt with the computed safe max
+        # instead of failing or running with risky tight MPP headroom.
+        if not args.auto_approve and sys.stdin.isatty() and MIN_LOOP_OUT_SATS <= safe_max_amt < total_swap_amt:
+            overwritten_amt = False
+            buffer_note = " + 10% MPP headroom" if len(selected_channels) > 1 else ""
+            if not liq_check["ok"]:
+                print_color(f"\nLiquidity Notice: {liq_check['message']}", Colors.WARNING, bold=True)
+                print_color(
+                    f"Maximum safe swap size for selected channel(s) "
+                    f"(accounting for routing fee, {prepay_amt:,} sat prepay{buffer_note}): "
+                    f"{safe_max_amt:,} sats",
+                    Colors.OKCYAN,
+                    bold=True,
+                )
+                try:
+                    choice = input(
+                        f"Overwrite swap size from {total_swap_amt:,} to safe max {safe_max_amt:,} sats? [Y/n]: "
+                    ).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    choice = "n"
+                if choice in ("", "y", "yes"):
+                    total_swap_amt = safe_max_amt
+                    overwritten_amt = True
+                else:
+                    print_color("Operation cancelled by user. No swap initiated.", Colors.WARNING)
+                    sys.exit(0)
+            else:
+                print_color(f"\nWarning: {liq_check['message']}", Colors.WARNING, bold=True)
+                print_color(
+                    f"Recommended safe max swap size (with ≥10% MPP headroom): {safe_max_amt:,} sats",
+                    Colors.OKCYAN,
+                    bold=True,
+                )
+                try:
+                    choice = input(
+                        f"Choose swap size: [1] Overwrite with safe max {safe_max_amt:,} sats (Recommended), "
+                        f"[2] Keep {total_swap_amt:,} sats anyway, [q] Cancel [1]: "
+                    ).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    choice = "q"
+                if choice in ("", "1", "y", "yes"):
+                    total_swap_amt = safe_max_amt
+                    overwritten_amt = True
+                elif choice == "2":
+                    tight_headroom_accepted = True
+                else:
+                    print_color("Operation cancelled by user. No swap initiated.", Colors.WARNING)
+                    sys.exit(0)
+
+            if overwritten_amt:
+                probed_routing_fee, est_routing_ppm = estimate_multi_channel_routing_fee(
+                    selected_channels, total_swap_amt
+                )
+                max_rf = calculate_max_routing_fee_budget(
+                    probed_routing_fee=probed_routing_fee,
+                    config=config,
+                    swap_amt=total_swap_amt,
+                    explicit_max_routing_fee_ppm=args.max_routing_fee,
+                    explicit_leeway_pct=args.fee_leeway_pct,
+                )
+                total_cost = max(scale_cost_to_swap_amt(c, total_swap_amt) for c in selected_channels)
+                effective_fee_for_liquidity = max_rf if max_rf > 0 else probed_routing_fee
+                liq_check = validate_multi_channel_liquidity(
+                    selected_channels=selected_channels,
+                    total_swap_amt=total_swap_amt,
+                    max_routing_fee_sats=effective_fee_for_liquidity,
+                    prepay_amt=prepay_amt,
+                )
+                print_color(
+                    f"✓ Adjusted Swap Size: {total_swap_amt:,} sats "
+                    f"(Est Route Fee: {probed_routing_fee:,} sats / {est_routing_ppm:,} ppm)",
+                    Colors.OKGREEN,
+                    bold=True,
+                )
+
+    if not liq_check["ok"]:
+        print_color(f"Error: {liq_check['message']}", Colors.FAIL, bold=True)
+        if safe_max_amt >= MIN_LOOP_OUT_SATS:
+            print_color(
+                f"Hint: Maximum safe swap size for selected channel(s) is {safe_max_amt:,} sats "
+                f"(re-run with --amt {safe_max_amt}).",
+                Colors.OKCYAN,
+            )
+        sys.exit(1)
+
+    max_rf_ppm = round((max_rf / total_swap_amt) * 1_000_000) if (max_rf > 0 and total_swap_amt > 0) else 0
     if max_rf > 0:
         if max_rf < probed_routing_fee:
             shortfall = probed_routing_fee - max_rf
@@ -2466,27 +2664,19 @@ def main():
             Colors.OKCYAN,
         )
 
-    # Validate aggregate outbound liquidity & MPP headroom before launching swap
-    prepay_amt = max(
-        (int(c.get("prepay_amt", DEFAULT_PREPAY_SATS)) for c in selected_channels),
-        default=DEFAULT_PREPAY_SATS,
-    )
-    effective_fee_for_liquidity = max_rf if max_rf > 0 else probed_routing_fee
-    liq_check = validate_multi_channel_liquidity(
-        selected_channels=selected_channels,
-        total_swap_amt=total_swap_amt,
-        max_routing_fee_sats=effective_fee_for_liquidity,
-        prepay_amt=prepay_amt,
-    )
-    if not liq_check["ok"]:
-        print_color(f"Error: {liq_check['message']}", Colors.FAIL, bold=True)
-        sys.exit(1)
-    elif liq_check["severity"] == "warning":
+    if liq_check["severity"] == "warning" and not tight_headroom_accepted:
         print_color(f"Warning: {liq_check['message']}", Colors.WARNING, bold=True)
+        if safe_max_amt >= MIN_LOOP_OUT_SATS:
+            print_color(
+                f"Hint: Maximum safe swap size with ≥10% MPP headroom is {safe_max_amt:,} sats.",
+                Colors.OKCYAN,
+            )
 
     # Require explicit confirmation on interactive TTY live runs when routing/headroom warns,
     # and fail closed on non-TTY live runs (e.g. auto-batched without --auto-approve).
-    has_exec_warning = (max_rf > 0 and max_rf < probed_routing_fee) or liq_check["severity"] == "warning"
+    fee_cap_warning = max_rf > 0 and max_rf < probed_routing_fee
+    headroom_warning = liq_check["severity"] == "warning" and not tight_headroom_accepted
+    has_exec_warning = fee_cap_warning or headroom_warning
     if has_exec_warning and not args.auto_approve and not args.dry_run:
         if sys.stdin.isatty():
             try:
