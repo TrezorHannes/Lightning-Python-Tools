@@ -29,7 +29,7 @@ Rather than simply finding channels with high local balances, `swap_out-loop.py`
   - Fixed Net Swap Size: The defined swap amount (`--amt`, e.g. 3,000,000 sats) remains fixed as the total swap volume. Activating multiple channels provides LND with multiple outbound route options and enables Multi-Path Payments (MPP) across chosen peers.
   - Cost & PPM Range: Dynamically calculates and displays the effective cost range (from the cheapest candidate's PPM up to the most expensive candidate's PPM, e.g. `3,569 – 4,570 ppm`), plus the conservative weighted MPP routing fee estimate across selected channels.
   - Bounded Routing Fee Budget (PPM Ceiling or Weighted MPP Leeway): Supports setting an explicit PPM ceiling via `--max-routing-fee <ppm>` (e.g., `4000` for `0.4%`, automatically converted to satoshis for `litloop out --max_swap_routing_fee`). When omitted, computes a conservative weighted MPP routing fee across selected channels (summing shard costs when `--amt` exceeds any single channel's drainable surplus) plus configurable leeway (`fee_leeway_pct` + `fee_leeway_base_sats`).
-  - Pre-Flight Liquidity, MPP Headroom & Safe Max Overwrite: Verifies combined drainable liquidity covers the swap amount, routing fee budget, and Loop prepay invoice, warning when multi-channel headroom drops below `10%` (where LND's power-of-2 MPP retries commonly hit channel reserve limits). When `--amt` exceeds the selected channels' safe capacity, the interactive multi-select footer previews the exact **Safe Max** swap size (accounting for routing fees, prepay, LND channel reserves, and the `10%` MPP buffer), and on confirmation offers to **overwrite `--amt` with the safe max** immediately without re-probing (recomputing routing fees and budgets automatically). Headless `--auto-approve` and non-TTY runs remain strictly fail-closed while printing the computed safe max as a `--amt` hint.
+  - Pre-Flight Liquidity, Shard-Aware MPP Headroom & Safe Max Overwrite: Verifies combined drainable liquidity covers the swap amount, routing fee budget, and Loop prepay invoice, requiring at least `20%` multi-channel MPP headroom by default (configurable via `--mpp-headroom-pct` / `[loop] mpp_headroom_pct`) and excluding "sliver" channels whose verified drainable surplus is smaller than a primary `12.5%` (`1/8`) LND power-of-2 MPP shard from effective Safe Max capacity. When `--amt` exceeds the selected channels' safe capacity, the interactive multi-select footer previews the exact **Safe Max** swap size (noting any excluded sliver channels), and on confirmation offers to **overwrite `--amt` with the safe max** immediately without re-probing (recomputing routing fees and budgets automatically). Headless `--auto-approve` and non-TTY runs remain strictly fail-closed while printing the computed safe max as a `--amt` hint.
   - Passes comma-separated channel IDs directly to `litloop out --channel <id1>,<id2>...` (native Loop daemon feature).
   - Bypasses single-channel bottlenecks, avoids stranded prepayments if a single peer experiences churn or mass channel closures, and optimizes routing path diversity.
 - **Interactive Terminal UI with Multi-Select**:
@@ -109,6 +109,8 @@ probe_steps = 2
 fee_leeway_pct = 100
 # Base satoshis buffer added to fee leeway to absorb base fees and small fluctuations (default: 500)
 fee_leeway_base_sats = 500
+# Minimum percentage liquidity headroom required on multi-channel MPP swaps (default: 20)
+mpp_headroom_pct = 20
 # Optional per-attempt off-chain payment timeout passed to litloop out (Go duration, e.g., 10m, 600s)
 # payment_timeout = 10m
 ```
@@ -170,6 +172,7 @@ python3 Other/swap_out-loop.py --history --csv
 | `--skip-prepay-probe` | `flag` | `False` | Skip active prepay probing and rely on queryroutes theoretical fees (not recommended). |
 | `--max-routing-fee`| `int` | Leeway buffer | Upper limit on off-chain routing fees in **PPM** (e.g., `4000` for `0.4%`, automatically converted to satoshis for `litloop out --max_swap_routing_fee`). Set to `0` to omit fee limit (uses Loop daemon default). |
 | `--fee-leeway-pct` | `float`| Config / `100%` | Percentage leeway added on top of estimated routing fee for max off-chain fee budget when no PPM cap is set (e.g. `100` = 2x headroom). |
+| `--mpp-headroom-pct` | `float`| Config / `20%` | Minimum percentage liquidity headroom required on multi-channel MPP swaps (excludes sliver channels `< 12.5%` shard size from effective Safe Max). |
 | `--payment-timeout` | `str` | Loop default (`1h`) | Optional per-attempt off-chain payment timeout passed to `litloop out --payment_timeout` (Go duration, e.g. `10m`, `600s`). Helps prevent canceled swaps from leaving prepay payments retrying for 1+ hour. |
 | `--max-channels` | `int` | Config / `3` | Maximum number of outgoing channels to batch in a multi-channel Loop Out. |
 | `--channel`, `--channels` | `str` | `None` | Comma-separated list of short channel IDs to target directly. |
@@ -221,7 +224,7 @@ If Loop Out swaps fail off-chain despite passing route probing:
 
 1. **Check `lnd.conf` pathfinder attempt cost (`routerrpc.attemptcostppm`)**:
    - LND defaults to `routerrpc.attemptcostppm=1000`. Setting it very low (e.g., `10`) causes LND to grind through dozens or hundreds of cheap 9–12 hop routes with dead liquidity rather than using a verified 2-hop direct channel to `LOOP` (typically `3,400–5,000 ppm`). Raising `attemptcostppm` closer to `500–1000` dramatically improves Loop Out routing convergence.
-2. **Keep ≥ 10% MPP Liquidity Headroom**:
-   - LND splits multi-channel MPP payments into power-of-2 shards (`50%`, `25%`, `12.5%`, ...) and keeps slow shards in-flight while retrying. Filling selected channels above ~90% of their combined drainable surplus frequently triggers `commitment transaction dips peer below chan reserve`. Lower `--amt` or select an additional channel.
+2. **Keep ≥ 20% Shard-Aware MPP Liquidity Headroom**:
+   - LND splits multi-channel MPP payments into power-of-2 shards (`50%`, `25%`, `12.5%`, ...) and keeps slow shards in-flight while retrying. Channels smaller than a `12.5%` (`1/8`) shard cannot reliably carry an initial MPP split, and filling the remaining channels above ~83% (`< 20%` headroom) frequently triggers `commitment transaction dips peer below chan reserve`. Accept the computed `Safe Max` or swap sliver channels for larger peers.
 3. **Avoid Stuck 1-Hour Prepay Retries**:
    - Pass `--payment-timeout 10m` (or configure `payment_timeout = 10m` under `[loop]`) so if a swap fails off-chain, `loopd` does not leave the `30,000` sat prepay payment retrying for an hour after the swap is already canceled.

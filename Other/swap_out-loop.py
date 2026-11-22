@@ -45,6 +45,8 @@ DEFAULT_PREPAY_SATS = 30_000
 DEFAULT_PROBE_STEPS = 2
 MAX_PROBE_STEPS = 4
 DEFAULT_MAX_THREE_HOP_BRIDGES = 2
+DEFAULT_MPP_HEADROOM_PCT = 20.0
+MPP_MIN_SHARD_FRACTION = 0.125  # 1/8th shard: LND primary power-of-2 MPP splits (50%, 25%, 12.5%)
 PAYMENT_TIMEOUT_RE = re.compile(r"^[1-9]\d*[smh]$")
 
 # ANSI Color Codes
@@ -1261,6 +1263,7 @@ def interactive_menu_select(
     config: Optional[Any] = None,
     explicit_max_routing_fee_ppm: Optional[int] = None,
     explicit_leeway_pct: Optional[float] = None,
+    mpp_headroom_pct: Optional[float] = None,
 ) -> Optional[Union[Dict[str, Any], List[Dict[str, Any]]]]:
     """
     Renders an interactive CLI terminal menu with arrow-key navigation,
@@ -1401,6 +1404,7 @@ def interactive_menu_select(
                 explicit_max_routing_fee_ppm=explicit_max_routing_fee_ppm,
                 explicit_leeway_pct=explicit_leeway_pct,
                 prepay_amt=sel_prepay,
+                mpp_headroom_pct=mpp_headroom_pct,
             )
             ppms = [c["effective_ppm"] for c in sel_list]
             costs = [scale_cost_to_swap_amt(c, swap_size) for c in sel_list]
@@ -1411,10 +1415,17 @@ def interactive_menu_select(
 
             safe_max_note = ""
             if safe_max < swap_size:
+                ref_amt = safe_max if safe_max >= MIN_LOOP_OUT_SATS else swap_size
+                _, footer_slivers = calculate_effective_mpp_liquidity(sel_list, ref_amt)
+                sliver_tag = (
+                    f" (excl. {len(footer_slivers)} small chan <{MPP_MIN_SHARD_FRACTION * 100:g}%)"
+                    if footer_slivers
+                    else ""
+                )
                 if safe_max >= MIN_LOOP_OUT_SATS:
-                    safe_max_note = f" | Safe Max: {safe_max:,} sats"
+                    safe_max_note = f" | Safe Max: {safe_max:,} sats{sliver_tag}"
                 else:
-                    safe_max_note = f" | Safe Max: < {MIN_LOOP_OUT_SATS:,} sats"
+                    safe_max_note = f" | Safe Max: < {MIN_LOOP_OUT_SATS:,} sats{sliver_tag}"
 
             print_color(
                 f"Multi-Select Active ({len(selected_indices)} chans): Fixed Swap Size {swap_size:,} sats "
@@ -1558,20 +1569,70 @@ def validate_payment_timeout(payment_timeout: Optional[str]) -> Optional[str]:
     return cleaned
 
 
+def calculate_effective_mpp_liquidity(
+    selected_channels: List[Dict[str, Any]],
+    total_swap_amt: int,
+    min_shard_fraction: float = MPP_MIN_SHARD_FRACTION,
+) -> Tuple[int, List[Dict[str, Any]]]:
+    """
+    Computes usable drainable liquidity for MPP splitting alongside any "sliver" channels.
+
+    LND's MPP splitter partitions payments into power-of-2 shards (50%, 25%, 12.5%, ...).
+    On multi-channel swaps (len > 1), any channel whose verified drainable surplus is smaller
+    than a primary 1/8th shard (total_swap_amt * min_shard_fraction) cannot reliably absorb
+    its share of the initial split and is excluded from effective MPP capacity (treated as
+    bonus route diversity instead of counted toward Safe Max).
+
+    Single-channel swaps never use MPP sharding and always return (total_drainable, []).
+    """
+    if not selected_channels:
+        return 0, []
+
+    if len(selected_channels) == 1:
+        only_surplus = int(selected_channels[0].get("drainable_surplus", selected_channels[0].get("proposed_amt", 0)))
+        return max(0, only_surplus), []
+
+    min_shard_sats = int(max(0, total_swap_amt) * max(0.0, min_shard_fraction))
+    effective_drainable = 0
+    sliver_channels: List[Dict[str, Any]] = []
+    for c in selected_channels:
+        surplus = max(0, int(c.get("drainable_surplus", c.get("proposed_amt", 0))))
+        if surplus < min_shard_sats:
+            sliver_channels.append(c)
+        else:
+            effective_drainable += surplus
+    return effective_drainable, sliver_channels
+
+
+def _get_config_mpp_headroom_pct(config: Any) -> float:
+    """Reads [loop] mpp_headroom_pct from config, defaulting to DEFAULT_MPP_HEADROOM_PCT (20%)."""
+    raw = get_config_val(config, "loop", "mpp_headroom_pct", DEFAULT_MPP_HEADROOM_PCT)
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_MPP_HEADROOM_PCT
+    return float(raw)
+
+
 def validate_multi_channel_liquidity(
     selected_channels: List[Dict[str, Any]],
     total_swap_amt: int,
     max_routing_fee_sats: int,
     prepay_amt: int = DEFAULT_PREPAY_SATS,
+    mpp_headroom_pct: float = DEFAULT_MPP_HEADROOM_PCT,
 ) -> Dict[str, Any]:
     """
     Validates that selected outbound channel(s) have enough combined drainable liquidity
-    for the swap amount, routing fee budget, and Loop prepay invoice (with MPP headroom).
+    for the swap amount, routing fee budget, and Loop prepay invoice (with shard-aware MPP headroom).
     Note: drainable_surplus already excludes a conservative 5% (min 100k sat) per-channel reserve.
     """
+    if not math.isfinite(mpp_headroom_pct) or mpp_headroom_pct < 0:
+        raise ValueError("mpp_headroom_pct must be a finite number >= 0")
+
     total_drainable = sum(
         int(c.get("drainable_surplus", c.get("proposed_amt", 0)))
         for c in selected_channels
+    )
+    effective_drainable, sliver_channels = calculate_effective_mpp_liquidity(
+        selected_channels, total_swap_amt
     )
     fee_sats = max(0, max_routing_fee_sats)
     prepay_sats = max(0, prepay_amt)
@@ -1593,6 +1654,9 @@ def validate_multi_channel_liquidity(
             "ok": False,
             "severity": "error",
             "total_drainable": total_drainable,
+            "effective_drainable": effective_drainable,
+            "sliver_channels": sliver_channels,
+            "mpp_headroom_pct": mpp_headroom_pct,
             "required_sats": recommended_required,
             "headroom_sats": headroom_sats,
             "utilization_pct": utilization_pct,
@@ -1608,6 +1672,9 @@ def validate_multi_channel_liquidity(
             "ok": False,
             "severity": "error",
             "total_drainable": total_drainable,
+            "effective_drainable": effective_drainable,
+            "sliver_channels": sliver_channels,
+            "mpp_headroom_pct": mpp_headroom_pct,
             "required_sats": recommended_required,
             "headroom_sats": raw_spendable - recommended_required,
             "utilization_pct": (recommended_required / raw_spendable * 100.0) if raw_spendable > 0 else 100.0,
@@ -1618,27 +1685,54 @@ def validate_multi_channel_liquidity(
             ),
         }
 
-    # For multi-channel MPP swaps, LND splits in power-of-2 shards and holds concurrent retries
-    # in-flight; < 10% aggregate headroom frequently triggers channel reserve failures.
-    if len(selected_channels) > 1 and total_drainable < int(recommended_required * 1.10):
+    # For multi-channel MPP swaps, LND splits in power-of-2 shards (50%, 25%, 12.5%) and holds
+    # concurrent retries in-flight; insufficient headroom or sliver channels (< 12.5% shard size)
+    # frequently trigger `commitment transaction dips peer below chan reserve` failures.
+    headroom_mult = 1.0 + (mpp_headroom_pct / 100.0)
+    required_with_headroom = round(recommended_required * headroom_mult)
+    if len(selected_channels) > 1 and effective_drainable < required_with_headroom:
+        eff_utilization_pct = (recommended_required / effective_drainable * 100.0) if effective_drainable > 0 else 100.0
+        eff_headroom_sats = effective_drainable - recommended_required
+        if sliver_channels:
+            sliver_desc = ", ".join(
+                f"{c.get('alias') or c.get('chan_id', '?')} "
+                f"({int(c.get('drainable_surplus', c.get('proposed_amt', 0))):,} sat)"
+                for c in sliver_channels
+            )
+            msg = (
+                f"Tight MPP liquidity headroom: {effective_drainable:,} sats effective drainable "
+                f"(excluding {len(sliver_channels)} sliver channel(s) < {MPP_MIN_SHARD_FRACTION * 100:g}% shard: {sliver_desc}) "
+                f"vs {recommended_required:,} sats needed (swap + fee budget + {prepay_sats:,} sat prepay; "
+                f"{eff_utilization_pct:.1f}% utilized; needs ≥{mpp_headroom_pct:g}% headroom). "
+                "LND MPP retries may hit channel reserve limits; consider lowering --amt or swapping sliver channels for larger peers."
+            )
+        else:
+            msg = (
+                f"Tight MPP liquidity headroom: {total_drainable:,} sats drainable vs {recommended_required:,} sats "
+                f"needed (swap + fee budget + {prepay_sats:,} sat prepay; {utilization_pct:.1f}% utilized; "
+                f"needs ≥{mpp_headroom_pct:g}% headroom). "
+                "LND MPP retries may hit channel reserve limits; consider lowering --amt or adding another channel."
+            )
         return {
             "ok": True,
             "severity": "warning",
             "total_drainable": total_drainable,
+            "effective_drainable": effective_drainable,
+            "sliver_channels": sliver_channels,
+            "mpp_headroom_pct": mpp_headroom_pct,
             "required_sats": recommended_required,
-            "headroom_sats": headroom_sats,
-            "utilization_pct": utilization_pct,
-            "message": (
-                f"Tight MPP liquidity headroom: {total_drainable:,} sats drainable vs {recommended_required:,} sats "
-                f"needed (swap + fee budget + {prepay_sats:,} sat prepay; {utilization_pct:.1f}% utilized). "
-                "LND MPP retries may hit channel reserve limits; consider lowering --amt or adding another channel."
-            ),
+            "headroom_sats": eff_headroom_sats,
+            "utilization_pct": eff_utilization_pct,
+            "message": msg,
         }
 
     return {
         "ok": True,
         "severity": "ok",
         "total_drainable": total_drainable,
+        "effective_drainable": effective_drainable,
+        "sliver_channels": sliver_channels,
+        "mpp_headroom_pct": mpp_headroom_pct,
         "required_sats": recommended_required,
         "headroom_sats": headroom_sats,
         "utilization_pct": utilization_pct,
@@ -1652,15 +1746,25 @@ def calculate_safe_max_swap_size(
     explicit_max_routing_fee_ppm: Optional[int] = None,
     explicit_leeway_pct: Optional[float] = None,
     prepay_amt: int = DEFAULT_PREPAY_SATS,
+    mpp_headroom_pct: Optional[float] = None,
 ) -> int:
     """
     Computes the exact maximum swap size (in satoshis) for selected_channels that passes
     validate_multi_channel_liquidity() with severity == "ok" — accounting for routing fee
     budget (PPM ceiling, unbounded probed fee, or leeway), Loop prepay, raw LND channel
-    reserves, and the 10% multi-channel MPP headroom buffer.
+    reserves, shard-aware sliver exclusion (<12.5% shard size), and configurable
+    multi-channel MPP headroom (default 20%).
 
     Returns 0 if even MIN_LOOP_OUT_SATS cannot safely fit.
     """
+    eff_headroom_pct = (
+        float(mpp_headroom_pct)
+        if mpp_headroom_pct is not None
+        else _get_config_mpp_headroom_pct(config)
+    )
+    if not math.isfinite(eff_headroom_pct) or eff_headroom_pct < 0:
+        raise ValueError("mpp_headroom_pct must be a finite number >= 0")
+
     if not selected_channels:
         return 0
 
@@ -1687,6 +1791,7 @@ def calculate_safe_max_swap_size(
             total_swap_amt=amt,
             max_routing_fee_sats=eff_fee,
             prepay_amt=prepay_amt,
+            mpp_headroom_pct=eff_headroom_pct,
         )
         return bool(check["ok"] and check["severity"] == "ok")
 
@@ -2098,6 +2203,12 @@ def parse_arguments() -> argparse.Namespace:
         help="Percentage leeway added on top of probed routing fee for max off-chain fee limit (default from config or 100%%).",
     )
     parser.add_argument(
+        "--mpp-headroom-pct",
+        type=float,
+        default=None,
+        help=f"Minimum percentage liquidity headroom required on multi-channel MPP swaps (default from config or {DEFAULT_MPP_HEADROOM_PCT:g}%%).",
+    )
+    parser.add_argument(
         "--payment-timeout",
         type=str,
         default=None,
@@ -2295,6 +2406,19 @@ def main():
         cfg_pt = get_config_val(config, "loop", "payment_timeout", "").strip()
         payment_timeout = cfg_pt or None
     show_pubkey = bool(getattr(args, "pubkey", False))
+    raw_mpp_headroom = getattr(args, "mpp_headroom_pct", None)
+    if isinstance(raw_mpp_headroom, (int, float)) and not isinstance(raw_mpp_headroom, bool):
+        mpp_headroom_pct = float(raw_mpp_headroom)
+    else:
+        try:
+            mpp_headroom_pct = _get_config_mpp_headroom_pct(config)
+        except ValueError:
+            print_color("Error: [loop] mpp_headroom_pct must be a valid number >= 0.", Colors.FAIL, bold=True)
+            sys.exit(1)
+
+    if not math.isfinite(mpp_headroom_pct) or mpp_headroom_pct < 0:
+        print_color("Error: --mpp-headroom-pct must be a finite number >= 0.", Colors.FAIL, bold=True)
+        sys.exit(1)
 
     if probe_steps < 0 or probe_steps > MAX_PROBE_STEPS:
         print_color(f"Error: --probe-steps must be between 0 and {MAX_PROBE_STEPS}.", Colors.FAIL, bold=True)
@@ -2456,6 +2580,7 @@ def main():
             config=config,
             explicit_max_routing_fee_ppm=args.max_routing_fee,
             explicit_leeway_pct=args.fee_leeway_pct,
+            mpp_headroom_pct=mpp_headroom_pct,
         )
 
     if not selected:
@@ -2536,6 +2661,7 @@ def main():
         total_swap_amt=total_swap_amt,
         max_routing_fee_sats=effective_fee_for_liquidity,
         prepay_amt=prepay_amt,
+        mpp_headroom_pct=mpp_headroom_pct,
     )
 
     safe_max_amt = 0
@@ -2547,13 +2673,25 @@ def main():
             explicit_max_routing_fee_ppm=args.max_routing_fee,
             explicit_leeway_pct=args.fee_leeway_pct,
             prepay_amt=prepay_amt,
+            mpp_headroom_pct=mpp_headroom_pct,
         )
 
         # In interactive TTY sessions, offer to overwrite total_swap_amt with the computed safe max
         # instead of failing or running with risky tight MPP headroom.
         if not args.auto_approve and sys.stdin.isatty() and MIN_LOOP_OUT_SATS <= safe_max_amt < total_swap_amt:
             overwritten_amt = False
-            buffer_note = " + 10% MPP headroom" if len(selected_channels) > 1 else ""
+            _, safe_slivers = calculate_effective_mpp_liquidity(selected_channels, safe_max_amt)
+            sliver_note = ""
+            if safe_slivers:
+                sliver_names = ", ".join(c.get("alias") or str(c.get("chan_id", "?")) for c in safe_slivers)
+                sliver_note = (
+                    f"; excluding sliver chan(s) <{MPP_MIN_SHARD_FRACTION * 100:g}% shard: {sliver_names}"
+                )
+            buffer_note = (
+                f" + {mpp_headroom_pct:g}% MPP headroom{sliver_note}"
+                if len(selected_channels) > 1
+                else ""
+            )
             if not liq_check["ok"]:
                 print_color(f"\nLiquidity Notice: {liq_check['message']}", Colors.WARNING, bold=True)
                 print_color(
@@ -2578,7 +2716,8 @@ def main():
             else:
                 print_color(f"\nWarning: {liq_check['message']}", Colors.WARNING, bold=True)
                 print_color(
-                    f"Recommended safe max swap size (with ≥10% MPP headroom): {safe_max_amt:,} sats",
+                    f"Recommended safe max swap size (with ≥{mpp_headroom_pct:g}% MPP headroom{sliver_note}): "
+                    f"{safe_max_amt:,} sats",
                     Colors.OKCYAN,
                     bold=True,
                 )
@@ -2616,6 +2755,7 @@ def main():
                     total_swap_amt=total_swap_amt,
                     max_routing_fee_sats=effective_fee_for_liquidity,
                     prepay_amt=prepay_amt,
+                    mpp_headroom_pct=mpp_headroom_pct,
                 )
                 print_color(
                     f"✓ Adjusted Swap Size: {total_swap_amt:,} sats "
@@ -2668,7 +2808,7 @@ def main():
         print_color(f"Warning: {liq_check['message']}", Colors.WARNING, bold=True)
         if safe_max_amt >= MIN_LOOP_OUT_SATS:
             print_color(
-                f"Hint: Maximum safe swap size with ≥10% MPP headroom is {safe_max_amt:,} sats.",
+                f"Hint: Maximum safe swap size with ≥{mpp_headroom_pct:g}% MPP headroom is {safe_max_amt:,} sats.",
                 Colors.OKCYAN,
             )
 

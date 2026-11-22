@@ -2102,7 +2102,7 @@ def _sample_three_channel_debian_nuc_set():
 
 
 def test_calculate_safe_max_swap_size_multi_channel_ppm_mode():
-    """Verify binary-search safe max swap size is the exact maximum passing severity=='ok' with 10% MPP buffer."""
+    """Verify binary-search safe max swap size is the exact maximum passing severity=='ok' with 20% MPP buffer + sliver exclusion."""
     channels = _sample_three_channel_debian_nuc_set()
     cfg = configparser.ConfigParser()
     safe_max = swap_out_loop.calculate_safe_max_swap_size(
@@ -2111,8 +2111,9 @@ def test_calculate_safe_max_swap_size_multi_channel_ppm_mode():
         explicit_max_routing_fee_ppm=4500,
         prepay_amt=30_000,
     )
-    # 17,361,135 / 1.10 ~= 15,782,850 minus 30k prepay and ~4500 ppm fee ~= 15,682,xxx
-    assert 15_600_000 <= safe_max <= 15_750_000
+    # Volarte (1.41M) < 12.5% shard (~1.65M) -> excluded; Garlic (9.39M) + Sunny Sarah (6.56M) = 15,955,104
+    # 15,955,104 / 1.20 ~= 13,295,920 minus 30k prepay and ~4500 ppm fee ~= 13,206,xxx
+    assert 13_150_000 <= safe_max <= 13_300_000
 
     # Verify safe_max passes with severity == "ok" and safe_max + 1 does not
     rf_ok = swap_out_loop.calculate_max_routing_fee_budget(
@@ -2152,7 +2153,7 @@ def test_calculate_safe_max_swap_size_unbounded_and_leeway_modes():
         explicit_max_routing_fee_ppm=None,
         prepay_amt=30_000,
     )
-    assert max_unbounded > max_leeway > 15_000_000
+    assert max_unbounded > max_leeway > 13_000_000
 
     # Both must pass validate_multi_channel_liquidity with severity == "ok"
     est_u, _ = swap_out_loop.estimate_multi_channel_routing_fee(channels, max_unbounded)
@@ -2164,7 +2165,7 @@ def test_calculate_safe_max_swap_size_unbounded_and_leeway_modes():
 
 
 def test_calculate_safe_max_swap_size_single_channel_and_below_min():
-    """Single channel has no extra 10% MPP buffer; tiny channels unable to meet MIN_LOOP_OUT_SATS return 0."""
+    """Single channel has no extra MPP buffer; tiny channels unable to meet MIN_LOOP_OUT_SATS return 0."""
     single = [
         {
             "capacity": 10_000_000,
@@ -2436,3 +2437,226 @@ def test_interactive_menu_select_tty_displays_safe_max_footer(capsys):
     assert len(selected) == 3
     out = capsys.readouterr().out
     assert f"Safe Max: {expected_safe_max:,} sats" in out
+
+
+def test_calculate_effective_mpp_liquidity_excludes_sliver_channels():
+    """Channels below 12.5% (1/8) of swap_amt are excluded as slivers on multi-channel swaps, never on single-channel."""
+    channels = _sample_three_channel_debian_nuc_set()
+    # Replace Volarte with exact debian-nuc stepped-down amount 1,237,072
+    channels[2]["drainable_surplus"] = 1_237_072
+    channels[2]["proposed_amt"] = 1_237_072
+
+    eff, slivers = swap_out_loop.calculate_effective_mpp_liquidity(channels, 15_529_369)
+    # 12.5% of 15,529,369 = 1,941,171 > 1,237,072 -> Volarte excluded
+    assert eff == 9_392_866 + 6_562_238
+    assert [c["alias"] for c in slivers] == ["Volarte"]
+
+    # When 3 full-size channels (Sunny Sarah + Garlic + TACO) are selected for 18M, none are slivers
+    three_large = [
+        channels[0],
+        channels[1],
+        {
+            "chan_id": "997409878668541953",
+            "alias": "TACO",
+            "drainable_surplus": 9_240_560,
+            "proposed_amt": 9_240_560,
+        },
+    ]
+    eff_large, slivers_large = swap_out_loop.calculate_effective_mpp_liquidity(three_large, 18_000_000)
+    assert eff_large == 9_392_866 + 6_562_238 + 9_240_560
+    assert slivers_large == []
+
+    # Single-channel swap never excludes the channel
+    eff_single, slivers_single = swap_out_loop.calculate_effective_mpp_liquidity([channels[2]], 1_237_072)
+    assert eff_single == 1_237_072
+    assert slivers_single == []
+
+
+def test_validate_multi_channel_liquidity_sliver_and_custom_headroom():
+    """Default 20% headroom + sliver exclusion warns with sliver alias; custom mpp_headroom_pct works; negative raises."""
+    channels = _sample_three_channel_debian_nuc_set()
+    channels[2]["drainable_surplus"] = 1_237_072
+    channels[2]["proposed_amt"] = 1_237_072
+
+    # 15,529,369 (which previously passed 10% without sliver exclusion) must now warn and name Volarte
+    res = swap_out_loop.validate_multi_channel_liquidity(
+        selected_channels=channels,
+        total_swap_amt=15_529_369,
+        max_routing_fee_sats=69_882,
+        prepay_amt=30_000,
+    )
+    assert res["ok"] is True
+    assert res["severity"] == "warning"
+    assert "Volarte" in res["message"]
+    assert res["effective_drainable"] == 9_392_866 + 6_562_238
+    assert len(res["sliver_channels"]) == 1
+
+    # Custom 10% headroom on two large channels: 22.76M total vs 20.5M * 1.10 = 22.55M -> ok at 10%, warning at 20%
+    two_large = [
+        {"alias": "A", "drainable_surplus": 13_380_136, "proposed_amt": 13_380_136},
+        {"alias": "B", "drainable_surplus": 9_385_344, "proposed_amt": 9_385_344},
+    ]
+    res_10 = swap_out_loop.validate_multi_channel_liquidity(two_large, 20_400_000, 80_000, 30_000, mpp_headroom_pct=10.0)
+    res_20 = swap_out_loop.validate_multi_channel_liquidity(two_large, 20_400_000, 80_000, 30_000, mpp_headroom_pct=20.0)
+    assert res_10["severity"] == "ok"
+    assert res_20["severity"] == "warning"
+
+    with pytest.raises(ValueError, match="mpp_headroom_pct"):
+        swap_out_loop.validate_multi_channel_liquidity(two_large, 10_000_000, 40_000, 30_000, mpp_headroom_pct=-5.0)
+
+
+def test_calculate_safe_max_swap_size_debian_nuc_regression_and_three_large_channels():
+    """Exact failed debian-nuc set drops to ~13.2M safe max; replacing sliver Volarte with TACO clears full 18M."""
+    channels = _sample_three_channel_debian_nuc_set()
+    channels[2]["drainable_surplus"] = 1_237_072
+    channels[2]["proposed_amt"] = 1_237_072
+    cfg = configparser.ConfigParser()
+
+    safe_with_sliver = swap_out_loop.calculate_safe_max_swap_size(
+        selected_channels=channels,
+        config=cfg,
+        explicit_max_routing_fee_ppm=4500,
+        prepay_amt=30_000,
+    )
+    assert 13_150_000 <= safe_with_sliver <= 13_250_000
+
+    # Replace Volarte with TACO (9.24M, 4,471 ppm) -> full 18M easily fits with >=20% MPP headroom
+    three_large = [
+        channels[0],
+        channels[1],
+        {
+            "chan_id": "997409878668541953",
+            "alias": "TACO",
+            "remote_pubkey": "03taco",
+            "capacity": 10_000_000,
+            "local_balance": 9_740_560,
+            "proposed_amt": 9_240_560,
+            "drainable_surplus": 9_240_560,
+            "routing_fee": 41_310,
+            "routing_ppm": 4_471,
+            "prepay_amt": 30_000,
+            "total_cost": 50_746,
+            "effective_ppm": 5_492,
+        },
+    ]
+    safe_three_large = swap_out_loop.calculate_safe_max_swap_size(
+        selected_channels=three_large,
+        config=cfg,
+        explicit_max_routing_fee_ppm=4500,
+        prepay_amt=30_000,
+    )
+    assert safe_three_large > 20_000_000
+    check_18m = swap_out_loop.validate_multi_channel_liquidity(
+        selected_channels=three_large,
+        total_swap_amt=18_000_000,
+        max_routing_fee_sats=swap_out_loop.ppm_to_sats(18_000_000, 4500),
+        prepay_amt=30_000,
+    )
+    assert check_18m["ok"] is True
+    assert check_18m["severity"] == "ok"
+
+
+def test_calculate_safe_max_swap_size_config_and_sliver_boundary_monotonicity():
+    """Config [loop] mpp_headroom_pct, CLI override, and sliver transition boundary preserve exact binary-search parity."""
+    channels = _sample_three_channel_debian_nuc_set()
+    # Set 3rd channel to 1,700,000 so it is usable up to 13,600,000 (12.5% = 1,700,000) and sliver above it
+    channels[2]["drainable_surplus"] = 1_700_000
+    channels[2]["proposed_amt"] = 1_700_000
+
+    cfg = configparser.ConfigParser()
+    cfg.add_section("loop")
+    cfg.set("loop", "mpp_headroom_pct", "20")
+
+    safe_20 = swap_out_loop.calculate_safe_max_swap_size(
+        selected_channels=channels,
+        config=cfg,
+        explicit_max_routing_fee_ppm=4500,
+        prepay_amt=30_000,
+    )
+    # At 13,600,000: 12.5% == 1,700,000 -> all 3 channels usable (17.65M / 1.20 = 14.71M > 13.69M -> ok!)
+    # At 13,600,001: 12.5% == 1,700,000 (int truncation -> still usable until 13,600,008!), then drops out
+    est_ok, _ = swap_out_loop.estimate_multi_channel_routing_fee(channels, safe_20)
+    rf_ok = swap_out_loop.calculate_max_routing_fee_budget(est_ok, cfg, swap_amt=safe_20, explicit_max_routing_fee_ppm=4500)
+    assert swap_out_loop.validate_multi_channel_liquidity(channels, safe_20, rf_ok, 30_000, mpp_headroom_pct=20.0)["severity"] == "ok"
+
+    est_over, _ = swap_out_loop.estimate_multi_channel_routing_fee(channels, safe_20 + 1)
+    rf_over = swap_out_loop.calculate_max_routing_fee_budget(est_over, cfg, swap_amt=safe_20 + 1, explicit_max_routing_fee_ppm=4500)
+    assert swap_out_loop.validate_multi_channel_liquidity(channels, safe_20 + 1, rf_over, 30_000, mpp_headroom_pct=20.0)["severity"] != "ok"
+
+    # Explicit override to 10% allows a higher safe max than config 20%
+    safe_10 = swap_out_loop.calculate_safe_max_swap_size(
+        selected_channels=channels,
+        config=cfg,
+        explicit_max_routing_fee_ppm=4500,
+        prepay_amt=30_000,
+        mpp_headroom_pct=10.0,
+    )
+    assert safe_10 > safe_20
+
+
+def test_parse_arguments_and_main_mpp_headroom_pct_validation():
+    """Verify --mpp-headroom-pct CLI parsing and fail-fast exit 1 on negative values."""
+    with patch("sys.argv", ["swap_out-loop.py", "--mpp-headroom-pct", "15"]):
+        args = swap_out_loop.parse_arguments()
+        assert args.mpp_headroom_pct == 15.0
+
+    with patch("sys.argv", ["swap_out-loop.py"]):
+        args_default = swap_out_loop.parse_arguments()
+        assert args_default.mpp_headroom_pct is None
+
+    mock_args = MagicMock()
+    mock_args.history = False
+    mock_args.capacity = None
+    mock_args.fee_limit = None
+    mock_args.min_ratio = None
+    mock_args.amt = 5_000_000
+    mock_args.conf_target = 6
+    mock_args.max_routing_fee = None
+    mock_args.fee_leeway_pct = None
+    mock_args.dest_addr = None
+    mock_args.dry_run = True
+    mock_args.auto_approve = False
+    mock_args.max_channels = 3
+    mock_args.channel = None
+    mock_args.workers = 1
+    mock_args.probe_timeout = 15
+    mock_args.skip_prepay_probe = False
+    mock_args.payment_timeout = None
+    mock_args.pubkey = False
+    mock_args.probe_steps = 2
+    mock_args.mpp_headroom_pct = -10.0
+
+    with patch.object(swap_out_loop, "parse_arguments", return_value=mock_args), \
+         patch.object(swap_out_loop, "load_config", return_value=(configparser.ConfigParser(), "/tmp")), \
+         patch.object(swap_out_loop, "setup_logger", return_value=MagicMock()), \
+         patch.object(swap_out_loop, "fetch_channels_lndg") as mock_fetch:
+        with pytest.raises(SystemExit) as exc_info:
+            swap_out_loop.main()
+        assert exc_info.value.code == 1
+        mock_fetch.assert_not_called()
+
+
+def test_interactive_menu_select_tty_displays_sliver_note_in_safe_max_footer(capsys):
+    """Multi-select TTY footer notes excluded sliver channels when Safe Max drops due to <12.5% shard filter."""
+    channels = _sample_three_channel_debian_nuc_set()
+    channels[2]["drainable_surplus"] = 1_237_072
+    channels[2]["proposed_amt"] = 1_237_072
+    expected_safe_max = swap_out_loop.calculate_safe_max_swap_size(
+        selected_channels=channels,
+        config={},
+        explicit_max_routing_fee_ppm=4500,
+        prepay_amt=30_000,
+    )
+    with patch("sys.stdin.isatty", return_value=True), \
+         patch.object(swap_out_loop, "read_single_keypress", side_effect=["a", "\r"]):
+        selected = swap_out_loop.interactive_menu_select(
+            channels,
+            target_amt=18_000_000,
+            max_channels=3,
+            config={},
+            explicit_max_routing_fee_ppm=4500,
+        )
+    assert len(selected) == 3
+    out = capsys.readouterr().out
+    assert f"Safe Max: {expected_safe_max:,} sats" in out
+    assert "<12.5%" in out
