@@ -120,6 +120,8 @@ target_local_ratio = 50
 workers = 1
 # Timeout in seconds for individual route prepay probes (default: 15)
 probe_timeout = 15
+# Maximum iterative halving step-downs when a full-size probe fails (0 to disable, default: 2 for 100% -> 50% -> 25%)
+probe_steps = 2
 # Optional default max off-chain routing fee ceiling in PPM (e.g. 4000 for 0.4%). Leave unset to use fee_leeway_pct.
 # max_routing_fee_ppm = 4000
 # Percentage leeway added on top of probed routing fee for max off-chain fee limit (default: 100 for +100% / 2x headroom)
