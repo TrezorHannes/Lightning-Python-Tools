@@ -128,6 +128,8 @@ probe_steps = 2
 fee_leeway_pct = 100
 # Base satoshis buffer added to fee leeway to absorb base fees and small fluctuations (default: 500)
 fee_leeway_base_sats = 500
+# Minimum percentage liquidity headroom required on multi-channel MPP swaps (default: 20)
+mpp_headroom_pct = 20
 # Optional per-attempt off-chain payment timeout passed to litloop out (Go duration, e.g. 10m, 600s)
 # payment_timeout = 10m
 # Maximum number of outgoing channels to batch in a multi-channel Loop Out (default: 3)
