@@ -157,17 +157,15 @@ chmod 600 config.ini Magma/magma_config.ini feeConfig.json wallets.json
 
 ## Running as Background Services
 
-### Automated Systemd Service Installers
-Helper scripts are included to generate and enable `systemd` oneshot services and timers (pre-configured with OS CA trust bundle environment variables):
+### Unified Service & Scheduler Installer
+Use the interactive CLI manager (`./install.sh`) to set up `.venv`, copy/harden configs (`chmod 600`), and generate `systemd` services/timers or `cron` jobs (pre-configured with OS CA trust bundle environment variables):
 
 ```bash
-# Install hourly fee_adjuster.service + fee_adjuster.timer
-chmod +x Other/install_fee_adjuster_service.sh
-sudo ./Other/install_fee_adjuster_service.sh
+chmod +x install.sh
+./install.sh
 
-# Install scheduled pocketmoney.service + pocketmoney.timer (reads [Schedule] from config.ini)
-chmod +x LNBits/install_pocketmoney_service.sh
-sudo ./LNBits/install_pocketmoney_service.sh
+# Or install non-interactively via CLI:
+./install.sh install fee-adjuster pocketmoney --scheduler systemd --accept-disclaimer
 ```
 
 ### Systemd Daemon Example
