@@ -65,7 +65,7 @@ This document serves as an architectural, operational, and development guide for
 
 | File | Type | Description |
 | :--- | :--- | :--- |
-| `fee_adjuster.py` | Systemd Timer / Cronjob | **Dynamic Liquidity Fee Controller**: Adjusts outbound and inbound channel fees using Amboss Space statistics, 5-band liquidity curves, and stuck-channel decay, with `charge-lnd` export and inbound discount protection. Documented in `Other/fee_adjuster.md`; systemd installer in `Other/install_fee_adjuster_service.sh`. |
+| `fee_adjuster.py` | Systemd Timer / Cronjob | **Dynamic Liquidity Fee Controller**: Adjusts outbound and inbound channel fees using Amboss Space statistics, 5-band liquidity curves, and stuck-channel decay, with `charge-lnd` export and inbound discount protection. Documented in `Other/fee_adjuster.md`; managed via `./install.sh` (`lpt_installer`). |
 | `rebalance_guard.py` | Cronjob / CLI | **Standalone Rebalance Guard**: Audits all open LNDg channels across native Auto-Fees and `fee_adjuster.py`. Locks `ar_out_target = 100%` when an inbound discount is active and restores baseline targets (`data/rebalance_targets_baseline.json`) via dynamic hysteresis once liquidity recovers. |
 | `swap_out-loop.py` | CLI Tool | **Economically Optimized Loop Out**: Ranks channels by net effective PPM, runs live fake-hash prepay route probes (with 2-hop direct Loop fallback), supports multi-channel MPP selection (`litloop` / `loopd`), interactive TTY multi-select, and native `loop_sqlite.db` history/CSV accounting. Documented in `Other/swap_out-loop.md`. |
 | `boltz_swap-out.py` | CLI Tool | Executes reverse submarine swaps (Lightning to Liquid L-BTC) via `boltzd` / `boltzcli` using LNDg candidate channels, multi-batch payment retries, and `--debug` dry-run mode. |
@@ -78,7 +78,7 @@ This document serves as an architectural, operational, and development guide for
 
 | File | Type | Description |
 | :--- | :--- | :--- |
-| `pocketmoney.py` | Systemd Timer / Daemon | Distributes scheduled fiat-denominated satoshi allowances from a parent LNbits wallet to child wallets defined in `wallets.json` (`--run-once` supported). Systemd timer installer in `LNBits/install_pocketmoney_service.sh`. |
+| `pocketmoney.py` | Systemd Timer / Daemon | Distributes scheduled fiat-denominated satoshi allowances from a parent LNbits wallet to child wallets defined in `wallets.json` (`--run-once` supported). Managed via `./install.sh` (`lpt_installer`). |
 
 ---
 

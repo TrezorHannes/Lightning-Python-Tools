@@ -1,10 +1,19 @@
 """Regression tests for CA trust store hardening (eMudhra / certifi>=2026.10.19)."""
 
-from pathlib import Path
+from __future__ import annotations
+
 import re
+from pathlib import Path
 
 import certifi
 
+from lpt_installer.registry import TOOLS
+from lpt_installer.scheduler import (
+    DEFAULT_CA_BUNDLE,
+    render_cron_entry,
+    render_systemd_service,
+    upsert_cron_block,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -50,17 +59,32 @@ def test_requirements_pins_and_installed_hardened_tls_dependencies():
     )
 
 
-def test_systemd_installers_export_os_ca_bundle():
-    """Systemd service installers must bind SSL_CERT_FILE and REQUESTS_CA_BUNDLE to the OS trust store."""
-    installers = [
-        REPO_ROOT / "LNBits" / "install_pocketmoney_service.sh",
-        REPO_ROOT / "Other" / "install_fee_adjuster_service.sh",
-    ]
-    for script in installers:
-        content = script.read_text(encoding="utf-8")
-        assert 'Environment="SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"' in content, (
-            f"{script.name} missing SSL_CERT_FILE systemd Environment directive"
-        )
-        assert 'Environment="REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt"' in content, (
-            f"{script.name} missing REQUESTS_CA_BUNDLE systemd Environment directive"
-        )
+def test_unified_systemd_and_cron_generators_export_os_ca_bundle():
+    """Every systemd unit and managed cron block must bind SSL_CERT_FILE and REQUESTS_CA_BUNDLE."""
+    for tool in TOOLS:
+        for mode in tool.supported_modes:
+            if mode not in ("systemd-service", "systemd-timer"):
+                continue
+            unit_text = render_systemd_service(
+                tool,
+                REPO_ROOT,
+                user="admin",
+                group="admin",
+                ca_bundle=DEFAULT_CA_BUNDLE,
+                mode=mode,
+            )
+            assert f'Environment="SSL_CERT_FILE={DEFAULT_CA_BUNDLE}"' in unit_text, (
+                f"{tool.id} ({mode}) missing SSL_CERT_FILE systemd Environment directive"
+            )
+            assert f'Environment="REQUESTS_CA_BUNDLE={DEFAULT_CA_BUNDLE}"' in unit_text, (
+                f"{tool.id} ({mode}) missing REQUESTS_CA_BUNDLE systemd Environment directive"
+            )
+
+    cron_tool = next(t for t in TOOLS if "cron" in t.supported_modes)
+    cron_text = upsert_cron_block(
+        "",
+        {cron_tool.id: render_cron_entry(cron_tool, "0 * * * *", REPO_ROOT)},
+        ca_bundle=DEFAULT_CA_BUNDLE,
+    )
+    assert f"SSL_CERT_FILE={DEFAULT_CA_BUNDLE}" in cron_text
+    assert f"REQUESTS_CA_BUNDLE={DEFAULT_CA_BUNDLE}" in cron_text

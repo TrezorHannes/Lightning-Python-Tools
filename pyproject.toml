@@ -49,7 +49,7 @@ select = ["E", "F", "W", "B", "UP"]
 ignore = ["E501"]
 
 [tool.coverage.run]
-source = ["LNDg", "Magma", "Other", "Peerswap", "LNBits"]
+source = ["LNDg", "Magma", "Other", "Peerswap", "LNBits", "lpt_installer"]
 omit = ["tests/*"]
 
 [tool.coverage.report]

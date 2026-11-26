@@ -45,11 +45,12 @@ jobs:
       shell: bash
       run: |
         set -o pipefail
-        pytest tests/ -v --cov=LNDg --cov=Magma --cov=Other --cov=Peerswap --cov=LNBits --cov-report=term --cov-fail-under=35 | tee pytest_cov.txt
+        pytest tests/ -v --cov=LNDg --cov=Magma --cov=Other --cov=Peerswap --cov=LNBits --cov=lpt_installer --cov-report=term --cov-fail-under=35 | tee pytest_cov.txt
+        pytest tests/test_lpt_installer.py tests/test_ca_trust_hardening.py --cov=lpt_installer --cov-report=term --cov-fail-under=85
         {
           echo "### Pytest Coverage (Python ${{ matrix.python-version }})"
           echo '```text'
-          tail -n 30 pytest_cov.txt
+          tail -n 35 pytest_cov.txt
           echo '```'
         } >> "$GITHUB_STEP_SUMMARY"
 
@@ -74,13 +75,65 @@ jobs:
     - name: Install ruff
       run: pip install -r requirements-dev.txt
 
-    - name: Run ruff check on modern/updated tests
-      run: ruff check tests/test_p0_runtime_safety.py tests/test_ca_trust_hardening.py tests/test_repo_hygiene.py
+    - name: Run ruff check on installer and updated tests
+      run: ruff check lpt_installer tests/test_lpt_installer.py tests/test_p0_runtime_safety.py tests/test_ca_trust_hardening.py tests/test_repo_hygiene.py
 
     - name: Validate shell scripts
       run: |
-        bash -n LNBits/install_pocketmoney_service.sh Other/install_fee_adjuster_service.sh
-        shellcheck -S error LNBits/install_pocketmoney_service.sh Other/install_fee_adjuster_service.sh
+        bash -n install.sh
+        shellcheck -S warning install.sh
+
+    - name: Verify rendered systemd units with systemd-analyze
+      shell: bash
+      run: |
+        UNIT_DIR="$RUNNER_TEMP/lpt-units"
+        mkdir -p "$UNIT_DIR"
+        python3 - "$UNIT_DIR" <<'PY'
+        import grp, os, sys
+        from pathlib import Path
+        from lpt_installer.registry import get_tool
+        from lpt_installer.scheduler import render_systemd_service, render_systemd_timer
+
+        out_dir = Path(sys.argv[1])
+        repo = Path.cwd()
+        user = os.environ["USER"]
+        group = grp.getgrgid(os.getgid()).gr_name
+        py_bin = Path(sys.executable)
+
+        for tid, cal in (("pocketmoney", "Fri *-*-* 09:00:00"), ("fee-adjuster", "*:0/20:00")):
+            tool = get_tool(tid)
+            (out_dir / f"lpt-{tid}.service").write_text(
+                render_systemd_service(
+                    tool,
+                    repo,
+                    user=user,
+                    group=group,
+                    mode="systemd-timer",
+                    python_bin=py_bin,
+                    unit_exists=lambda _: False,
+                ),
+                encoding="utf-8",
+            )
+            (out_dir / f"lpt-{tid}.timer").write_text(
+                render_systemd_timer(tool, cal),
+                encoding="utf-8",
+            )
+
+        magma = get_tool("magma-sale")
+        (out_dir / "lpt-magma-sale.service").write_text(
+            render_systemd_service(
+                magma,
+                repo,
+                user=user,
+                group=group,
+                mode="systemd-service",
+                python_bin=py_bin,
+                unit_exists=lambda _: False,
+            ),
+            encoding="utf-8",
+        )
+        PY
+        SYSTEMD_UNIT_PATH="$UNIT_DIR:" systemd-analyze verify --man=no "$UNIT_DIR"/*.service "$UNIT_DIR"/*.timer
 
   security:
     runs-on: ubuntu-latest

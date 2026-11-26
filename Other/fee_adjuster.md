@@ -65,10 +65,9 @@ config_file = file:///home/admin/.chargelnd/.config/fee_adjuster.txt
 
 ## Installation (systemd Timer or Crontab)
 
-Use the included installer script to set up `fee_adjuster.service` and an hourly `fee_adjuster.timer`:
+Use the unified installer (`./install.sh`) to configure `lpt-fee-adjuster.service` + `lpt-fee-adjuster.timer` (or a managed cron entry):
 ```bash
-chmod +x Other/install_fee_adjuster_service.sh
-sudo ./Other/install_fee_adjuster_service.sh
+./install.sh install fee-adjuster --scheduler systemd
 ```
 
 Or schedule via `crontab -e`:
