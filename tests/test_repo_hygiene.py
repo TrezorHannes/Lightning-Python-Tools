@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import pocketmoney
+from lpt_installer.registry import render_markdown_overview_table
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -118,3 +119,43 @@ def test_readme_relative_file_links_exist():
             continue
         rel_path = target.split("#", maxsplit=1)[0]
         assert (REPO_ROOT / rel_path).exists(), f"Broken relative link in README.md: {target}"
+
+
+def test_all_markdown_relative_file_links_exist():
+    md_files = sorted(
+        [
+            REPO_ROOT / "README.md",
+            REPO_ROOT / "SECURITY.md",
+            *(REPO_ROOT / "docs").glob("*.md"),
+            *(REPO_ROOT / "Magma").glob("*.md"),
+            *(REPO_ROOT / "Other").glob("*.md"),
+            REPO_ROOT / "Peerswap" / "README.md",
+        ]
+    )
+    assert len(md_files) >= 6
+    for md_file in md_files:
+        text = re.sub(r"```.*?```", "", md_file.read_text(encoding="utf-8"), flags=re.S)
+        for target in re.findall(r"\]\(([^)]+)\)", text):
+            if target.startswith(("http://", "https://", "#", "mailto:")):
+                continue
+            rel_path = target.split("#", maxsplit=1)[0]
+            resolved = (md_file.parent / rel_path).resolve()
+            assert resolved.exists(), f"Broken relative link in {md_file}: {target}"
+
+
+def test_readme_script_table_matches_registry():
+    readme_text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    begin_marker = "<!-- BEGIN_LPT_SCRIPT_TABLE -->"
+    end_marker = "<!-- END_LPT_SCRIPT_TABLE -->"
+    assert begin_marker in readme_text and end_marker in readme_text
+    section = readme_text.split(begin_marker, maxsplit=1)[1].split(end_marker, maxsplit=1)[0].strip()
+    assert section == render_markdown_overview_table().strip()
+
+
+def test_readme_contains_safety_disclaimer_and_donation_link():
+    readme_text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    lowered = readme_text.lower()
+    assert "security.md" in lowered
+    assert "mit" in lowered
+    assert "no liability" in lowered
+    assert "https://hodlmetight.org" in readme_text
