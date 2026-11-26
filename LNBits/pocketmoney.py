@@ -10,6 +10,8 @@ from logging.handlers import RotatingFileHandler
 from telebot import TeleBot
 import argparse
 
+DEFAULT_HTTP_TIMEOUT = 30
+
 def normalize_lnbits_base_url(raw_url):
     """Normalize LNbits base URL so /api/v1/... endpoints are never doubled."""
     url = (raw_url or "").strip().rstrip("/")
@@ -73,7 +75,9 @@ def get_exchange_rate(fiat_currency):
     try:
         url = f"{LNBITS_URL}/api/v1/rate/{fiat_currency}"
         logger.debug(f"Requesting exchange rate from: {url}")
-        response = requests.get(url, headers={"accept": "application/json"})
+        response = requests.get(
+            url, headers={"accept": "application/json"}, timeout=DEFAULT_HTTP_TIMEOUT
+        )
         logger.debug(f"Response status code: {response.status_code}")
         response.raise_for_status()
         rate = response.json().get("rate")
@@ -103,6 +107,7 @@ def create_invoice(wallet_id, invoice_key, amount_eur, child_name, fiat_currency
             f"{LNBITS_URL}/api/v1/payments",
             headers={"X-Api-Key": invoice_key, "Content-type": "application/json"},
             json={"out": False, "amount": amount_sats, "memo": memo},
+            timeout=DEFAULT_HTTP_TIMEOUT,
         )
         logger.debug(f"Invoice creation response status: {response.status_code}")
         logger.debug(f"Invoice creation response: {response.text}")
@@ -145,6 +150,7 @@ def pay_invoice(payment_request):
                 "Content-type": "application/json",  # Added Content-type header
             },
             json={"out": True, "bolt11": payment_request},
+            timeout=DEFAULT_HTTP_TIMEOUT,
         )
         logger.debug(f"Payment response status: {response.status_code}")
         logger.debug(f"Payment response: {response.text}")
@@ -170,7 +176,9 @@ def pay_invoice(payment_request):
 def check_balance():
     try:
         response = requests.get(
-            f"{LNBITS_URL}/api/v1/wallet", headers={"X-Api-Key": ADMIN_KEY}
+            f"{LNBITS_URL}/api/v1/wallet",
+            headers={"X-Api-Key": ADMIN_KEY},
+            timeout=DEFAULT_HTTP_TIMEOUT,
         )
         response.raise_for_status()
         balance = response.json().get("balance")
@@ -191,11 +199,12 @@ def send_telegram_warning(balance):
 
 # Main function to run the scheduled transfer
 def scheduled_transfer():
-    # Parse the children wallets from the jason file
+    # Parse the children wallets from the json file
     wallets_file_path = os.path.join(parent_dir, "..", "wallets.json")
     with open(wallets_file_path, "r") as f:
         CHILDREN_WALLETS = json.load(f)
 
+    failures = 0
     for child, wallet_info in CHILDREN_WALLETS.items():
         wallet_id = wallet_info["wallet_id"]
         invoice_key = wallet_info["invoice_key"]
@@ -205,17 +214,28 @@ def scheduled_transfer():
         payment_request, amount_sats = create_invoice(
             wallet_id, invoice_key, fiat_amount, child, fiat_currency
         )
-        if payment_request:
-            pay_invoice(payment_request)
-            logger.info(
-                f"Transferred {fiat_amount} {fiat_currency} ({amount_sats} satoshis) worth of pocket money to {child}"
-            )
-            bot.send_message(
-                CHAT_ID,
-                f"💶 🤑 Transferred {fiat_amount} {fiat_currency} ({amount_sats} satoshis) worth of pocket money to {child}",
-            )
-            # Check balance after each payment
-            check_balance()
+        if not payment_request:
+            failures += 1
+            logger.error(f"Invoice creation failed for {child}; skipping payment.")
+            continue
+
+        payment_result = pay_invoice(payment_request)
+        if payment_result is None:
+            failures += 1
+            logger.error(f"Payment failed for {child}; skipping transfer confirmation.")
+            continue
+
+        logger.info(
+            f"Transferred {fiat_amount} {fiat_currency} ({amount_sats} satoshis) worth of pocket money to {child}"
+        )
+        bot.send_message(
+            CHAT_ID,
+            f"💶 🤑 Transferred {fiat_amount} {fiat_currency} ({amount_sats} satoshis) worth of pocket money to {child}",
+        )
+        # Check balance after each successful payment
+        check_balance()
+
+    return failures
 
 
 # Comment out the scheduling logic for testing
@@ -267,7 +287,9 @@ def main():
     validate_runtime_config()
 
     if args.run_once:
-        scheduled_transfer()
+        failures = scheduled_transfer()
+        if failures > 0:
+            raise SystemExit(1)
     else:
         schedule_transfers()
         while True:

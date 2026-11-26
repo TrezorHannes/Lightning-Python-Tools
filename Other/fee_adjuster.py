@@ -77,6 +77,7 @@ crontab -e
 
 import os
 import sys
+import tempfile
 import requests
 from datetime import datetime, timedelta
 import configparser
@@ -85,6 +86,8 @@ import json
 import time
 import argparse
 from prettytable import PrettyTable
+
+DEFAULT_HTTP_TIMEOUT = 30
 
 
 # Error classes
@@ -283,7 +286,9 @@ def get_last_peer_forwarding_timestamp(pubkey, days_to_check_back, channel_ids, 
         logging.debug(f"Querying LNDg for channel {chan_id}: {api_url}")
 
         try:
-            response = requests.get(api_url, auth=(username, password))
+            response = requests.get(
+                api_url, auth=(username, password), timeout=DEFAULT_HTTP_TIMEOUT
+            )
             response.raise_for_status()
             data = response.json()
 
@@ -543,7 +548,9 @@ def fetch_all_channels(config):
     password = config["credentials"]["lndg_password"]
 
     try:
-        response = requests.get(api_url, auth=(username, password))
+        response = requests.get(
+            api_url, auth=(username, password), timeout=DEFAULT_HTTP_TIMEOUT
+        )
         response.raise_for_status()
         data = response.json()
 
@@ -779,7 +786,10 @@ def update_lndg_fee(
         auto_fees_url = f"{lndg_api_url}/api/channels/{chan_id}/"
         try:
             response = requests.put(
-                auto_fees_url, json=channel_update_payload, auth=(username, password)
+                auto_fees_url,
+                json=channel_update_payload,
+                auth=(username, password),
+                timeout=DEFAULT_HTTP_TIMEOUT,
             )
             response.raise_for_status()
             logging.info(
@@ -810,7 +820,10 @@ def update_lndg_fee(
         )
 
         response = requests.post(
-            fee_update_url, json=fee_payload, auth=(username, password)
+            fee_update_url,
+            json=fee_payload,
+            auth=(username, password),
+            timeout=DEFAULT_HTTP_TIMEOUT,
         )
 
         if log_api_response:  # Only log verbose response if specifically requested
@@ -833,6 +846,58 @@ def update_lndg_fee(
         raise LNDGAPIError(f"Error updating LNDg fee policy for channel {chan_id}: {e}")
 
 
+def format_charge_lnd_entry(
+    pubkey,
+    alias,
+    new_fee_rate,
+    is_aggregated,
+    inbound_auto_fee_enabled_for_node,
+    calculated_inbound_ppm_for_charge_lnd,
+):
+    """Format a single peer stanza for charge-lnd."""
+    lines = [
+        f"[🤖 {alias}{' (Aggregated)' if is_aggregated else ''}]\n",
+        f"node.id = {pubkey}\n",
+        "strategy = static\n",
+        f"fee_ppm = {new_fee_rate}\n",
+    ]
+    if inbound_auto_fee_enabled_for_node:
+        lines.append(f"inbound_fee_ppm = {calculated_inbound_ppm_for_charge_lnd}\n")
+        # Defaulting inbound base to 0 for now
+        lines.append("inbound_base_fee_msat = 0\n")
+    # Default base fees and HTLC settings
+    lines.extend(
+        [
+            "base_fee_msat = 1000\n",
+            "min_htlc_msat = 1_000\n",
+            "max_htlc_msat_ratio = 0.9\n",
+            "\n",
+        ]
+    )
+    return "".join(lines)
+
+
+def write_charge_lnd_entries_atomic(file_path, entries):
+    """Atomically replace charge-lnd fee_adjuster.txt with formatted stanzas."""
+    target_dir = os.path.dirname(os.path.abspath(file_path))
+    os.makedirs(target_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".fee_adjuster_", suffix=".tmp", dir=target_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            tmp_file.write("".join(entries))
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, file_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise
+
+
 def write_charge_lnd_file(
     file_path,
     pubkey,
@@ -843,22 +908,16 @@ def write_charge_lnd_file(
     inbound_auto_fee_enabled_for_node,
     calculated_inbound_ppm_for_charge_lnd,  # Pass the specific inbound PPM for this peer/aggregation
 ):
-    with open(file_path, "a") as f:
-        f.write(f"[🤖 {alias}{' (Aggregated)' if is_aggregated else ''}]\n")
-        f.write(f"node.id = {pubkey}\n")
-        f.write("strategy = static\n")
-        f.write(f"fee_ppm = {new_fee_rate}\n")
-        # Add inbound fee details if the feature is enabled for this node
-        if inbound_auto_fee_enabled_for_node:
-            f.write(f"inbound_fee_ppm = {calculated_inbound_ppm_for_charge_lnd}\n")
-            f.write(
-                "inbound_base_fee_msat = 0\n"
-            )  # Defaulting inbound base to 0 for now
-        # Default base fees and HTLC settings, consider making these configurable
-        f.write("base_fee_msat = 1000\n")  # Default for outgoing, might need review
-        f.write("min_htlc_msat = 1_000\n")
-        f.write("max_htlc_msat_ratio = 0.9\n")
-        f.write("\n")
+    entry = format_charge_lnd_entry(
+        pubkey,
+        alias,
+        new_fee_rate,
+        is_aggregated,
+        inbound_auto_fee_enabled_for_node,
+        calculated_inbound_ppm_for_charge_lnd,
+    )
+    with open(file_path, "a", encoding="utf-8") as f:
+        f.write(entry)
 
 
 def update_channel_notes(
@@ -988,7 +1047,9 @@ def update_channel_notes(
         logging.debug(f"Sending PUT request to: {put_url}")
         logging.debug(f"With payload: {json.dumps(payload)}")
 
-        response = requests.put(put_url, json=payload, auth=(username, password))
+        response = requests.put(
+            put_url, json=payload, auth=(username, password), timeout=DEFAULT_HTTP_TIMEOUT
+        )
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         if response.status_code == 200:
@@ -1342,6 +1403,7 @@ def main():
                 save_baseline_targets(baseline_map)
                 logging.info(f"RebalanceGuard applied {len(guard_plans)} target adjustments.")
 
+        charge_lnd_entries = []
         for node in node_definitions["nodes"]:
             pubkey = node["pubkey"]
             group_name = node.get("group")
@@ -1819,39 +1881,43 @@ def main():
                         )
                         sys.stdout.flush()  # Ensure output is shown immediately
 
-                # Write to charge-lnd file once per peer if enabled and any channel updated
+                # Collect charge-lnd stanza once per peer if enabled and any channel updated
                 if (
                     write_charge_lnd_file_enabled
                     and updated_any_channel
                     and not skip_charge_lnd_file_write
                 ):
-                    charge_lnd_dir = os.path.expanduser(
-                        config.get(
-                            "paths", "charge_lnd_path", fallback="~/.chargelnd/.config"
+                    charge_lnd_entries.append(
+                        format_charge_lnd_entry(
+                            pubkey,
+                            first_channel_data["alias"],
+                            final_rate,  # This is the outgoing fee rate
+                            num_channels > 1,
+                            inbound_auto_fee_enabled_for_node,  # Pass the resolved enable status
+                            calculated_inbound_ppm_for_peer,  # Pass the peer-level calculated inbound ppm
                         )
-                    )
-                    os.makedirs(charge_lnd_dir, exist_ok=True)
-                    charge_lnd_file_path = os.path.join(
-                        charge_lnd_dir, "fee_adjuster.txt"
-                    )
-                    # Pass the inbound fee details to write_charge_lnd_file
-                    # calculated_inbound_ppm_for_peer is the peer-level summary calculated earlier
-                    write_charge_lnd_file(
-                        charge_lnd_file_path,
-                        pubkey,
-                        first_channel_data["alias"],
-                        final_rate,  # This is the outgoing fee rate
-                        num_channels > 1,
-                        inbound_auto_fee_enabled_for_node,  # Pass the resolved enable status
-                        calculated_inbound_ppm_for_peer,  # Pass the peer-level calculated inbound ppm
                     )
 
             except (AmbossAPIError, LNDGAPIError) as e:
                 logging.error(f"Error processing node {pubkey}: {e}")
                 continue
+        if (
+            write_charge_lnd_file_enabled
+            and not skip_charge_lnd_file_write
+            and charge_lnd_entries
+        ):
+            charge_lnd_dir = os.path.expanduser(
+                config.get(
+                    "paths", "charge_lnd_path", fallback="~/.chargelnd/.config"
+                )
+            )
+            charge_lnd_file_path = os.path.join(
+                charge_lnd_dir, "fee_adjuster.txt"
+            )
+            write_charge_lnd_entries_atomic(charge_lnd_file_path, charge_lnd_entries)
     except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}")
-        time.sleep(60)  # Sleep for 1 minute before retrying
+        logging.exception(f"An unexpected error occurred: {e}")
+        raise SystemExit(1) from e
 
 
 if __name__ == "__main__":

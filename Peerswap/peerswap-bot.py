@@ -32,23 +32,28 @@ config_file_path = os.path.join(parent_dir, '..', 'config.ini')
 config = configparser.ConfigParser()
 config.read(config_file_path)
 
-BOT_TOKEN = config['telegram']['peerswap_bot_token']
-TELEGRAM_USER_ID = config['telegram']['telegram_user_id']
-MEMPOOL_TX = config['urls']['mempool_tx']
-LIQUID_TX = config['urls']['liquid_tx']
-PATH_COMMAND = config['system']['path_command']
+BOT_TOKEN = config.get('telegram', 'peerswap_bot_token', fallback='').strip()
+TELEGRAM_USER_ID = config.get('telegram', 'telegram_user_id', fallback='').strip()
+MEMPOOL_TX = config.get('urls', 'mempool_tx', fallback='https://mempool.space/tx/').strip()
+LIQUID_TX = config.get('urls', 'liquid_tx', fallback='https://liquid.network/tx/').strip()
+PATH_COMMAND = config.get('system', 'path_command', fallback='/usr/local/bin').strip()
+PSCLI_BIN = (
+    config.get('paths', 'pscli_path', fallback='').strip()
+    or (os.path.join(PATH_COMMAND, 'pscli') if PATH_COMMAND else 'pscli')
+)
 
 # Logging
 log_file_path = os.path.join(parent_dir, '..', 'logs', 'peerswap-bot.log')
 os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
 logging.basicConfig(filename=log_file_path, level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
-bot = telebot.TeleBot(BOT_TOKEN)
-logging.info("Peerswap bot started")
+bot = telebot.TeleBot(
+    BOT_TOKEN if (BOT_TOKEN and ':' in BOT_TOKEN) else '123456:fake_token_for_testing'
+)
 
 # Function to check if the user is authorized
 def is_authorized_user(user_id):
-    return str(user_id) == TELEGRAM_USER_ID
+    return bool(TELEGRAM_USER_ID) and str(user_id) == TELEGRAM_USER_ID
 
 # Decorator function for authorization check
 def authorized_only(func):
@@ -61,7 +66,9 @@ def authorized_only(func):
 
 def get_node_alias(pub_key):
     try:
-        response = requests.get(f"https://mempool.space/api/v1/lightning/nodes/{pub_key}")
+        response = requests.get(
+            f"https://mempool.space/api/v1/lightning/nodes/{pub_key}", timeout=15
+        )
         data = response.json()
         return data.get('alias', '')
     except Exception as e:
@@ -153,7 +160,7 @@ def format_single_swap_output(swap):
 
 def list_recent_swaps(message, count=1):
     send_formatted_output(message.chat.id, "Checking most recent PeerSwap Swap...")
-    command = [f'{PATH_COMMAND}/pscli', 'listswaps']
+    command = [PSCLI_BIN, 'listswaps']
     output = execute_command(command)
     try:
         data = json.loads(output)
@@ -223,7 +230,7 @@ def format_generic_output(data):
 
 def list_all_swaps(message):
     send_formatted_output(message.chat.id, "Checking PeerSwap Swaps...")
-    output = execute_command([f'{PATH_COMMAND}/pscli', 'listswaps'])
+    output = execute_command([PSCLI_BIN, 'listswaps'])
     try:
         data = json.loads(output)
         swaps = data.get('swaps', [])
@@ -267,7 +274,7 @@ def help_command(message):
 @authorized_only
 def list_peers(message):
         # Execute the command and capture the output
-    output = subprocess.check_output([f'{PATH_COMMAND}/pscli', 'listpeers'], text=True)
+    output = subprocess.check_output([PSCLI_BIN, 'listpeers'], text=True)
     if not output.startswith("Error"):
         # Parse the JSON output
         data = json.loads(output)
@@ -307,7 +314,7 @@ def list_peers(message):
 @authorized_only
 def list_swap_requests(message):
     send_formatted_output(message.chat.id, "Checking PeerSwap Requests...")
-    output = execute_command([f'{PATH_COMMAND}/pscli', 'listswaprequests'])
+    output = execute_command([PSCLI_BIN, 'listswaprequests'])
     formatted_output = format_output(json.loads(output))
     print(formatted_output)
     send_formatted_output(message.chat.id, formatted_output)
@@ -322,7 +329,7 @@ def swapin_command(message):
         send_formatted_output(message.chat.id, "Usage: /swapin sat_amt channel_id asset")
         return
 
-    command = [f'{PATH_COMMAND}/pscli', 'swapin', '--sat_amt', sat_amt, '--channel_id', channel_id, '--asset', asset]
+    command = [PSCLI_BIN, 'swapin', '--sat_amt', sat_amt, '--channel_id', channel_id, '--asset', asset]
     output = execute_command(command)
     if "Error" in output:
         print(output)
@@ -342,7 +349,7 @@ def swapout_command(message):
         send_formatted_output(message.chat.id, "Usage: /swapout sat_amt channel_id asset")
         return
 
-    command = [f'{PATH_COMMAND}/pscli', 'swapout', '--sat_amt', sat_amt, '--channel_id', channel_id, '--asset', asset]
+    command = [PSCLI_BIN, 'swapout', '--sat_amt', sat_amt, '--channel_id', channel_id, '--asset', asset]
     output = execute_command(command)
     if "Error" in output:
         print(output)
@@ -366,7 +373,7 @@ def list_swaps(message):
 @authorized_only
 def lbtc_getbalance(message):
     send_formatted_output(message.chat.id, "Fetching LBTC Balance...")
-    output = execute_command([f'{PATH_COMMAND}/pscli', 'lbtc-getbalance'])
+    output = execute_command([PSCLI_BIN, 'lbtc-getbalance'])
     try:
         data = json.loads(output)
         formatted_output = f"Amount: {data['sat_amount']} sats"
@@ -379,7 +386,7 @@ def lbtc_getbalance(message):
 @authorized_only
 def lbtc_getaddress(message):
     send_formatted_output(message.chat.id, "Fetching L-BTC Address...")
-    output = execute_command([f'{PATH_COMMAND}/pscli', 'lbtc-getaddress'])
+    output = execute_command([PSCLI_BIN, 'lbtc-getaddress'])
     try:
         data = json.loads(output)
         formatted_output = f"L-BTC Address"
@@ -404,7 +411,7 @@ def add_peer(message):
         return
 
     send_formatted_output(message.chat.id, f"Adding Peer with Public Key: {pub_key}...")
-    output = execute_command([f'{PATH_COMMAND}/pscli', 'addpeer', '--peer_pubkey', pub_key])
+    output = execute_command([PSCLI_BIN, 'addpeer', '--peer_pubkey', pub_key])
     try:
         data = json.loads(output)
         formatted_output = format_generic_output(data)
@@ -417,7 +424,7 @@ def add_peer(message):
 @authorized_only
 def reload_policy(message):
     send_formatted_output(message.chat.id, "Reloading Policy...")
-    output = execute_command([f'{PATH_COMMAND}/pscli', 'reloadpolicy'])
+    output = execute_command([PSCLI_BIN, 'reloadpolicy'])
     try:
         data = json.loads(output)
         formatted_output = format_generic_output(data)
@@ -435,7 +442,7 @@ def lbtc_send_to_address(message):
         send_formatted_output(message.chat.id, "Usage: /lbtcsend sat_amt address")
         return
 
-    command = [f'{PATH_COMMAND}/pscli', 'lbtc-sendtoaddress', '--sat_amt', sat_amt, '--address', address]
+    command = [PSCLI_BIN, 'lbtc-sendtoaddress', '--sat_amt', sat_amt, '--address', address]
     output = execute_command(command)
 
     if "Error" in output:
@@ -446,14 +453,24 @@ def lbtc_send_to_address(message):
         print(formatted_output)
         send_formatted_output(message.chat.id, formatted_output)
 
-# Polling to keep the bot running
-while True:
-    try:
-        bot.polling()
-        logging.info("Polling cycle completed")
-        time.sleep(15)  # Adjust sleep duration as needed
-    except Exception as e:
-        # Log the exception with traceback for detailed information
-        logging.error(f"Exception occurred: {e}\nTraceback: {traceback.format_exc()}")
-        time.sleep(60)  # Wait before retrying
+def run_bot():
+    if not BOT_TOKEN or ":" not in BOT_TOKEN:
+        raise ValueError("Missing or invalid [telegram] peerswap_bot_token in config.ini")
+    if not TELEGRAM_USER_ID:
+        raise ValueError("Missing [telegram] telegram_user_id in config.ini")
+
+    logging.info("Peerswap bot started")
+    while True:
+        try:
+            bot.polling()
+            logging.info("Polling cycle completed")
+            time.sleep(15)  # Adjust sleep duration as needed
+        except Exception as e:
+            # Log the exception with traceback for detailed information
+            logging.error(f"Exception occurred: {e}\nTraceback: {traceback.format_exc()}")
+            time.sleep(60)  # Wait before retrying
+
+
+if __name__ == "__main__":
+    run_bot()
 

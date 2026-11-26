@@ -14,6 +14,8 @@ import configparser
 from prettytable import PrettyTable
 import argparse
 
+DEFAULT_HTTP_TIMEOUT = 30
+
 # Get the path to the parent directory
 parent_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -79,7 +81,9 @@ CAPACITY_THRESHOLD = args.capacity
 def get_chan_ids_to_write():
     chan_ids_to_write = []  # Initialize the list
     try:
-        response = requests.get(api_url, auth=(username, password))
+        response = requests.get(
+            api_url, auth=(username, password), timeout=DEFAULT_HTTP_TIMEOUT
+        )
 
         # Check if the request was successful (status code 200)
         if response.status_code == 200:
@@ -117,7 +121,9 @@ def get_chan_ids_to_write():
 
 def terminal_output():
     try:
-        response = requests.get(api_url, auth=(username, password))
+        response = requests.get(
+            api_url, auth=(username, password), timeout=DEFAULT_HTTP_TIMEOUT
+        )
 
         if response.status_code == 200:
             data = response.json()
@@ -208,7 +214,9 @@ def terminal_output():
 
 def write_bos_tags():
     try:
-        response = requests.get(api_url, auth=(username, password))
+        response = requests.get(
+            api_url, auth=(username, password), timeout=DEFAULT_HTTP_TIMEOUT
+        )
         if response.status_code == 200:
             data = response.json()
             if "results" in data:

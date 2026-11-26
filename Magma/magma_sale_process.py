@@ -1271,11 +1271,17 @@ def get_lncli_utxos():
 
     try:
         if loop_path and os.path.exists(loop_path):
+            loop_rpcserver = config.get(
+                "loop", "rpcserver", fallback="localhost:8443"
+            ).strip()
+            loop_tlscertpath = os.path.expanduser(
+                config.get("loop", "tlscertpath", fallback="~/.lit/tls.cert").strip()
+            )
             # Construct the litloop command as list
             litloop_cmd = [
                 loop_path,
-                "--rpcserver=localhost:8443",
-                "--tlscertpath=~/.lit/tls.cert",
+                f"--rpcserver={loop_rpcserver}",
+                f"--tlscertpath={loop_tlscertpath}",
                 "static",
                 "listunspent"
             ]
