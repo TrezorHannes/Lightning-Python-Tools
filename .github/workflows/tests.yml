@@ -42,7 +42,9 @@ jobs:
 
     - name: Run pytest (Python 3.12 with coverage)
       if: matrix.python-version == '3.12'
+      shell: bash
       run: |
+        set -o pipefail
         pytest tests/ -v --cov=LNDg --cov=Magma --cov=Other --cov=Peerswap --cov=LNBits --cov-report=term --cov-fail-under=35 | tee pytest_cov.txt
         {
           echo "### Pytest Coverage (Python ${{ matrix.python-version }})"

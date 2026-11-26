@@ -1881,10 +1881,9 @@ def main():
                         )
                         sys.stdout.flush()  # Ensure output is shown immediately
 
-                # Collect charge-lnd stanza once per peer if enabled and any channel updated
+                # Collect charge-lnd stanza once per processed peer if enabled
                 if (
                     write_charge_lnd_file_enabled
-                    and updated_any_channel
                     and not skip_charge_lnd_file_write
                 ):
                     charge_lnd_entries.append(

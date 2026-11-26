@@ -49,6 +49,106 @@ def test_fee_adjuster_atomic_charge_lnd_write_overwrites_and_sets_0644(tmp_path)
     assert stat.S_IMODE(target.stat().st_mode) == 0o644
 
 
+def test_fee_adjuster_main_retains_unchanged_peers_in_charge_lnd_snapshot(
+    tmp_path, monkeypatch
+):
+    module = _load_isolated_module("Other/fee_adjuster.py", "_p0_fee_adjuster_snapshot")
+    charge_lnd_dir = tmp_path / "charge-lnd"
+
+    cfg = configparser.ConfigParser()
+    cfg.read_dict(
+        {
+            "credentials": {
+                "amboss_authorization": "tok",
+                "lndg_username": "u",
+                "lndg_password": "p",
+            },
+            "lndg": {"lndg_api_url": "http://localhost:8889"},
+            "paths": {"charge_lnd_path": str(charge_lnd_dir)},
+        }
+    )
+
+    node_defs = {
+        "write_charge_lnd_file": True,
+        "LNDg_fee_update": True,
+        "Terminal_output": False,
+        "update_channel_notes": False,
+        "inbound_protection": {"lock_ar_out_target_on_discount": False},
+        "groups": {},
+        "nodes": [
+            {
+                "pubkey": "02updated",
+                "fee_conditions": {
+                    "base_adjustment_percentage": 0.0,
+                    "fee_base": "median",
+                    "fee_delta_threshold": 5,
+                    "max_cap": 1000,
+                },
+            },
+            {
+                "pubkey": "03unchanged",
+                "fee_conditions": {
+                    "base_adjustment_percentage": 0.0,
+                    "fee_base": "median",
+                    "fee_delta_threshold": 500,
+                    "max_cap": 1000,
+                },
+            },
+        ],
+    }
+
+    channels_map = {
+        "02updated": {
+            "1001": {
+                "chan_id": "1001",
+                "alias": "PeerUpdated",
+                "local_balance": 500_000,
+                "capacity": 1_000_000,
+                "local_fee_rate": 100,
+                "local_inbound_fee_rate": 0,
+                "ar_max_cost": 50,
+                "auto_fees": False,
+                "num_updates": 10,
+            }
+        },
+        "03unchanged": {
+            "1002": {
+                "chan_id": "1002",
+                "alias": "PeerUnchanged",
+                "local_balance": 500_000,
+                "capacity": 1_000_000,
+                "local_fee_rate": 200,
+                "local_inbound_fee_rate": 0,
+                "ar_max_cost": 50,
+                "auto_fees": False,
+                "num_updates": 10,
+            }
+        },
+    }
+
+    monkeypatch.setattr(module, "load_config", lambda: cfg)
+    monkeypatch.setattr(module, "load_node_definitions", lambda: node_defs)
+    monkeypatch.setattr(module, "fetch_all_channels", lambda _cfg: channels_map)
+    monkeypatch.setattr(
+        module,
+        "fetch_amboss_data",
+        lambda _pk, _cfg: {
+            "TODAY": {"median": "210"},
+            "ONE_DAY": {"median": "210"},
+            "ONE_WEEK": {"median": "210"},
+            "ONE_MONTH": {"median": "210"},
+        },
+    )
+    monkeypatch.setattr(module, "update_lndg_fee", MagicMock())
+    monkeypatch.setattr(sys, "argv", ["fee_adjuster.py"])
+
+    module.main()
+
+    snapshot = (charge_lnd_dir / "fee_adjuster.txt").read_text(encoding="utf-8")
+    assert "node.id = 02updated" in snapshot
+    assert "node.id = 03unchanged" in snapshot
+
+
 def test_fee_adjuster_fatal_error_exits_nonzero_without_sleeping(monkeypatch):
     module = _load_isolated_module("Other/fee_adjuster.py", "_p0_fee_adjuster_exit")
     sleep_mock = MagicMock()
