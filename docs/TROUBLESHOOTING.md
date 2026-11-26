@@ -13,7 +13,7 @@ Run the built-in diagnostic command first whenever something fails to install, v
 | `python` | Host Python must be `3.11`, `3.12`, or `3.13`. | Install Python 3.11–3.13 (`sudo apt-get install -y python3 python3-venv`). |
 | `venv-certifi` | Checks `.venv` exists and `certifi >= 2026.10.19` (`requirements.txt` requires `>= 2026.11.20`). | Run `./install.sh env` (or `./install.sh env --recreate`). |
 | `ca-bundle` | Verifies an OS CA certificate bundle exists (`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`, or `/etc/ssl/cert.pem`). | On Debian/Ubuntu, run `sudo apt-get install -y ca-certificates`. |
-| `perms:<file>` | Flags config files that are group/world readable. | Run `./install.sh config` or `chmod 600 <file>`. |
+| `perms:<file>` | Flags config files that are group/world readable. | Run `./install.sh config --harden` (or `chmod 600 <file>`). |
 | `ownership` | Flags root-owned files in `logs/` or `data/` (common after switching `fee_adjuster` from `User=root` to `User=admin`). | Fix with `sudo chown "$USER:$USER" logs/* data/*`. |
 | `legacy-units` | Detects pre-existing unprefixed systemd units (`fee_adjuster.*`, `pocketmoney.*`, etc.). | Run `./install.sh install <tool>` to back up and migrate to `lpt-*`. |
 

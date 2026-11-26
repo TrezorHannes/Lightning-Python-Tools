@@ -8,6 +8,9 @@ All user configuration files containing credentials, pubkeys, or node rules are 
 # Copy missing templates, set chmod 600 on configs (chmod 700 on logs/ & data/), and validate
 ./install.sh config
 
+# Only tighten chmod 600/700 permissions on existing configs without copying templates or validating all tools
+./install.sh config --harden
+
 # Limit to specific tools and open config.ini in $VISUAL / $EDITOR / nano
 ./install.sh config --tools fee-adjuster pocketmoney --edit config.ini
 ```

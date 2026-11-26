@@ -184,7 +184,7 @@ def run_doctor(repo_root: Path, env: SystemEnv) -> list[dict[str, str]]:
                 {
                     "name": f"perms:{rel_path}",
                     "status": "warn",
-                    "detail": f"{rel_path} mode {oct(mode)} is group/world readable; run 'config --harden'",
+                    "detail": f"{rel_path} mode {oct(mode)} is group/world readable; run './install.sh config --harden'",
                 }
             )
         else:

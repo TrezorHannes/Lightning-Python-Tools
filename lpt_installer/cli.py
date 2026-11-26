@@ -18,6 +18,7 @@ from lpt_installer.adapters import SystemEnv
 from lpt_installer.configs import (
     CONFIG_TEMPLATES,
     ensure_configs,
+    harden_existing_configs,
     open_in_editor,
     validate_configs,
 )
@@ -122,6 +123,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cfg_p.add_argument("--tools", nargs="*", help="Limit config check/copy to specific tool IDs.")
     cfg_p.add_argument("--edit", metavar="FILE", help="Open config file in $EDITOR after copying.")
+    cfg_p.add_argument(
+        "--harden",
+        action="store_true",
+        help="Only enforce 0600/0700 permissions on existing configs and logs/data without copying templates or validating.",
+    )
     cfg_p.add_argument("--dry-run", action="store_true", help="Preview without modifying files.")
 
     inst_p = sub.add_parser("install", parents=[shared], help="Install and schedule one or more scripts.")
@@ -391,6 +397,15 @@ def main(
         return 0
 
     if args.command == "config":
+        if args.harden:
+            harden_summary = harden_existing_configs(repo_root, dry_run=args.dry_run)
+            if args.json:
+                output_fn(json.dumps(harden_summary, indent=2))
+            else:
+                output_fn(
+                    f"Hardened configs: {harden_summary['hardened']} | dirs: {harden_summary['hardened_dirs']}"
+                )
+            return 0
         try:
             selected = [get_tool(tid) for tid in args.tools] if args.tools else list(TOOLS)
         except KeyError as exc:
