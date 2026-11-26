@@ -133,7 +133,7 @@ jobs:
             encoding="utf-8",
         )
         PY
-        SYSTEMD_UNIT_PATH="$UNIT_DIR:/etc/systemd/system" systemd-analyze verify --man=no "$UNIT_DIR"/*.service "$UNIT_DIR"/*.timer
+        SYSTEMD_UNIT_PATH="$UNIT_DIR:" systemd-analyze verify --man=no "$UNIT_DIR"/*.service "$UNIT_DIR"/*.timer
 
   security:
     runs-on: ubuntu-latest
