@@ -20,6 +20,8 @@ import logging  # For more structured debugging
 from prettytable import PrettyTable
 import argparse
 
+DEFAULT_HTTP_TIMEOUT = 30
+
 # Get the path to the parent directory
 parent_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -92,7 +94,9 @@ def get_channels_to_modify(verbose=False):
 
     try:
         # Make the API request with authentication
-        response = requests.get(api_url, auth=(username, password))
+        response = requests.get(
+            api_url, auth=(username, password), timeout=DEFAULT_HTTP_TIMEOUT
+        )
         response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
         data = response.json()
 
@@ -324,7 +328,10 @@ def modify_channels(channels):
 
             # Make a POST request to update the channel details via chanpolicy (not possible via channels-PUT)
             response = requests.post(
-                update_api_url, json=payload, auth=(username, password)
+                update_api_url,
+                json=payload,
+                auth=(username, password),
+                timeout=DEFAULT_HTTP_TIMEOUT,
             )
 
             # Get the current timestamp

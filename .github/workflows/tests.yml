@@ -5,6 +5,8 @@ on:
     branches: [ main, "feat/**", "fix/**" ]
   pull_request:
     branches: [ main ]
+  schedule:
+    - cron: "0 6 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -17,6 +19,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -37,6 +40,63 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt -r requirements-dev.txt
 
-    - name: Run pytest with coverage
+    - name: Run pytest (Python 3.12 with coverage)
+      if: matrix.python-version == '3.12'
+      shell: bash
       run: |
-        pytest tests/ -v --cov=LNDg --cov=Magma --cov=Other --cov=Peerswap --cov=LNBits --cov-report=term
+        set -o pipefail
+        pytest tests/ -v --cov=LNDg --cov=Magma --cov=Other --cov=Peerswap --cov=LNBits --cov-report=term --cov-fail-under=35 | tee pytest_cov.txt
+        {
+          echo "### Pytest Coverage (Python ${{ matrix.python-version }})"
+          echo '```text'
+          tail -n 30 pytest_cov.txt
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Run pytest (Python ${{ matrix.python-version }})
+      if: matrix.python-version != '3.12'
+      run: pytest tests/ -v
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.12"
+        cache: "pip"
+        cache-dependency-path: "requirements-dev.txt"
+
+    - name: Install ruff
+      run: pip install -r requirements-dev.txt
+
+    - name: Run ruff check on modern/updated tests
+      run: ruff check tests/test_p0_runtime_safety.py tests/test_ca_trust_hardening.py tests/test_repo_hygiene.py
+
+    - name: Validate shell scripts
+      run: |
+        bash -n LNBits/install_pocketmoney_service.sh Other/install_fee_adjuster_service.sh
+        shellcheck -S error LNBits/install_pocketmoney_service.sh Other/install_fee_adjuster_service.sh
+
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.12"
+        cache: "pip"
+        cache-dependency-path: "requirements*.txt"
+
+    - name: Run pip-audit against requirements.txt
+      run: |
+        pip install "pip-audit>=2.7"
+        pip-audit -r requirements.txt

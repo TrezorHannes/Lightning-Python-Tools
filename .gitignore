@@ -53,7 +53,16 @@ PR_DESCRIPTION_TEMP.md
 
 # Testing and Coverage
 .pytest_cache/
+.ruff_cache/
 .coverage
 .coverage.*
 coverage.xml
 htmlcov/
+
+# OS / Patch / Runtime State
+.DS_Store
+*.orig
+*.flag
+*.pid
+.lpt-state.json
+.lpt-backups/

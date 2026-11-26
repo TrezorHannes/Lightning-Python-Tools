@@ -35,6 +35,8 @@ import datetime
 import os
 import configparser
 
+DEFAULT_HTTP_TIMEOUT = 30
+
 
 # Get the path to the parent directory
 parent_dir = os.path.dirname(os.path.abspath(__file__))
@@ -90,7 +92,7 @@ def check_mempool_fees():
     """Checks the mempool API and adjusts LNDg AR-Enabled setting if necessary."""
 
     try:
-        response = requests.get(MEMPOOL_API_URL)
+        response = requests.get(MEMPOOL_API_URL, timeout=DEFAULT_HTTP_TIMEOUT)
         response.raise_for_status()  # Raise exception for HTTP errors
 
         data = response.json()
@@ -121,6 +123,7 @@ def adjust_ar_enabled(ar_enabled):
             AR_ENABLED_API_URL,
             json={"value": ar_enabled_str},
             auth=(username, password),
+            timeout=DEFAULT_HTTP_TIMEOUT,
         )
 
         if response.status_code == 200:

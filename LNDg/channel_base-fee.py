@@ -4,6 +4,8 @@ import datetime  # Import datetime module
 import configparser
 from prettytable import PrettyTable
 
+DEFAULT_HTTP_TIMEOUT = 30
+
 # Get the path to the parent directory
 parent_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -34,7 +36,9 @@ def get_channels_to_modify():
     all_channels_details = [] # Initialize list to store details of all channels from API
     try:
         # Make the API request with authentication
-        response = requests.get(api_url, auth=(username, password))
+        response = requests.get(
+            api_url, auth=(username, password), timeout=DEFAULT_HTTP_TIMEOUT
+        )
 
         # Check if the request was successful (status code 200)
         if response.status_code == 200:
@@ -167,7 +171,10 @@ def modify_channels(channels):
 
             # Make a PUT request to update the channel details
             response = requests.post(
-                update_api_url, json=payload, auth=(username, password)
+                update_api_url,
+                json=payload,
+                auth=(username, password),
+                timeout=DEFAULT_HTTP_TIMEOUT,
             )
 
             # Get the current timestamp

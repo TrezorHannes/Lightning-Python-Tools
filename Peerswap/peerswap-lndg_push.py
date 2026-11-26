@@ -10,7 +10,12 @@ import configparser
 import argparse
 import locale
 
-locale.setlocale(locale.LC_ALL, "")
+try:
+    locale.setlocale(locale.LC_ALL, "")
+except locale.Error:
+    pass
+
+DEFAULT_HTTP_TIMEOUT = 30
 
 # Get the path to the parent directory
 parent_dir = os.path.dirname(os.path.abspath(__file__))
@@ -21,17 +26,18 @@ config = configparser.ConfigParser()
 config.read(config_file_path)
 
 # pscli path and get peers information
-pscli_path = config["paths"]["pscli_path"]
+pscli_path = config.get("paths", "pscli_path", fallback="pscli").strip() or "pscli"
 pscli_command = [pscli_path, "listpeers"]
 
 # lncli path from the config file
-lncli_path = config["paths"]["lncli_path"]
+lncli_path = config.get("paths", "lncli_path", fallback="lncli").strip() or "lncli"
 
 # LNDg API credentials and endpoints
-username = config["credentials"]["lndg_username"]
-password = config["credentials"]["lndg_password"]
+username = config.get("credentials", "lndg_username", fallback="").strip()
+password = config.get("credentials", "lndg_password", fallback="").strip()
 
-lndg_api_url = config["lndg"]["lndg_api_url"] + "/api/channels"
+_lndg_base = config.get("lndg", "lndg_api_url", fallback="").strip().rstrip("/")
+lndg_api_url = f"{_lndg_base}/api/channels" if _lndg_base else ""
 
 # File path for the log file
 log_file_path = os.path.join(parent_dir, "..", "logs", "peerswap-LNDg_changes.log")
@@ -159,7 +165,9 @@ def get_current_notes(channel_id):
 
     try:
         # Make the API request with authentication
-        response = requests.get(api_url, auth=(username, password))
+        response = requests.get(
+            api_url, auth=(username, password), timeout=DEFAULT_HTTP_TIMEOUT
+        )
 
         # Check if the request was successful (status code 200)
         if response.status_code == 200:
@@ -192,7 +200,10 @@ def update_notes(channel_id, notes, dry_run=False):
         return
     try:
         response = requests.put(
-            api_url, json=payload, auth=(username, password)
+            api_url,
+            json=payload,
+            auth=(username, password),
+            timeout=DEFAULT_HTTP_TIMEOUT,
         )
 
         # timestamp = get_current_timestamp() # This line is removed as per new_code
@@ -216,9 +227,6 @@ def update_notes(channel_id, notes, dry_run=False):
 
 
 def main():
-    channels_data = get_lncli_listchannels_output()
-    peers_info = get_peerswap_info()
-
     parser = argparse.ArgumentParser(
         description="Script to update notes for LNDg channels."
     )
@@ -247,6 +255,12 @@ def main():
         "--dry-run", action="store_true", help="Show what would be done, but do not make any changes."
     )
     args = parser.parse_args()
+
+    if not lndg_api_url or not username or not password:
+        raise ValueError("Missing [lndg] or [credentials] settings in config.ini")
+
+    channels_data = get_lncli_listchannels_output()
+    peers_info = get_peerswap_info()
 
     if args.delete:
         filter_and_delete_notes(peers_info, channels_data, dry_run=args.dry_run)
