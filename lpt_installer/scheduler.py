@@ -151,7 +151,8 @@ def render_systemd_service(
 
     py_exe = python_bin or venv_python_path(repo_root)
     script_abs = repo_root / tool.script_path
-    exec_parts = [str(py_exe), str(script_abs), *tool.unattended_args]
+    cli_args = tool.unattended_args if chosen_mode == "systemd-timer" else ()
+    exec_parts = [str(py_exe), str(script_abs), *cli_args]
     exec_start = " ".join(shlex.quote(part) for part in exec_parts)
 
     after_list = ["network-online.target"]
@@ -304,7 +305,7 @@ def render_cron_entry(
     cmd_parts = [str(py_exe), str(script_abs), *tool.unattended_args]
     cmd_str = " ".join(shlex.quote(part) for part in cmd_parts)
     log_path = shlex.quote(str(repo_root / "logs" / f"cron_{tool.id}.log"))
-    lock_path = shlex.quote(f"/tmp/lpt-{tool.id}.lock")
+    lock_path = shlex.quote(str(repo_root / "logs" / f".lpt-{tool.id}.lock"))
     repo_quoted = shlex.quote(str(repo_root))
     return (
         f"{cron_expr} cd {repo_quoted} && flock -n {lock_path} {cmd_str} >> {log_path} 2>&1"
@@ -420,8 +421,26 @@ def detect_conflicts(tool: ToolSpec, env: SystemEnv) -> ConflictReport:
 
     running: list[str] = []
     if not legacy_found:
+        managed_pid: str | None = None
+        if env.systemd_unit_exists(managed_service):
+            pid_res = env.systemctl(
+                "show",
+                "-p",
+                "MainPID",
+                "--value",
+                managed_service,
+                use_sudo=False,
+                check=False,
+            )
+            candidate_pid = pid_res.stdout.strip()
+            if pid_res.returncode == 0 and candidate_pid.isdigit() and int(candidate_pid) > 0:
+                managed_pid = candidate_pid
+
         for proc_line in env.running_processes():
             if script_name in proc_line and "lpt_installer" not in proc_line:
+                proc_pid = proc_line.split(None, 1)[0]
+                if managed_pid and proc_pid == managed_pid:
+                    continue
                 running.append(proc_line)
 
     return ConflictReport(
@@ -567,13 +586,15 @@ def install_tool(
 
         if not dry_run:
             # Ensure no leftover managed cron entry runs alongside systemd
-            updated_cron = remove_cron_tools(
-                env.read_crontab(),
-                [tool.id],
-                ca_bundle=ca_bundle,
-                home_dir=env.home_dir(),
-            )
-            env.write_crontab(updated_cron)
+            existing_cron = env.read_crontab()
+            if tool.id in _split_cron_blocks(existing_cron)[1]:
+                updated_cron = remove_cron_tools(
+                    existing_cron,
+                    [tool.id],
+                    ca_bundle=ca_bundle,
+                    home_dir=env.home_dir(),
+                )
+                env.write_crontab(updated_cron)
 
             env.sudo_install_file(service_content, service_path)
             if timer_content is not None:
@@ -586,6 +607,7 @@ def install_tool(
                     env.sudo_remove_file(timer_path)
                 env.systemctl("daemon-reload", use_sudo=True, check=True)
                 env.systemctl("enable", "--now", f"{prefix}.service", use_sudo=True, check=True)
+                env.systemctl("try-restart", f"{prefix}.service", use_sudo=True, check=True)
 
             state["installed"][tool.id] = {
                 "mode": chosen_mode,

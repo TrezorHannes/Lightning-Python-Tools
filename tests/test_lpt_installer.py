@@ -247,6 +247,17 @@ def test_render_systemd_units_hardening_and_sandbox(tmp_path):
     assert "--run-once" in pm_service
     assert "[Install]" not in pm_service
 
+    pm_daemon = render_systemd_service(
+        pm,
+        repo,
+        user="admin",
+        group="admin",
+        mode="systemd-service",
+        unit_exists=lambda _: False,
+    )
+    assert "Type=simple" in pm_daemon
+    assert "--run-once" not in pm_daemon
+
     pm_timer = render_systemd_timer(pm, "Fri *-*-* 09:30:00")
     assert "OnCalendar=Fri *-*-* 09:30:00" in pm_timer
     assert "Persistent=true" in pm_timer
@@ -298,7 +309,8 @@ def test_cron_managed_block_idempotency_and_preservation(tmp_path):
     assert first == second
     assert CRON_BEGIN in first
     assert CRON_END in first
-    assert "flock -n /tmp/lpt-fee-adjuster.lock" in first
+    assert "logs/.lpt-fee-adjuster.lock" in first
+    assert "/tmp/lpt-" not in first
     assert "pull_lndg_backup.sh" in first
 
     cleaned = remove_cron_tools(first, ["fee-adjuster"])
@@ -313,11 +325,12 @@ def test_config_copy_no_clobber_chmod_600_and_validation(tmp_path):
     assert stat.S_IMODE((repo / "wallets.json").stat().st_mode) == 0o600
     assert stat.S_IMODE((repo / "logs").stat().st_mode) == 0o700
 
-    # Placeholders must fail validation
+    # Placeholders must fail validation (including INVOICEID1 from wallets.json.example)
     errors = validate_configs(repo, [get_tool("pocketmoney")])
     assert any("base_url" in err for err in errors)
     assert any("admin_key" in err for err in errors)
-    assert any("WALLETID" in err or "wallet_id" in err for err in errors)
+    assert any("wallet_id" in err for err in errors)
+    assert any("invoice_key" in err for err in errors)
 
     # Custom contents must never be clobbered on second run
     (repo / "config.ini").write_text("[LNBits]\nbase_url = https://my.node\n", encoding="utf-8")
@@ -654,4 +667,42 @@ def test_doctor_warnings_and_system_env_adapter(tmp_path, monkeypatch):
     assert real_env.sudo_install_file("[Unit]\n", tmp_path / "out.service").returncode == 0
     assert real_env.sudo_remove_file(tmp_path / "out.service").returncode == 0
     assert real_env.systemctl("daemon-reload").returncode == 0
+
+    # Missing crontab binary must not crash read_crontab or empty write_crontab
+    monkeypatch.setattr(real_env, "which", lambda _b: None)
+    assert real_env.read_crontab() == ""
+    assert real_env.write_crontab("").returncode == 0
+    with pytest.raises(RuntimeError, match="crontab binary not found"):
+        real_env.write_crontab("0 * * * * echo hi")
+
+
+def test_reinstall_running_managed_daemon_and_unknown_tool_errors(tmp_path):
+    repo = _seed_repo(tmp_path)
+
+    class DaemonEnv(FakeEnv):
+        def systemctl(self, *args: str, use_sudo: bool = True, check: bool = True) -> CommandResult:
+            self.commands.append(["systemctl", *args])
+            if args[:4] == ("show", "-p", "MainPID", "--value"):
+                return CommandResult(0, "5555\n", "")
+            return CommandResult(0, "", "")
+
+    env = DaemonEnv(tmp_path, processes=[])
+    magma = get_tool("magma-sale")
+    # First install creates managed unit
+    install_tool(magma, repo, env, mode="systemd-service")
+    # Re-install with MainPID=5555 active must succeed and call try-restart
+    env._processes.append("5555 /repo/.venv/bin/python3 Magma/magma_sale_process.py")
+    install_tool(magma, repo, env, mode="systemd-service")
+    assert any(cmd == ["systemctl", "try-restart", "lpt-magma-sale.service"] for cmd in env.commands)
+
+    # An extra unmanaged PID must still fail closed
+    env._processes.append("6666 python3 magma_sale_process.py")
+    with pytest.raises(RuntimeError, match="unmanaged duplicate"):
+        install_tool(magma, repo, env, mode="systemd-service")
+
+    # Unknown tool IDs in CLI subcommands must exit 1 cleanly (no KeyError traceback)
+    out: list[str] = []
+    assert cli_main(["--repo-root", str(repo), "install", "no-such-tool"], env=env, output_fn=out.append) == 1
+    assert cli_main(["--repo-root", str(repo), "config", "--tools", "no-such-tool"], env=env, output_fn=out.append) == 1
+    assert cli_main(["--repo-root", str(repo), "uninstall", "no-such-tool"], env=env, output_fn=out.append) == 1
 

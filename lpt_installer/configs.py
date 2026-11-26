@@ -170,11 +170,21 @@ def validate_configs(repo_root: Path, tools: list[ToolSpec]) -> list[str]:
                         if not isinstance(info, dict):
                             errors.append(f"wallets.json entry {name!r} must be an object.")
                             continue
-                        if info.get("wallet_id", "").startswith("WALLETID"):
+                        wallet_id = info.get("wallet_id")
+                        if not isinstance(wallet_id, str) or not wallet_id.strip():
+                            errors.append(
+                                f"wallets.json entry {name!r} is missing a valid wallet_id."
+                            )
+                        elif wallet_id.strip().startswith("WALLETID"):
                             errors.append(
                                 f"wallets.json entry {name!r} still uses placeholder wallet_id."
                             )
-                        if info.get("invoice_key", "").startswith("INVOICEKEY"):
+                        invoice_key = info.get("invoice_key")
+                        if not isinstance(invoice_key, str) or not invoice_key.strip():
+                            errors.append(
+                                f"wallets.json entry {name!r} is missing a valid invoice_key."
+                            )
+                        elif invoice_key.strip().startswith(("INVOICEID", "INVOICEKEY")):
                             errors.append(
                                 f"wallets.json entry {name!r} still uses placeholder invoice_key."
                             )

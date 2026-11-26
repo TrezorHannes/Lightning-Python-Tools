@@ -147,6 +147,8 @@ class SystemEnv:
         return self.run(cmd, check=check)
 
     def read_crontab(self) -> str:
+        if self.which("crontab") is None:
+            return ""
         res = self.run(["crontab", "-l"], check=False)
         if res.returncode != 0:
             # No crontab installed yet for current user
@@ -154,6 +156,12 @@ class SystemEnv:
         return res.stdout
 
     def write_crontab(self, content: str) -> CommandResult:
+        if self.which("crontab") is None:
+            if not content.strip():
+                return CommandResult(0, "", "")
+            raise RuntimeError(
+                "crontab binary not found; install cron or use --scheduler systemd."
+            )
         if not content.strip():
             # Keep user crontab empty cleanly without failing if none existed
             res = self.run(["crontab", "-r"], check=False)

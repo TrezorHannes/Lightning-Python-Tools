@@ -391,7 +391,11 @@ def main(
         return 0
 
     if args.command == "config":
-        selected = [get_tool(tid) for tid in args.tools] if args.tools else list(TOOLS)
+        try:
+            selected = [get_tool(tid) for tid in args.tools] if args.tools else list(TOOLS)
+        except KeyError as exc:
+            output_fn(f"Error: {exc}")
+            return 1
         summary = ensure_configs(repo_root, selected, dry_run=args.dry_run)
         if args.edit and not args.dry_run:
             if args.edit not in CONFIG_TEMPLATES:
@@ -410,7 +414,11 @@ def main(
         return 1 if errors else 0
 
     if args.command == "install":
-        selected = [get_tool(tid) for tid in args.tools]
+        try:
+            selected = [get_tool(tid) for tid in args.tools]
+        except KeyError as exc:
+            output_fn(f"Error: {exc}")
+            return 1
         if not args.dry_run and not ensure_disclaimer_accepted(
             repo_root,
             accept_flag=args.accept_disclaimer,
@@ -460,14 +468,18 @@ def main(
         if not target_ids:
             output_fn("Error: specify tool IDs or --all.")
             return 1
-        res = uninstall_tools(
-            target_ids,
-            repo_root,
-            sys_env,
-            remove_venv=args.remove_venv,
-            purge_configs=args.purge_configs,
-            dry_run=args.dry_run,
-        )
+        try:
+            res = uninstall_tools(
+                target_ids,
+                repo_root,
+                sys_env,
+                remove_venv=args.remove_venv,
+                purge_configs=args.purge_configs,
+                dry_run=args.dry_run,
+            )
+        except KeyError as exc:
+            output_fn(f"Error: {exc}")
+            return 1
         if args.json:
             output_fn(json.dumps(res, indent=2))
         else:
