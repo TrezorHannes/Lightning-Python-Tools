@@ -94,6 +94,32 @@ def ensure_configs(
     return {"copied": copied, "preserved": preserved, "hardened": hardened}
 
 
+def harden_existing_configs(
+    repo_root: Path,
+    *,
+    dry_run: bool = False,
+) -> dict[str, list[str]]:
+    """Enforce 0600/0700 permissions on existing config files and logs/data without copying templates."""
+    hardened: list[str] = []
+    hardened_dirs: list[str] = []
+
+    for rel_path in CONFIG_TEMPLATES:
+        dst = repo_root / rel_path
+        if dst.is_file():
+            hardened.append(rel_path)
+            if not dry_run:
+                os.chmod(dst, 0o600)
+
+    for dir_name in ("logs", "data"):
+        dir_path = repo_root / dir_name
+        if dir_path.is_dir():
+            hardened_dirs.append(dir_name)
+            if not dry_run:
+                os.chmod(dir_path, 0o700)
+
+    return {"hardened": hardened, "hardened_dirs": hardened_dirs}
+
+
 def validate_configs(repo_root: Path, tools: list[ToolSpec]) -> list[str]:
     """Validate required config files, INI keys, schedules, and JSON syntax."""
     errors: list[str] = []

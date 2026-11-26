@@ -706,3 +706,45 @@ def test_reinstall_running_managed_daemon_and_unknown_tool_errors(tmp_path):
     assert cli_main(["--repo-root", str(repo), "config", "--tools", "no-such-tool"], env=env, output_fn=out.append) == 1
     assert cli_main(["--repo-root", str(repo), "uninstall", "no-such-tool"], env=env, output_fn=out.append) == 1
 
+
+def test_cli_config_harden_tightens_existing_without_copying_templates(tmp_path):
+    repo = _seed_repo(tmp_path, valid_configs=False)
+    (repo / "config.ini").write_text("[credentials]\n", encoding="utf-8")
+    (repo / "wallets.json").write_text("{}", encoding="utf-8")
+    (repo / "config.ini").chmod(0o644)
+    (repo / "wallets.json").chmod(0o644)
+    (repo / "logs").mkdir(exist_ok=True)
+    (repo / "logs").chmod(0o755)
+
+    env = FakeEnv(tmp_path)
+    out: list[str] = []
+
+    # --dry-run must not mutate permissions or copy missing templates
+    assert (
+        cli_main(
+            ["--repo-root", str(repo), "config", "--harden", "--dry-run"],
+            env=env,
+            output_fn=out.append,
+        )
+        == 0
+    )
+    assert stat.S_IMODE((repo / "config.ini").stat().st_mode) == 0o644
+    assert not (repo / "Magma" / "magma_config.ini").exists()
+    assert not (repo / "feeConfig.json").exists()
+
+    # Live --harden tightens existing files/dirs to 0600/0700 without copying missing templates
+    out.clear()
+    assert (
+        cli_main(
+            ["--repo-root", str(repo), "config", "--harden"],
+            env=env,
+            output_fn=out.append,
+        )
+        == 0
+    )
+    assert stat.S_IMODE((repo / "config.ini").stat().st_mode) == 0o600
+    assert stat.S_IMODE((repo / "wallets.json").stat().st_mode) == 0o600
+    assert stat.S_IMODE((repo / "logs").stat().st_mode) == 0o700
+    assert not (repo / "Magma" / "magma_config.ini").exists()
+    assert not (repo / "feeConfig.json").exists()
+
